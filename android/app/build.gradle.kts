@@ -7,10 +7,6 @@ plugins {
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
-val local = Properties().apply {
-    rootProject.file("local.properties").takeIf { it.exists() }?.inputStream()?.use { load(it) }
-}
-val mapsKey = (System.getenv("MAPS_API_KEY") ?: local.getProperty("MAPS_API_KEY", "")).trim()
 // The private key is kept outside the checkout. CI supplies the same identity through Secrets.
 val familySigning = Properties().apply {
     file("${System.getProperty("user.home")}/.config/talkingfamily/signing.properties")
@@ -51,11 +47,9 @@ android {
         applicationId = "kr.family.homeway"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.4.0"
+        versionCode = 6
+        versionName = "0.4.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        manifestPlaceholders["mapsApiKey"] = mapsKey
-        buildConfigField("String", "MAPS_API_KEY", "\"${mapsKey.replace("\\", "\\\\").replace("\"", "\\\"")}\"")
     }
     signingConfigs {
         if (familySigningComplete) create("family") {
@@ -100,7 +94,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.9.0")
     implementation("com.google.android.gms:play-services-location:21.3.0")
-    implementation("com.google.android.gms:play-services-maps:19.0.0")
+    implementation("androidx.webkit:webkit:1.12.1")
     implementation("androidx.work:work-runtime-ktx:2.10.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")

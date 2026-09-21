@@ -36,14 +36,18 @@ class TelegramReceiveService : Service() {
         if (intent?.action == ACTION_STOP) { stop(this); return START_NOT_STICKY }
         if (!AppRepository(this).configured) { stopSelf(); return START_NOT_STICKY }
         getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(CHANNEL, "텔레그램 가족 소식 수신", NotificationManager.IMPORTANCE_LOW))
+            NotificationChannel(CHANNEL, "텔레그램 가족 소식 수신", NotificationManager.IMPORTANCE_LOW).apply {
+                setSound(null, null)
+                enableVibration(false)
+                setShowBadge(false)
+            })
         val open = PendingIntent.getActivity(this, 42, Intent(this, MainActivity::class.java)
             .setAction(FloatingStarService.ACTION_OPEN_CHAT), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val stopIntent = PendingIntent.getService(this, 43, Intent(this, TelegramReceiveService::class.java)
             .setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val notification = NotificationCompat.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_homeway)
             .setContentTitle("가족 소식 수신 중").setContentText("텔레그램으로 대화와 칭찬을 주고받고 있어요.")
-            .setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true)
+            .setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true).setSilent(true)
             .addAction(0, "수신 중지", stopIntent).build()
         ServiceCompat.startForeground(this, NOTIFICATION, notification,
             if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING else 0)

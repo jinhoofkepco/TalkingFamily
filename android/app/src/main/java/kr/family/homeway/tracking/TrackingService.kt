@@ -81,6 +81,9 @@ class TrackingService : Service(), SensorEventListener {
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "자녀 위치 공유", NotificationManager.IMPORTANCE_LOW).apply {
                 description = "공유 중에는 계속 표시하며 알림에서 언제든 종료할 수 있습니다."
+                setSound(null, null)
+                enableVibration(false)
+                setShowBadge(false)
             },
         )
         sender = scope.launch {
@@ -263,7 +266,7 @@ class TrackingService : Service(), SensorEventListener {
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setContentTitle("아빠에게 위치 공유 중")
             .setContentText("움직임이 있는 5분 구간마다 위치를 확인해요. 높이 변화는 추정해요.")
-            .setOngoing(true).setOnlyAlertOnce(true).setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setOngoing(true).setOnlyAlertOnce(true).setSilent(true).setCategory(NotificationCompat.CATEGORY_SERVICE)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "공유 종료", stop)
         // Notification entry opens the app; only an explicit launcher entry starts collapsed.
         val launch = Intent(this, kr.family.homeway.MainActivity::class.java)

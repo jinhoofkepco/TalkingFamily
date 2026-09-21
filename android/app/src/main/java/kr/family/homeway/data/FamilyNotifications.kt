@@ -15,8 +15,7 @@ import kr.family.homeway.overlay.FloatingStarService
 
 internal object FamilyNotifications {
     fun received(context: Context, event: FamilyEvent) {
-        if (event.kind in setOf("heartbeat", "sharing_status", "vertical") ||
-            (event.kind == "location" && event.payload.optString("source") == "automatic")) return
+        if (event.kind != "chat") return
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context,
                 Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
         val intent = Intent(context, MainActivity::class.java).setAction(FloatingStarService.ACTION_OPEN_CHAT)
@@ -24,7 +23,7 @@ internal object FamilyNotifications {
         val open = PendingIntent.getActivity(context, 41, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val notification = NotificationCompat.Builder(context, "family_messages")
             .setSmallIcon(R.drawable.ic_homeway).setContentTitle("우리 오는 길")
-            .setContentText("가족의 새 소식이 도착했어요. 앱에서 확인해 주세요.")
+            .setContentText("가족의 새 메시지가 도착했어요. 앱에서 확인해 주세요.")
             .setContentIntent(open).setAutoCancel(true).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).build()
         NotificationManagerCompat.from(context).notify(event.id.hashCode(), notification)
     }

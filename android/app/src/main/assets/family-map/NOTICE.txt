@@ -1,0 +1,12 @@
+Leaflet 1.9.4 is bundled locally. Source: https://leafletjs.com/download.html
+Copyright (c) 2010-2023, Vladimir Agafonkin; Copyright (c) 2010-2011, CloudMade.
+See LICENSE-Leaflet.txt for the BSD 2-Clause license.
+
+Official distribution integrity (SHA-256, base64):
+leaflet.js: 20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=
+leaflet.css: p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=
+
+Map data and raster tiles: © OpenStreetMap contributors.
+https://www.openstreetmap.org/copyright
+https://operations.osmfoundation.org/policies/tiles/
+Only the visible online map is loaded; there is no tile prefetch or offline-download feature.

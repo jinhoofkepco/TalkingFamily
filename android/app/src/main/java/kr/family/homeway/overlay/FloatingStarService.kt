@@ -85,6 +85,8 @@ class FloatingStarService : Service() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "메신저 별 아이콘", NotificationManager.IMPORTANCE_LOW).apply {
                 description = "다른 앱 위에 떠 있는 별로 메신저를 여는 동안 표시해요. 알림에서 끌 수 있어요."
+                setSound(null, null)
+                enableVibration(false)
                 setShowBadge(false)
             },
         )

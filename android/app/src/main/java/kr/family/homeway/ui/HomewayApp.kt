@@ -2,7 +2,6 @@ package kr.family.homeway.ui
 
 import android.content.Intent
 import android.net.Uri
-import android.os.Bundle
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -36,19 +35,10 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
-import com.google.android.gms.maps.CameraUpdateFactory
-import com.google.android.gms.maps.MapView
-import com.google.android.gms.maps.model.CircleOptions
-import com.google.android.gms.maps.model.LatLng
-import com.google.android.gms.maps.model.MarkerOptions
-import kr.family.homeway.BuildConfig
 import kr.family.homeway.data.FamilyEvent
 import kr.family.homeway.data.Redemption
 import kr.family.homeway.data.Reward
+import kr.family.homeway.data.ServiceNotificationSettings
 import kotlinx.coroutines.delay
 import java.time.Duration
 import java.time.Instant
@@ -229,12 +219,12 @@ private fun FamilyHome(state: UiState, actions: UiActions) {
                     Text("체험 모드 · 실제 전송과 위치 공유는 하지 않아요", Modifier.fillMaxWidth().background(WarmGold).padding(horizontal = 20.dp, vertical = 8.dp), color = Ink, fontSize = 11.sp)
                 }
                 if (state.loading) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Forest)
-                if (state.error != null || state.notice != null) {
+                if (state.error != null) {
                     Row(
-                        Modifier.fillMaxWidth().background(if (state.error != null) Color(0xFFFCE9E4) else Mint).padding(start = 20.dp, end = 4.dp),
+                        Modifier.fillMaxWidth().background(Color(0xFFFCE9E4)).padding(start = 20.dp, end = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text(state.error ?: state.notice.orEmpty(), Modifier.weight(1f).padding(vertical = 10.dp), fontSize = 13.sp, lineHeight = 19.sp)
+                        Text(state.error, Modifier.weight(1f).padding(vertical = 10.dp), fontSize = 13.sp, lineHeight = 19.sp)
                         IconButton(actions.clearNotice) { Icon(Icons.Outlined.Close, "안내 닫기", Modifier.size(18.dp)) }
                     }
                 }
@@ -413,33 +403,7 @@ private fun LocationScreen(state: UiState) {
     val readings = state.events.filter { it.kind == "location" || it.kind == "vertical" }.sortedByDescending { eventTime(it) }
     val latest = readings.firstOrNull { it.kind == "location" && locationPoint(it) != null }
     val point = latest?.let(::locationPoint)
-    val heartbeat = state.events.filter { it.kind == "heartbeat" }.maxByOrNull { it.payload.optString("recordedAt") }
-    val heartbeatTime = heartbeat?.payload?.optString("recordedAt").orEmpty()
-    val heartbeatAge = elapsedMinutes(heartbeatTime, now)
     LazyColumn(Modifier.fillMaxSize().testTag("location-list"), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        item {
-            SectionCard {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Outlined.Shield, null, tint = Forest, modifier = Modifier.size(20.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text(if (state.sharingEnabled) "자동 공유 설정 켜짐" else "자동 공유 설정 꺼짐", fontWeight = FontWeight.Bold)
-                }
-                Text(if (state.demoMode) "체험 기록 · 실제 위치를 수집하지 않아요" else "자녀에게서 마지막으로 받은 공유 설정입니다.", fontSize = 13.sp, color = Muted)
-                Text("이동 중 5분 간격의 위치 기록과 높이 변화 알림을 확인해요.", fontSize = 13.sp, color = Muted, lineHeight = 20.sp)
-                if (heartbeat != null) {
-                    Text("최근 기기 상태 ${displayTime(heartbeatTime, true)}", fontSize = 12.sp, color = Muted)
-                    val battery = heartbeat.payload.optInt("batteryPercent", -1)
-                    if (battery in 0..100) Text("기록 당시 배터리 ${battery}%", fontSize = 12.sp, color = Muted)
-                }
-                if (!state.demoMode && state.sharingEnabled && (heartbeatAge == null || heartbeatAge >= 10)) {
-                    Text(
-                        if (heartbeatAge == null) "아직 자녀의 최근 기기 상태가 확인되지 않았어요. 공유 설정과 실제 연결 상태는 다를 수 있어요."
-                        else "기기 상태가 ${heartbeatAge}분 동안 갱신되지 않았어요. 마지막 기록만 표시하고 있으니 자녀에게 확인해 주세요.",
-                        color = Gold, fontSize = 12.sp, lineHeight = 19.sp,
-                    )
-                }
-            }
-        }
         item {
             if (point == null) EmptyCard(Icons.Outlined.LocationOn, "아직 공유된 위치가 없어요", "자녀가 대화에서 현재 위치를 보내거나\n설정에서 자동 공유를 켜면 표시됩니다.")
             else SectionCard {
@@ -447,27 +411,18 @@ private fun LocationScreen(state: UiState) {
                     Text(if (state.demoMode) "예시 위치" else "마지막으로 확인한 위치", Modifier.weight(1f), fontWeight = FontWeight.Bold)
                     Pill(if (latest.payload.optString("source") == "automatic") "자동 기록" else "직접 공유")
                 }
-                if (BuildConfig.MAPS_API_KEY.isNotBlank() && !state.demoMode) {
-                    Surface(shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth().height(240.dp)) {
-                        LocationMap(point.first, point.second, latest.payload.optDouble("accuracy", Double.NaN))
-                    }
-                } else {
-                    Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp), color = Mint) {
-                        Column(Modifier.padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(9.dp)) {
-                            Icon(Icons.Outlined.Map, null, tint = Forest, modifier = Modifier.size(38.dp))
-                            Text(coordinateText(point.first, point.second), fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                            Text(if (state.demoMode) "체험 모드의 예시 좌표입니다." else "지도 연결 전에도 측정 좌표를 확인할 수 있어요.", fontSize = 12.sp, color = Muted, textAlign = TextAlign.Center)
-                        }
-                    }
+                Surface(shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth().height(320.dp).testTag("embedded-location-map")) {
+                    EmbeddedLocationMap(point.first, point.second, latest.payload.optDouble("accuracy", Double.NaN), Modifier.fillMaxSize())
                 }
                 Text("측정 ${displayTime(eventTime(latest), includeDate = true)}", fontWeight = FontWeight.Medium)
+                Text(coordinateText(point.first, point.second), fontSize = 12.sp, color = Muted)
                 val locationAge = elapsedMinutes(eventTime(latest), now)
                 if (!state.demoMode && locationAge != null && locationAge >= 10) {
                     Text("${locationAge}분 전에 측정한 위치입니다. 현재 위치와 다를 수 있어요.", fontSize = 12.sp, color = Gold, lineHeight = 19.sp)
                 }
                 val accuracy = latest.payload.optDouble("accuracy", Double.NaN)
                 Text(if (accuracy.isFinite()) "위치 오차 약 ${accuracy.toInt()}m · ${deliveryLabel(latest.delivery, state.demoMode)}" else "위치 정확도 정보 없음 · ${deliveryLabel(latest.delivery, state.demoMode)}", fontSize = 12.sp, color = Muted)
-                MapsButton(point.first, point.second, state.demoMode)
+                if (state.demoMode) Text("체험 위치 · 실제 위치를 수집하지 않아요", fontSize = 12.sp, color = Muted)
             }
         }
         item {
@@ -479,54 +434,6 @@ private fun LocationScreen(state: UiState) {
         if (readings.isEmpty()) item { Text("새 기록이 도착하면 여기에 모아 보여 드릴게요.", color = Muted, fontSize = 13.sp) }
         items(readings, key = { it.id }) { event -> TimelineCard(event, state.demoMode) }
         item { Spacer(Modifier.height(8.dp)) }
-    }
-}
-
-@Composable
-private fun LocationMap(latitude: Double, longitude: Double, accuracy: Double) {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-    val mapView = remember { MapView(context).apply { onCreate(Bundle()) } }
-    DisposableEffect(mapView, lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_START -> mapView.onStart()
-                Lifecycle.Event.ON_RESUME -> mapView.onResume()
-                Lifecycle.Event.ON_PAUSE -> mapView.onPause()
-                Lifecycle.Event.ON_STOP -> mapView.onStop()
-                else -> Unit
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-            mapView.onPause(); mapView.onStop(); mapView.onDestroy()
-        }
-    }
-    AndroidView(factory = { mapView }, modifier = Modifier.fillMaxSize())
-    LaunchedEffect(mapView, latitude, longitude, accuracy) {
-        mapView.getMapAsync { map ->
-            val position = LatLng(latitude, longitude)
-            map.clear()
-            map.uiSettings.isMapToolbarEnabled = false
-            map.uiSettings.isZoomControlsEnabled = true
-            map.addMarker(MarkerOptions().position(position).title("마지막 측정 위치"))
-            if (accuracy.isFinite() && accuracy > 0) map.addCircle(CircleOptions().center(position).radius(accuracy).strokeColor(0x99245B46.toInt()).fillColor(0x22245B46).strokeWidth(2f))
-            map.moveCamera(CameraUpdateFactory.newLatLngZoom(position, 16f))
-        }
-    }
-}
-
-@Composable
-private fun MapsButton(latitude: Double, longitude: Double, demo: Boolean) {
-    val context = LocalContext.current
-    OutlinedButton(
-        onClick = {
-            val uri = Uri.parse("https://www.google.com/maps/search/?api=1&query=$latitude,$longitude")
-            runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, uri)) }
-        }, modifier = Modifier.fillMaxWidth(), enabled = !demo,
-    ) {
-        Icon(Icons.Outlined.OpenInNew, null, Modifier.size(17.dp)); Spacer(Modifier.width(7.dp)); Text("Google 지도에서 열기")
     }
 }
 
@@ -798,6 +705,7 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
     var consentDialog by rememberSaveable { mutableStateOf(false) }
     var disconnectDialog by rememberSaveable { mutableStateOf(false) }
     val child = state.role == "child"
+    val context = LocalContext.current
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         if (section == "location") SectionCard {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -809,7 +717,11 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
             }
             Text(if (child) state.trackingStatus else "마지막으로 전달받은 자녀의 공유 설정입니다.", color = Forest, fontSize = 13.sp)
             HorizontalDivider(color = Cream)
-            Text("공유 중에는 휴대폰에 알림이 표시돼요. 언제든 이 설정이나 알림에서 끌 수 있어요. 공유를 끄면 새 자동 수집을 멈춥니다.", color = Muted, fontSize = 13.sp, lineHeight = 21.sp)
+            Text("언제든 이 설정에서 위치 공유를 끌 수 있어요. 공유를 끄면 새 자동 수집을 멈춥니다.", color = Muted, fontSize = 13.sp, lineHeight = 21.sp)
+            if (!state.demoMode && child) {
+                OutlinedButton({ ServiceNotificationSettings.open(context, ServiceNotificationSettings.Kind.LOCATION) }, Modifier.fillMaxWidth().testTag("location-notification-settings")) { Text("위치 공유 알림 표시 설정") }
+                Text("열린 Android 설정에서 이 알림의 허용을 끄면 실행 알림을 숨길 수 있어요. 대화 알림과 위치 공유는 계속 유지됩니다.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
+            }
             Text("현재 위치를 한 번 보내는 기능은 대화 화면에서 별도로 사용할 수 있어요.", color = Muted, fontSize = 13.sp, lineHeight = 21.sp)
         }
         if (section == "info") SharedInformation()
@@ -828,11 +740,18 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
                         }
                         Switch(state.telegramReceiving, actions.setTelegramReceiving, enabled = !state.loading, modifier = Modifier.testTag("telegram-receiving-switch"))
                     }
-                    Text("두 휴대폰에서 수신을 켜 두면 대화와 위치를 계속 받을 수 있어요. 수신 중에는 알림이 표시되고 배터리를 사용합니다. 절전·강제 종료·인터넷 끊김으로 수신이 멈출 수 있으니 앱을 다시 열어 확인해 주세요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
+                    Text("두 휴대폰에서 수신을 켜 두면 대화와 위치를 계속 받을 수 있어요. 수신 중에는 배터리를 사용합니다. 절전·강제 종료·인터넷 끊김으로 수신이 멈출 수 있으니 앱을 다시 열어 확인해 주세요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
                     Text("‘상대 기기 수신’은 상대 앱이 메시지를 받은 상태예요. 사람이 읽었다는 뜻은 아니에요. 상대 앱에서 받을 때까지 전송 대기로 표시될 수 있어요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
                 }
                 TextButton(firstGuide, Modifier.testTag("first-guide-button")) { Icon(Icons.Outlined.Info, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text("처음 안내 다시 보기") }
                 OutlinedButton(actions.refresh, Modifier.fillMaxWidth(), enabled = !state.loading) { Icon(Icons.Outlined.Refresh, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text("새로 고침") }
+            }
+            if (!state.demoMode) SectionCard {
+                Text("실행 알림 표시 설정", fontWeight = FontWeight.Bold)
+                Text("대화 메시지 알림은 유지하고, 아래 실행 알림만 따로 숨길 수 있어요. 열린 Android 설정에서 해당 알림의 허용을 꺼 주세요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
+                if (child) OutlinedButton({ ServiceNotificationSettings.open(context, ServiceNotificationSettings.Kind.LOCATION) }, Modifier.fillMaxWidth()) { Text("위치 공유 알림") }
+                OutlinedButton({ ServiceNotificationSettings.open(context, ServiceNotificationSettings.Kind.RECEIVING) }, Modifier.fillMaxWidth()) { Text("메시지 수신 대기 알림") }
+                OutlinedButton({ ServiceNotificationSettings.open(context, ServiceNotificationSettings.Kind.STAR) }, Modifier.fillMaxWidth()) { Text("별 아이콘 실행 알림") }
             }
             if (!child) OverlaySettings(state, actions)
             if (state.demoMode) SectionCard {

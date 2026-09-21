@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://tile.openstreetmap.org; connect-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>자녀가 공유한 위치</title>
+  <link rel="stylesheet" href="leaflet.css">
+  <link rel="stylesheet" href="map.css">
+  <script src="leaflet.js" defer></script>
+  <script src="map.js" defer></script>
+</head>
+<body>
+  <div id="map" role="region" aria-label="자녀가 마지막으로 공유한 위치 지도"></div>
+  <button id="recenter" type="button" disabled aria-label="마지막 측정 위치로 지도 이동">최근 위치로</button>
+  <div id="status" role="status" aria-live="polite"><span id="status-text">위치를 표시하고 있어요…</span><button id="retry" type="button" hidden>다시 보기</button></div>
+</body>
+</html>

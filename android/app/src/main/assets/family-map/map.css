@@ -1,0 +1,15 @@
+html, body, #map { height: 100%; width: 100%; margin: 0; }
+body { font-family: system-ui, sans-serif; color: #24362d; background: #e4efe5; }
+#map { background: #e4efe5; }
+.leaflet-container { font-family: inherit; }
+.leaflet-bar { border: 0 !important; box-shadow: 0 2px 8px #24362d30; }
+.leaflet-bar a { width: 42px; height: 42px; line-height: 42px; color: #245b46; }
+.leaflet-control-attribution { font-size: 10px; background: #fffffff0 !important; padding: 3px 5px; }
+.leaflet-control-attribution a { color: #245b46; }
+.leaflet-tooltip { border: 0; border-radius: 9px; color: #245b46; font-weight: 600; padding: 5px 8px; }
+button { font: inherit; font-size: 13px; font-weight: 600; color: #245b46; background: white; border: 0; border-radius: 12px; min-height: 44px; padding: 0 13px; }
+#recenter { position: absolute; z-index: 800; right: 10px; top: 10px; box-shadow: 0 2px 8px #24362d30; }
+#recenter:disabled { opacity: .55; }
+#status { position: absolute; z-index: 800; bottom: 31px; left: 10px; right: 10px; width: fit-content; max-width: calc(100% - 44px); margin: auto; padding: 8px 12px; border-radius: 12px; background: #fffffff2; box-shadow: 0 2px 8px #24362d22; font-size: 12px; text-align: center; }
+#status[hidden], #retry[hidden] { display: none; }
+#retry { display: block; margin: 4px auto 0; padding: 0 10px; background: #e4efe5; }
