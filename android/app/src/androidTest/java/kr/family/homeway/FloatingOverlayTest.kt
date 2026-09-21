@@ -216,6 +216,16 @@ class FloatingOverlayTest {
         assertNoTrackingService()
     }
 
+    private fun awaitStarDisableDialogFocus() {
+        compose.onNodeWithTag("overlay-disable-dialog").assertIsDisplayed()
+        // Compose visibility can precede WindowManager focus; native Back must target this dialog.
+        compose.waitUntil(5000) {
+            instrumentation.uiAutomation.windows.any { window ->
+                window.isFocused && window.root?.findAccessibilityNodeInfosByText("별 아이콘을 끌까요?")?.isNotEmpty() == true
+            }
+        }
+    }
+
     @Test fun childCanCancelStarDisableBeforeDeliberatelyConfirmingIt() {
         launchDemo(overlay = true)
         awaitStar()
@@ -224,7 +234,7 @@ class FloatingOverlayTest {
         compose.onNodeWithTag("chat-send").performClick()
         compose.onNodeWithTag("settings-overlay-menu-item").performClick()
         compose.onNodeWithTag("overlay-disable").performScrollTo().performClick()
-        compose.onNodeWithTag("overlay-disable-dialog").assertIsDisplayed()
+        awaitStarDisableDialogFocus()
         assertTrue(OverlayPreferences(context).enabled)
         assertTrue(FloatingStarService.runtime.value.running)
 
@@ -232,11 +242,13 @@ class FloatingOverlayTest {
         compose.onNodeWithTag("overlay-disable-dialog").assertDoesNotExist()
         assertTrue(OverlayPreferences(context).enabled)
         compose.onNodeWithTag("overlay-disable").performScrollTo().performClick()
+        awaitStarDisableDialogFocus()
         device.pressBack()
         compose.onNodeWithTag("overlay-disable-dialog").assertDoesNotExist()
         assertTrue(OverlayPreferences(context).enabled)
 
         compose.onNodeWithTag("overlay-disable").performScrollTo().performClick()
+        awaitStarDisableDialogFocus()
         compose.onNodeWithTag("overlay-disable-confirm").performClick()
         compose.waitUntil(5000) { !FloatingStarService.runtime.value.running && !FloatingStarService.runtime.value.visible }
         compose.onNodeWithTag("overlay-disable-dialog").assertDoesNotExist()
