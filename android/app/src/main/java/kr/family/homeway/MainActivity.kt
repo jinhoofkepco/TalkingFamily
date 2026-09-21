@@ -107,6 +107,8 @@ class MainActivity : ComponentActivity() {
                 approveRedemption=model::approveRedemption,
                 setSharing={ enabled -> if(enabled && !state.demoMode) requestLocation(true) { model.setSharing(true) } else model.setSharing(enabled) },
                 refresh=model::refresh,
+                selectHistoryDay=model::selectHistoryDay,
+                loadMoreHistory=model::loadMoreHistory,
                 clearNotice=model::clearNotice,
                 resetConfiguration={
                     if (!model.state.value.demoMode && model.state.value.role == "child" && model.state.value.sharingEnabled) model.resetConfiguration()

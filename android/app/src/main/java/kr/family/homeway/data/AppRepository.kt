@@ -127,6 +127,9 @@ class AppRepository(context: Context) {
         store.localEvents().forEach { events[it.id] = it }
         snapshot.copy(events = events.values.sortedBy { it.measuredAt })
     }
+    suspend fun movementHistory(day: String? = null, before: MovementHistoryCursor? = null): MovementHistoryPage = withContext(Dispatchers.IO) {
+        synchronized(dataLock) { store.movementHistory(day, before) }
+    }
     fun hasPending(): Boolean = synchronized(dataLock) { store.pending().isNotEmpty() || store.receipts().isNotEmpty() }
     private fun scheduleOutbox() {
         WorkManager.getInstance(app).enqueueUniqueWork("homeway_outbox", ExistingWorkPolicy.KEEP,

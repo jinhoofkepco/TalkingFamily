@@ -3,6 +3,7 @@ package kr.family.homeway.ui
 import kr.family.homeway.data.FamilyEvent
 import kr.family.homeway.data.Redemption
 import kr.family.homeway.data.Reward
+import java.time.LocalDate
 
 data class UiState(
     val role: String = "child",
@@ -12,6 +13,11 @@ data class UiState(
     val error: String? = null,
     val notice: String? = null,
     val events: List<FamilyEvent> = emptyList(),
+    val locationHistory: List<FamilyEvent> = emptyList(),
+    val historyDays: List<String> = emptyList(),
+    val historyDay: String = LocalDate.now().toString(),
+    val historyHasMore: Boolean = false,
+    val historyLoading: Boolean = false,
     val stickerBalance: Int = 0,
     val redemptions: List<Redemption> = emptyList(),
     val rewards: List<Reward> = emptyList(),
@@ -48,4 +54,6 @@ data class UiActions(
     val disableOverlay: () -> Unit = {},
     val dismissOverlayPrompt: () -> Unit = {},
     val setTelegramReceiving: (enabled: Boolean) -> Unit = {},
+    val selectHistoryDay: (String) -> Unit = {},
+    val loadMoreHistory: () -> Unit = {},
 )

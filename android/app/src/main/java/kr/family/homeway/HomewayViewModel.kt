@@ -6,16 +6,22 @@ import androidx.lifecycle.viewModelScope
 import kr.family.homeway.data.AppRepository
 import kr.family.homeway.data.DemoStore
 import kr.family.homeway.data.FamilySnapshot
+import kr.family.homeway.data.MovementHistoryCursor
+import kr.family.homeway.data.MovementHistoryDates
 import kr.family.homeway.tracking.CurrentLocationProvider
 import kr.family.homeway.tracking.TrackingService
 import kr.family.homeway.ui.UiState
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
 import java.util.UUID
 
 class HomewayViewModel(app: Application) : AndroidViewModel(app) {
@@ -25,6 +31,11 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
     val state = mutableState.asStateFlow()
     private var refreshJob: Job? = null
     private var awaitedLocationId: String? = null
+    private var historyJob: Job? = null
+    private var historyCursor: MovementHistoryCursor? = null
+    private var historyDaySelected = false
+    private var historyGeneration = 0
+    private var historyContext: Triple<String, Boolean, String>? = null
     init {
         val snapshot = if(repo.demoMode) demo.read() else repo.cached()
         render(snapshot)
@@ -40,6 +51,13 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
             trackingStatus=if(repo.demoMode) "체험 기록 · 실제 위치를 수집하지 않아요" else repo.trackingStatus,
             transport=snapshot.transport, error=error ?: repo.connectionError
         ) }
+        val context = Triple(repo.role, repo.demoMode, ZoneId.systemDefault().id)
+        if (historyContext != context) {
+            resetHistorySelection()
+            historyContext = context
+        }
+        if (repo.role == "guardian") refreshHistory(snapshot)
+        else mutableState.update { it.copy(locationHistory = emptyList(), historyDays = emptyList(), historyHasMore = false, historyLoading = false) }
         awaitedLocationId?.let { id ->
             val event = snapshot.events.firstOrNull { it.id == id }
             if(event?.delivery=="relayed") {
@@ -53,14 +71,16 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun configure(role: String, botToken: String, peerBotUsername: String) = perform {
         TrackingService.stopAndAwait(getApplication())
-        render(repo.configure(role,botToken,peerBotUsername))
+        val snapshot = repo.configure(role,botToken,peerBotUsername)
+        resetHistorySelection()
+        render(snapshot)
         notice(if (role == "child") "텔레그램 봇을 연결했어요. 상대 휴대폰도 연결해 주세요. 자동 위치 공유는 대화에 '설정'을 보내 따로 켤 수 있어요."
             else "텔레그램 봇을 연결했어요. 자녀 휴대폰도 연결해 주세요. 자동 위치 공유는 자녀가 따로 켤 수 있어요.")
     }
     fun startDemo(role: String) = perform {
         refreshJob?.cancel()
         TrackingService.stopAndAwait(getApplication())
-        repo.startDemo(role); demo.reset(); render(demo.read()); notice("체험 모드예요. 실제 위치 수집과 메시지 전송은 하지 않아요.")
+        repo.startDemo(role); demo.reset(); resetHistorySelection(); render(demo.read()); notice("체험 모드예요. 실제 위치 수집과 메시지 전송은 하지 않아요.")
     }
     fun switchDemoRole(role:String) {
         if (!repo.demoMode) return
@@ -74,6 +94,68 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
             try { render(repo.refresh()) }
             catch(e: kotlinx.coroutines.CancellationException) { throw e }
             catch(_: Exception) { render(repo.cached(), repo.connectionError ?: "연결이 원활하지 않아요. 마지막 받은 기록을 표시하고 있어요.") }
+        }
+    }
+    fun selectHistoryDay(day: String) {
+        if (repo.role != "guardian" || runCatching { LocalDate.parse(day) }.isFailure) return
+        historyJob?.cancel()
+        historyGeneration++
+        historyCursor = null
+        historyDaySelected = true
+        mutableState.update { it.copy(historyDay = day, locationHistory = emptyList(), historyHasMore = false) }
+        refreshHistory(if (repo.demoMode) demo.read() else null, force = true)
+    }
+    fun loadMoreHistory() {
+        if (repo.role != "guardian" || historyJob?.isActive == true || historyCursor == null) return
+        refreshHistory(if (repo.demoMode) demo.read() else null, append = true)
+    }
+    private fun resetHistorySelection() {
+        historyJob?.cancel()
+        historyGeneration++
+        historyCursor = null
+        historyDaySelected = false
+        mutableState.update { it.copy(locationHistory = emptyList(), historyDays = emptyList(),
+            historyDay = LocalDate.now().toString(), historyHasMore = false, historyLoading = false) }
+    }
+    private fun refreshHistory(snapshot: FamilySnapshot? = null, append: Boolean = false, force: Boolean = false) {
+        if (historyJob?.isActive == true && !force) return
+        val generation = ++historyGeneration
+        val isDemo = repo.demoMode
+        val requested = mutableState.value.historyDay.takeIf { historyDaySelected }
+        val cursor = if (append) historyCursor else null
+        mutableState.update { it.copy(historyLoading = true) }
+        historyJob = viewModelScope.launch {
+            try {
+                val page = if (isDemo) withContext(Dispatchers.Default) {
+                    MovementHistoryDates.demoPage((snapshot ?: demo.read()).events, requested, cursor)
+                } else repo.movementHistory(requested, cursor)
+                if (generation != historyGeneration || repo.role != "guardian" || repo.demoMode != isDemo) return@launch
+                val oldHistory = mutableState.value
+                val (preserve, events) = withContext(Dispatchers.Default) {
+                    val old = oldHistory
+                    val existingIds = old.locationHistory.map { it.id }.toHashSet()
+                    // Retain already expanded rows on routine refreshes when the pages overlap.
+                    // A large newly received batch without overlap starts a fresh contiguous page.
+                    val preserve = old.historyDay == page.day && (append || page.events.any { it.id in existingIds })
+                    val events = if (preserve) (page.events + old.locationHistory).distinctBy { it.id }
+                        .map { (MovementHistoryDates.epoch(it) ?: Long.MIN_VALUE) to it }
+                        .sortedWith(compareByDescending<Pair<Long, kr.family.homeway.data.FamilyEvent>> { it.first }.thenByDescending { it.second.id })
+                        .map { it.second }
+                        else page.events
+                    preserve to events
+                }
+                if (generation != historyGeneration || repo.role != "guardian" || repo.demoMode != isDemo) return@launch
+                historyDaySelected = historyDaySelected || page.days.isNotEmpty()
+                if (append || !preserve) historyCursor = page.next
+                mutableState.update { old ->
+                    old.copy(locationHistory = events, historyDays = page.days, historyDay = page.day,
+                        historyHasMore = historyCursor != null, historyLoading = false)
+                }
+            } catch (error: kotlinx.coroutines.CancellationException) { throw error }
+            catch (_: Exception) {
+                if (generation == historyGeneration) mutableState.update { it.copy(historyLoading = false,
+                    error = "이동 기록을 불러오지 못했어요. 잠시 후 다시 시도해 주세요.") }
+            }
         }
     }
     fun sendChat(text:String) {
@@ -176,7 +258,7 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         refreshJob?.cancel(); awaitedLocationId=null
         perform {
             TrackingService.stopAndAwait(getApplication())
-            repo.reset(); mutableState.value=UiState()
+            repo.reset(); resetHistorySelection(); mutableState.value=UiState()
         }
     }
     fun clearNotice() { mutableState.update { it.copy(notice=null,error=null) } }

@@ -52,9 +52,10 @@
     if (!failed) status.hidden = true;
   });
 
-  recenter.addEventListener("click", () => {
+  function focusLocation() {
     if (latest) map.setView(latest, Math.max(map.getZoom(), 16), { animate: false });
-  });
+  }
+  recenter.addEventListener("click", focusLocation);
   retry.addEventListener("click", () => {
     failed = false;
     showStatus("지도를 다시 불러오고 있어요…", false);
@@ -74,13 +75,14 @@
         tiles.addTo(map);
         accuracyCircle = L.circle(latest, { radius, color: "#245b46", weight: 1.5, fillOpacity: .12 }).addTo(map);
         marker = L.circleMarker(latest, { radius: 9, color: "#fff", weight: 3, fillColor: "#245b46", fillOpacity: 1 })
-          .addTo(map).bindTooltip("마지막 측정 위치", { permanent: true, direction: "top", offset: [0, -11] });
+          .addTo(map).bindTooltip("기록된 위치", { permanent: true, direction: "top", offset: [0, -11] });
         recenter.disabled = false;
       } else {
         marker.setLatLng(latest);
         accuracyCircle.setLatLng(latest).setRadius(radius);
         // New points update the marker, while preserving the view the parent chose.
       }
-    }
+    },
+    recenter: focusLocation
   });
 })();

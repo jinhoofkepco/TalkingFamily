@@ -4,6 +4,7 @@ import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -40,8 +41,10 @@ import kr.family.homeway.data.Redemption
 import kr.family.homeway.data.Reward
 import kr.family.homeway.data.ServiceNotificationSettings
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.time.Duration
 import java.time.Instant
+import java.time.LocalDate
 import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -245,7 +248,7 @@ private fun FamilyHome(state: UiState, actions: UiActions) {
                     selectReward = { selectedRewardId = it; openPopup("reward-confirm") },
                     openFamily = { openPopup("settings-family") },
                 )
-                parent && tab == "location" -> LocationScreen(state)
+                parent && tab == "location" -> LocationScreen(state, actions)
                 else -> ChatScreen(state, actions, { openPopup("settings-menu") }, { openPopup("stickers") })
             }
         }
@@ -396,52 +399,93 @@ private fun ChatBubble(event: FamilyEvent, role: String, demo: Boolean) {
 }
 
 @Composable
-private fun LocationScreen(state: UiState) {
+private fun LocationScreen(state: UiState, actions: UiActions) {
     val now by produceState(Instant.now()) {
         while (true) { delay(30_000); value = Instant.now() }
     }
-    val readings = state.events.filter { it.kind == "location" || it.kind == "vertical" }.sortedByDescending { eventTime(it) }
-    val latest = readings.firstOrNull { it.kind == "location" && locationPoint(it) != null }
-    val point = latest?.let(::locationPoint)
-    LazyColumn(Modifier.fillMaxSize().testTag("location-list"), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+    val readings = state.locationHistory
+    var selectedRecordId by rememberSaveable(state.historyDay) { mutableStateOf<String?>(null) }
+    var focusRequest by rememberSaveable(state.historyDay) { mutableIntStateOf(0) }
+    val selected = readings.firstOrNull { it.id == selectedRecordId && it.kind == "location" && locationPoint(it) != null }
+        ?: readings.firstOrNull { it.kind == "location" && locationPoint(it) != null }
+    val point = selected?.let(::locationPoint)
+    val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    var dateMenu by remember { mutableStateOf(false) }
+    val dayIndex = state.historyDays.indexOf(state.historyDay)
+    LazyColumn(Modifier.fillMaxSize().testTag("location-list"), state = listState, contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        item(key = "history-day") {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton({ state.historyDays.getOrNull(dayIndex + 1)?.let(actions.selectHistoryDay) }, enabled = dayIndex >= 0 && dayIndex + 1 < state.historyDays.size) { Icon(Icons.Outlined.ChevronLeft, "이전 기록 날짜") }
+                Box(Modifier.weight(1f)) {
+                    OutlinedButton({ dateMenu = true }, Modifier.fillMaxWidth().testTag("history-date-selector"), enabled = state.historyDays.isNotEmpty()) {
+                        Icon(Icons.Outlined.CalendarMonth, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp))
+                        Text(historyDateLabel(state.historyDay)); Spacer(Modifier.width(4.dp)); Icon(Icons.Outlined.ExpandMore, null)
+                    }
+                    DropdownMenu(dateMenu, { dateMenu = false }, modifier = Modifier.heightIn(max = 320.dp)) {
+                        state.historyDays.forEach { day ->
+                            DropdownMenuItem(text = { Text(historyDateLabel(day)) }, onClick = { dateMenu = false; actions.selectHistoryDay(day) })
+                        }
+                    }
+                }
+                IconButton({ state.historyDays.getOrNull(dayIndex - 1)?.let(actions.selectHistoryDay) }, enabled = dayIndex > 0) { Icon(Icons.Outlined.ChevronRight, "다음 기록 날짜") }
+            }
+            if (state.historyLoading) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Forest)
+        }
         item {
-            if (point == null) EmptyCard(Icons.Outlined.LocationOn, "아직 공유된 위치가 없어요", "자녀가 대화에서 현재 위치를 보내거나\n설정에서 자동 공유를 켜면 표시됩니다.")
+            if (point == null) EmptyCard(Icons.Outlined.LocationOn,
+                if (state.historyLoading) "기록을 불러오고 있어요" else if (state.historyHasMore) "불러온 기록에는 위치가 없어요" else "이 날짜의 위치 기록이 없어요",
+                if (state.historyHasMore) "아래의 ‘이전 기록 더 보기’에서 앞선 위치를 찾아볼 수 있어요." else "자녀가 공유한 위치를 날짜별로 모아 보여 드려요.")
             else SectionCard {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(if (state.demoMode) "예시 위치" else "마지막으로 확인한 위치", Modifier.weight(1f), fontWeight = FontWeight.Bold)
-                    Pill(if (latest.payload.optString("source") == "automatic") "자동 기록" else "직접 공유")
+                    Text("${displayTime(eventTime(selected))} 위치 기록", Modifier.weight(1f), fontWeight = FontWeight.Bold)
+                    TextButton({
+                        selectedRecordId = null
+                        focusRequest++
+                        state.historyDays.firstOrNull()?.let(actions.selectHistoryDay)
+                    }) { Text("최신 기록") }
                 }
-                Surface(shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth().height(320.dp).testTag("embedded-location-map")) {
-                    EmbeddedLocationMap(point.first, point.second, latest.payload.optDouble("accuracy", Double.NaN), Modifier.fillMaxSize())
+                Surface(shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth().height(270.dp).testTag("embedded-location-map")) {
+                    EmbeddedLocationMap(point.first, point.second, selected.payload.optDouble("accuracy", Double.NaN), Modifier.fillMaxSize(), focusToken = "${state.historyDay}/${selectedRecordId?.takeIf { it == selected.id } ?: "latest"}/$focusRequest")
                 }
-                Text("측정 ${displayTime(eventTime(latest), includeDate = true)}", fontWeight = FontWeight.Medium)
+                Text("측정 ${displayTime(eventTime(selected), includeDate = true)}", fontWeight = FontWeight.Medium)
                 Text(coordinateText(point.first, point.second), fontSize = 12.sp, color = Muted)
-                val locationAge = elapsedMinutes(eventTime(latest), now)
+                val locationAge = elapsedMinutes(eventTime(selected), now)
                 if (!state.demoMode && locationAge != null && locationAge >= 10) {
-                    Text("${locationAge}분 전에 측정한 위치입니다. 현재 위치와 다를 수 있어요.", fontSize = 12.sp, color = Gold, lineHeight = 19.sp)
+                    Text("저장된 과거 위치입니다. 현재 위치와 다를 수 있어요.", fontSize = 12.sp, color = Gold, lineHeight = 19.sp)
                 }
-                val accuracy = latest.payload.optDouble("accuracy", Double.NaN)
-                Text(if (accuracy.isFinite()) "위치 오차 약 ${accuracy.toInt()}m · ${deliveryLabel(latest.delivery, state.demoMode)}" else "위치 정확도 정보 없음 · ${deliveryLabel(latest.delivery, state.demoMode)}", fontSize = 12.sp, color = Muted)
+                val accuracy = selected.payload.optDouble("accuracy", Double.NaN)
+                Text(if (accuracy.isFinite()) "위치 오차 약 ${accuracy.toInt()}m" else "위치 정확도 정보 없음", fontSize = 12.sp, color = Muted)
                 if (state.demoMode) Text("체험 위치 · 실제 위치를 수집하지 않아요", fontSize = 12.sp, color = Muted)
             }
         }
         item {
             Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                Text("오는 길 기록", fontSize = 19.sp, fontWeight = FontWeight.Bold)
-                Text("GPS 위치와 오르내림은 따로 기록돼요.\n높이 변화는 추정이며, 현재 층수를 뜻하지 않아요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
+                Text("시간별 기록", fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                Text("위치 기록을 누르면 그 시각의 지도를 볼 수 있어요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
+                Text("${readings.size}${if (state.historyHasMore) "+" else ""}개 기록 · 최근 시각부터", color = Muted, fontSize = 11.sp)
             }
         }
-        if (readings.isEmpty()) item { Text("새 기록이 도착하면 여기에 모아 보여 드릴게요.", color = Muted, fontSize = 13.sp) }
-        items(readings, key = { it.id }) { event -> TimelineCard(event, state.demoMode) }
+        if (readings.isEmpty() && !state.historyLoading) item { Text("이 날짜에 받은 기록이 아직 없어요.", color = Muted, fontSize = 13.sp) }
+        readings.groupBy { historyHour(eventTime(it)) }.forEach { (hour, events) ->
+            item(key = "hour-$hour") { Text(hour, fontWeight = FontWeight.Bold, color = Forest, modifier = Modifier.padding(top = 8.dp)) }
+            items(events, key = { it.id }) { event ->
+                TimelineCard(event, selected = event.id == selected?.id, onSelect = if (event.kind == "location" && locationPoint(event) != null) ({
+                    selectedRecordId = event.id
+                    focusRequest++
+                    scope.launch { listState.animateScrollToItem(1) }
+                }) else null)
+            }
+        }
+        if (state.historyHasMore) item { OutlinedButton(actions.loadMoreHistory, Modifier.fillMaxWidth(), enabled = !state.historyLoading) { Text("이전 기록 더 보기") } }
         item { Spacer(Modifier.height(8.dp)) }
     }
 }
 
 @Composable
-private fun TimelineCard(event: FamilyEvent, demo: Boolean) {
+private fun TimelineCard(event: FamilyEvent, selected: Boolean = false, onSelect: (() -> Unit)? = null) {
     val vertical = event.kind == "vertical"
     val phase = event.payload.optString("phase")
-    val ascent = phase.startsWith("ascent")
     val label = when (phase) {
         "ascent_started" -> "올라가기 시작"
         "ascent_finished" -> "올라가기 종료"
@@ -449,17 +493,20 @@ private fun TimelineCard(event: FamilyEvent, demo: Boolean) {
         "descent_finished" -> "내려가기 종료"
         else -> "높이 변화"
     }
-    SectionCard {
-        Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Box(Modifier.size(38.dp).background(if (vertical) WarmGold else Mint, CircleShape), contentAlignment = Alignment.Center) {
-                Icon(if (!vertical) Icons.Outlined.LocationOn else if (ascent) Icons.Outlined.NorthEast else Icons.Outlined.SouthEast, null, Modifier.size(20.dp), tint = if (vertical) Gold else Forest)
-            }
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+    Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+        Text(displayTime(eventTime(event)), Modifier.width(45.dp).padding(top = 16.dp), fontWeight = FontWeight.Medium, fontSize = 12.sp, color = Muted)
+        Box(Modifier.width(12.dp).fillMaxHeight(), contentAlignment = Alignment.TopCenter) {
+            Box(Modifier.width(2.dp).fillMaxHeight().background(Mint))
+            Box(Modifier.padding(top = 21.dp).size(10.dp).background(if (selected) Forest else Gold, CircleShape))
+        }
+        Surface(onClick = { onSelect?.invoke() }, enabled = onSelect != null, shape = RoundedCornerShape(18.dp), color = if (selected) Mint else Color.White,
+            border = BorderStroke(1.dp, if (selected) Forest else Color(0xFFE0E7DE)), modifier = Modifier.weight(1f).testTag("history-record-${event.id}")) {
+            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                    Text(if (vertical) label else if (event.payload.optString("source") == "automatic") "5분 자동 위치 기록" else "현재 위치 직접 공유", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text(if (vertical) label else if (event.payload.optString("source") == "automatic") "자동 위치 기록" else "직접 공유한 위치", Modifier.weight(1f), fontWeight = FontWeight.Bold, fontSize = 14.sp)
                     if (vertical) Pill("추정", gold = true)
                 }
-                Text(displayTime(eventTime(event), includeDate = true), color = Muted, fontSize = 12.sp)
+                Text(historyClock(eventTime(event)), color = Muted, fontSize = 12.sp)
                 if (vertical) {
                     val delta = event.payload.optDouble("relativeMeters", Double.NaN)
                     if (delta.isFinite()) Text("상대 높이 변화 ${if (delta >= 0) "+" else ""}${String.format(Locale.KOREA, "%.1f", delta)}m", fontSize = 12.sp, color = Muted)
@@ -468,11 +515,23 @@ private fun TimelineCard(event: FamilyEvent, demo: Boolean) {
                     val accuracy = event.payload.optDouble("accuracy", Double.NaN)
                     if (accuracy.isFinite()) Text("위치 오차 약 ${accuracy.toInt()}m", fontSize = 12.sp, color = Muted)
                 }
-                Text(deliveryLabel(event.delivery, demo), fontSize = 11.sp, color = Muted)
+                Text(if (selected) "지도에 표시 중" else if (onSelect != null) "눌러서 지도 보기" else "높이 변화 추정", fontSize = 11.sp, color = if (selected) Forest else Muted)
             }
         }
     }
 }
+
+private fun historyDateLabel(day: String): String = runCatching {
+    LocalDate.parse(day).format(DateTimeFormatter.ofPattern("yyyy년 M월 d일 (E)", Locale.KOREA))
+}.getOrDefault("날짜 선택")
+
+private fun historyHour(value: String): String = runCatching {
+    DateTimeFormatter.ofPattern("HH시", Locale.KOREA).withZone(ZoneId.systemDefault()).format(Instant.parse(value))
+}.getOrDefault("시각 정보 없음")
+
+private fun historyClock(value: String): String = runCatching {
+    DateTimeFormatter.ofPattern("HH:mm:ss", Locale.KOREA).withZone(ZoneId.systemDefault()).format(Instant.parse(value))
+}.getOrDefault(value)
 
 @Composable
 private fun StickerScreen(

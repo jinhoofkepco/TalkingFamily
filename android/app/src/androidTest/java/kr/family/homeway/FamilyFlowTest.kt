@@ -7,6 +7,8 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.text.AnnotatedString
 import androidx.test.platform.app.InstrumentationRegistry
+import androidx.lifecycle.ViewModelProvider
+import kr.family.homeway.data.DemoState
 import kr.family.homeway.data.DemoStore
 import kr.family.homeway.data.LocalStore
 import kr.family.homeway.overlay.FloatingStarService
@@ -16,6 +18,8 @@ import org.junit.Test
 import org.junit.Assert.*
 import org.junit.rules.ExternalResource
 import java.io.File
+import java.time.LocalDate
+import java.time.ZoneId
 
 class FamilyFlowTest {
     private val context get() = InstrumentationRegistry.getInstrumentation().targetContext
@@ -146,8 +150,23 @@ class FamilyFlowTest {
         compose.onNodeWithTag("chat-input").assertIsDisplayed()
     }
 
-    @Test fun guardianStartsWithSharingStatusAndFourDistinctPhases() {
+    @Test fun guardianShowsDateTimelineAndFourDistinctMovementPhases() {
         enterDemo(guardian = true)
+        // Keep every phase on one local date, including runs just after midnight.
+        val day = LocalDate.of(2026, 9, 21)
+        val seed = DemoState.initial(day.atTime(12, 0).atZone(ZoneId.systemDefault()).toInstant())
+        context.getSharedPreferences("homeway_demo", Context.MODE_PRIVATE).edit().putString("state", seed.toString()).commit()
+        lateinit var model: HomewayViewModel
+        compose.runOnUiThread {
+            model = ViewModelProvider(compose.activity)[HomewayViewModel::class.java]
+            model.refresh()
+            model.selectHistoryDay(day.toString())
+        }
+        compose.waitUntil(5000) {
+            val state = model.state.value
+            !state.historyLoading && state.historyDay == day.toString() && state.locationHistory.size == 6 &&
+                compose.onAllNodesWithTag("embedded-location-map").fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithTag("nav-location").assertIsSelected()
         compose.onNodeWithText("우리 오는 길", useUnmergedTree = true).assertDoesNotExist()
         compose.onNodeWithText("보호자의 공간").assertDoesNotExist()

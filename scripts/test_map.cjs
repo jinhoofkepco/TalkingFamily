@@ -79,6 +79,7 @@ async function markerCenter(page) {
     page.on("pageerror", error => scriptErrors.push(error.message));
     await page.goto(pageUrl);
     await page.waitForFunction(() => !!window.FamilyMap);
+    await page.evaluate(() => window.FamilyMap.recenter());
     assert.equal(tileRequests.length, 0, "no tile request before coordinates arrive");
     assert.equal(await page.locator("#recenter").isDisabled(), true);
     await page.evaluate(() => {
@@ -125,13 +126,46 @@ async function markerCenter(page) {
     assert.ok(Math.hypot(movedMarker.x - oldMarker.x, movedMarker.y - oldMarker.y) > 5, "marker moves to new location");
     assert.equal(tileRequests.length, requestsBeforeUpdate, "marker update does not fetch new viewport tiles");
     checks.push("New point moves marker and preserves user pan/zoom without tile requests");
-    await page.getByRole("button", { name: "마지막 측정 위치로 지도 이동" }).click();
+    await page.getByRole("button", { name: "선택한 기록의 위치로 지도 이동" }).click();
     await loaded(page);
     const centeredMarker = await markerCenter(page);
     assert.ok(Math.abs(centeredMarker.x - 180) < 2 && Math.abs(centeredMarker.y - 150) < 2, "recenter uses latest point");
     assert.equal(page.url(), pageUrl);
     checks.push("Recenter returns to latest point without external navigation");
     await page.screenshot({ path: path.join(output, "map-recentered.png") });
+
+    const beforeHistorySelection = await viewSnapshot(page);
+    const zoomBeforeHistorySelection = new URL(beforeHistorySelection.tiles[0].src).pathname.split("/")[1];
+    // Native history selection sends the selected point and an explicit recenter in order.
+    await page.evaluate(() => {
+      window.FamilyMap.setLocation(37.552, 126.965, 9);
+      window.FamilyMap.recenter();
+    });
+    await loaded(page);
+    const historyMarker = await markerCenter(page);
+    assert.ok(Math.abs(historyMarker.x - 180) < 2 && Math.abs(historyMarker.y - 150) < 2,
+      "history selection centers the newly selected point, not the previous point");
+    const selectedHistoryView = await viewSnapshot(page);
+    assert.notDeepEqual(selectedHistoryView, beforeHistorySelection, "a distant history point changes the viewport");
+    assert.ok(selectedHistoryView.tiles.every(tile => new URL(tile.src).pathname.split("/")[1] === zoomBeforeHistorySelection),
+      "explicit history selection preserves a zoom level above the minimum focus zoom");
+    await page.mouse.move(170, 170);
+    await page.mouse.down();
+    await page.mouse.move(225, 195, { steps: 8 });
+    await page.mouse.up();
+    await page.waitForTimeout(650);
+    const pannedHistoryMarker = await markerCenter(page);
+    assert.ok(Math.hypot(pannedHistoryMarker.x - 180, pannedHistoryMarker.y - 150) > 20,
+      "the user can pan away from a historical selection");
+    // Selecting that same record again may send only recenter, without a coordinate update.
+    await page.evaluate(() => window.FamilyMap.recenter());
+    await loaded(page);
+    const refocusedHistoryMarker = await markerCenter(page);
+    assert.ok(Math.abs(refocusedHistoryMarker.x - 180) < 2 && Math.abs(refocusedHistoryMarker.y - 150) < 2,
+      "direct recenter refocuses the existing historical point without setLocation");
+    assert.equal(page.url(), pageUrl);
+    checks.push("History selection API focuses the selected point and refocuses an unchanged record while preserving zoom");
+    await page.screenshot({ path: path.join(output, "map-history-selection.png") });
 
     failTiles = true;
     await page.reload();

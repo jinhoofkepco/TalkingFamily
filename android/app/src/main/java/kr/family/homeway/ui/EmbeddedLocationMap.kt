@@ -45,6 +45,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.webkit.WebViewAssetLoader
+import kr.family.homeway.BuildConfig
 import java.io.ByteArrayInputStream
 
 /** A local, bridge-free map whose only remote resources are public OSM map tiles. */
@@ -54,6 +55,7 @@ fun EmbeddedLocationMap(
     longitude: Double,
     accuracy: Double,
     modifier: Modifier = Modifier,
+    focusToken: String? = null,
 ) {
     val location = EmbeddedMapPolicy.location(latitude, longitude, accuracy)
     var failed by remember { mutableStateOf(false) }
@@ -103,7 +105,7 @@ fun EmbeddedLocationMap(
                     modifier = Modifier.fillMaxSize(),
                     onRelease = { controller.release() },
                     update = {
-                        controller.setLocation(location)
+                        controller.setLocation(location, focusToken)
                         if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
                             controller.resume()
                         } else {
@@ -124,6 +126,8 @@ private class MapViewController(
     private var webView: WebView? = null
     private var location: EmbeddedMapLocation? = null
     private var deliveredLocation: EmbeddedMapLocation? = null
+    private var focusToken: String? = null
+    private var focusRequested = false
     private var ready = false
     private val handler = Handler(Looper.getMainLooper())
     private val loadTimeout = Runnable { if (webView != null && !ready) fail() }
@@ -143,7 +147,10 @@ private class MapViewController(
             .build()
         return MapWebView(context).also { view ->
             webView = view
-            view.contentDescription = "자녀의 최근 위치 지도. 손가락으로 이동하거나 두 손가락으로 확대할 수 있어요."
+            // WebView forces HTML percentage heights to zero with WRAP_CONTENT, even
+            // when Compose supplies an exact measured height. Use the map card bounds.
+            view.layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            view.contentDescription = "선택한 기록의 위치 지도. 손가락으로 이동하거나 두 손가락으로 확대할 수 있어요."
             view.isVerticalScrollBarEnabled = false
             view.isHorizontalScrollBarEnabled = false
             view.overScrollMode = View.OVER_SCROLL_NEVER
@@ -164,7 +171,7 @@ private class MapViewController(
                 setGeolocationEnabled(false)
                 mediaPlaybackRequiresUserGesture = true
                 safeBrowsingEnabled = true
-                userAgentString = "$userAgentString TalkingFamily/0.4.1 (+https://github.com/jinhoofkepco/TalkingFamily)"
+                userAgentString = "$userAgentString TalkingFamily/${BuildConfig.VERSION_NAME} (+https://github.com/jinhoofkepco/TalkingFamily)"
             }
             CookieManager.getInstance().apply {
                 setAcceptCookie(false)
@@ -238,16 +245,27 @@ private class MapViewController(
         }
     }
 
-    fun setLocation(value: EmbeddedMapLocation) {
+    fun setLocation(value: EmbeddedMapLocation, focusToken: String?) {
         location = value
+        if (this.focusToken != focusToken) {
+            this.focusToken = focusToken
+            focusRequested = true
+        }
         deliverLocation()
     }
 
     private fun deliverLocation() {
         val value = location ?: return
-        if (!ready || deliveredLocation == value) return
-        webView?.evaluateJavascript(value.javascriptCall(), null)
+        val view = webView ?: return
+        if (!ready || (deliveredLocation == value && !focusRequested)) return
+        val script = buildString {
+            if (deliveredLocation != value) append(value.javascriptCall())
+            // Focus identity stays native. Only an explicit selection change recentres the map.
+            if (focusRequested) append("window.FamilyMap.recenter();")
+        }
+        view.evaluateJavascript(script, null)
         deliveredLocation = value
+        focusRequested = false
     }
 
     fun resume() { webView?.onResume() }
