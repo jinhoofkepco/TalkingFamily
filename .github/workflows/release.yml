@@ -1,0 +1,132 @@
+name: Signed Android release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing main-branch version tag, for example v0.3.1'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Keep version checks and publication sequential across all version tags.
+concurrency:
+  group: talkingfamily-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, verify, and publish signed APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Validate version tag format
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Release tags must have the form v0.3.1.' >&2
+            exit 1
+          fi
+      - name: Check out version tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require tagged commit from main
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main
+      - name: Refuse to replace an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "A release for $RELEASE_TAG already exists. Bump the version and create a new tag." >&2
+            exit 1
+          fi
+      - name: Set up Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - name: Install Android SDK packages
+        run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.1"'
+      - name: Install server dependencies
+        run: npm ci
+        working-directory: server
+      - name: Test server
+        run: npm test
+        working-directory: server
+      - name: Build and verify release with the existing app signing key
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TALKINGFAMILY_KEYSTORE_BASE64: ${{ secrets.TALKINGFAMILY_KEYSTORE_BASE64 }}
+          TALKINGFAMILY_STORE_PASSWORD: ${{ secrets.TALKINGFAMILY_STORE_PASSWORD }}
+          TALKINGFAMILY_KEY_ALIAS: ${{ secrets.TALKINGFAMILY_KEY_ALIAS }}
+          TALKINGFAMILY_KEY_PASSWORD: ${{ secrets.TALKINGFAMILY_KEY_PASSWORD }}
+          MAPS_API_KEY: ${{ secrets.MAPS_API_KEY }}
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${TALKINGFAMILY_KEYSTORE_BASE64:?Missing signing keystore secret}"
+          : "${TALKINGFAMILY_STORE_PASSWORD:?Missing keystore password secret}"
+          : "${TALKINGFAMILY_KEY_ALIAS:?Missing signing key alias secret}"
+          : "${TALKINGFAMILY_KEY_PASSWORD:?Missing signing key password secret}"
+          umask 077
+          export TALKINGFAMILY_KEYSTORE_FILE="$RUNNER_TEMP/talkingfamily-signing.p12"
+          cleanup() {
+            rm -f "$TALKINGFAMILY_KEYSTORE_FILE" android/app/google-services.json
+          }
+          trap cleanup EXIT
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+
+          encoded = os.environ['TALKINGFAMILY_KEYSTORE_BASE64']
+          Path(os.environ['TALKINGFAMILY_KEYSTORE_FILE']).write_bytes(base64.b64decode(encoded, validate=True))
+          services = os.environ.get('GOOGLE_SERVICES_JSON', '').strip()
+          if services:
+              json.loads(services)
+              Path('android/app/google-services.json').write_text(services, encoding='utf-8')
+          PY
+          unset TALKINGFAMILY_KEYSTORE_BASE64 GOOGLE_SERVICES_JSON
+          python3 scripts/package_release.py --tag "$RELEASE_TAG"
+      - name: Publish new GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="dist/TalkingFamily-${RELEASE_TAG#v}.apk"
+          test -f "$apk"
+          test -f "$apk.sha256"
+          test -f dist/release-notes.md
+          test -f dist/release-manifest.json
+          gh release create "$RELEASE_TAG" "$apk" "$apk.sha256" dist/release-manifest.json \
+            --verify-tag --title "TalkingFamily $RELEASE_TAG" \
+            --notes-file dist/release-notes.md
