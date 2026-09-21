@@ -413,18 +413,16 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
     var selectedRecordId by rememberSaveable(state.historyDay) { mutableStateOf<String?>(null) }
     var focusRequest by rememberSaveable(state.historyDay) { mutableIntStateOf(0) }
     val locations = remember(readings) {
-        readings.filter { it.kind == "location" && locationPoint(it) != null && runCatching { Instant.parse(eventTime(it)) }.isSuccess }
+        readings.filter { it.toEmbeddedMapHistoryPoint() != null }
             .sortedWith(compareBy<FamilyEvent> { Instant.parse(eventTime(it)) }.thenBy { it.id })
     }
     val historyPoints = remember(locations) {
-        locations.map { event ->
-            val coordinates = locationPoint(event)!!
-            EmbeddedMapHistoryPoint(coordinates.first, coordinates.second, event.payload.optDouble("accuracy", Double.NaN), Instant.parse(eventTime(event)).toEpochMilli())
-        }
+        locations.map { it.toEmbeddedMapHistoryPoint()!! }
     }
     val selectedIndex = locations.indexOfFirst { it.id == selectedRecordId }.takeIf { it >= 0 } ?: locations.lastIndex
     val selected = locations.getOrNull(selectedIndex)
     val point = selected?.let(::locationPoint)
+    val selectedMapPoint = historyPoints.getOrNull(selectedIndex)?.let(EmbeddedMapPolicy::historyPoint)
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     var dateMenu by remember { mutableStateOf(false) }
@@ -457,14 +455,15 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
             if (state.historyLoading) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Forest)
         }
         item {
-            if (point == null) EmptyCard(Icons.Outlined.LocationOn,
+            if (point == null || selectedMapPoint == null) EmptyCard(Icons.Outlined.LocationOn,
                 if (state.historyLoading) "기록을 불러오고 있어요" else if (state.historyHasMore) "불러온 기록에는 위치가 없어요" else "이 날짜의 위치 기록이 없어요",
                 if (state.historyHasMore) "아래의 ‘이전 기록 더 보기’에서 앞선 위치를 찾아볼 수 있어요." else "자녀가 공유한 위치를 날짜별로 모아 보여 드려요.")
             else Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Surface(shape = RoundedCornerShape(22.dp), modifier = Modifier.fillMaxWidth().height(500.dp).testTag("embedded-location-map")) {
                     Box(Modifier.fillMaxSize()) {
                         key(state.historyDay) {
-                            EmbeddedLocationMap(point.first, point.second, selected.payload.optDouble("accuracy", Double.NaN), Modifier.fillMaxSize(),
+                            EmbeddedLocationMap(selectedMapPoint.location.latitude, selectedMapPoint.location.longitude,
+                                selectedMapPoint.location.accuracy ?: Double.NaN, Modifier.fillMaxSize(),
                                 focusToken = "${state.historyDay}/${selectedRecordId?.takeIf { it == selected.id } ?: "latest"}/$focusRequest",
                                 history = historyPoints, selectedHistoryIndex = selectedIndex, timelineInsetDp = timelineInset)
                         }
@@ -479,6 +478,9 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
                                     }
                                     Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
                                         Text(historyClock(eventTime(selected)), fontWeight = FontWeight.Bold, fontSize = 18.sp, modifier = Modifier.testTag("map-selected-time"))
+                                        selectedMapPoint.activityLabel()?.let { label ->
+                                            Text(label, fontSize = 11.sp, color = Forest, modifier = Modifier.testTag("map-selected-activity"))
+                                        }
                                         Text("${selectedIndex + 1} / ${locations.size}${if (state.historyHasMore) "+" else ""} 위치", fontSize = 11.sp, color = Muted)
                                     }
                                     IconButton({ selectPoint(selectedIndex + 1) }, enabled = selectedIndex < locations.lastIndex, modifier = Modifier.size(40.dp)) {
@@ -489,6 +491,10 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
                                         val latestDay = state.historyDays.firstOrNull()
                                         if (latestDay != null && latestDay != state.historyDay) actions.selectHistoryDay(latestDay)
                                     }, contentPadding = PaddingValues(horizontal = 4.dp)) { Text("최신") }
+                                }
+                                if (selectedMapPoint.positionAdjusted) {
+                                    Text("GPS 흔들림 보정", fontSize = 10.sp, color = Muted,
+                                        modifier = Modifier.align(Alignment.CenterHorizontally).testTag("map-position-adjusted"))
                                 }
                                 Slider(value = selectedIndex.coerceAtLeast(0).toFloat(), onValueChange = { selectPoint(it.roundToInt()) },
                                     valueRange = 0f..locations.lastIndex.coerceAtLeast(1).toFloat(),
@@ -508,8 +514,8 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
                 }
                 Text("점선은 기록된 위치를 이은 선이며 실제 이동 경로와 다를 수 있어요.", fontSize = 11.sp, color = Muted, lineHeight = 17.sp)
                 if (state.historyHasMore) Text("이 날짜의 이전 기록은 ‘이전 기록 더 보기’로 지도에 추가할 수 있어요.", fontSize = 12.sp, color = Muted, lineHeight = 18.sp)
-                val accuracy = selected.payload.optDouble("accuracy", Double.NaN)
-                Text("${coordinateText(point.first, point.second)}${if (accuracy.isFinite()) " · 오차 약 ${accuracy.toInt()}m" else ""}", fontSize = 12.sp, color = Muted)
+                val displayed = selectedMapPoint.location
+                Text("${coordinateText(displayed.latitude, displayed.longitude)}${displayed.accuracy?.let { " · 오차 약 ${it.toInt()}m" }.orEmpty()}", fontSize = 12.sp, color = Muted)
                 val locationAge = elapsedMinutes(eventTime(selected), now)
                 if (!state.demoMode && locationAge != null && locationAge >= 10) {
                     Text("저장된 과거 위치입니다. 현재 위치와 다를 수 있어요.", fontSize = 12.sp, color = Gold, lineHeight = 19.sp)
@@ -846,6 +852,15 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
                 }
                 LabelValue("최근 자동 측정", measuredAt ?: "표시할 기록 없음")
                 latestAutomatic?.let { LabelValue("보호자에게 전달", deliveryLabel(it.delivery, false)) }
+            }
+            if (child) {
+                Text("움직임 인식으로 GPS 흔들림을 줄여요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
+                if (!state.demoMode && state.sharingEnabled && !state.motionRecognitionAllowed) {
+                    OutlinedButton(actions.requestMotionRecognition,
+                        Modifier.fillMaxWidth().testTag("motion-recognition-permission"), enabled = !state.loading) {
+                        Text("움직임 인식 허용")
+                    }
+                }
             }
             HorizontalDivider(color = Cream)
             Text("언제든 이 설정에서 위치 공유를 끌 수 있어요. 공유를 끄면 새 자동 수집을 멈춥니다.", color = Muted, fontSize = 13.sp, lineHeight = 21.sp)

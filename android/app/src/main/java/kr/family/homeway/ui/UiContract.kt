@@ -33,6 +33,7 @@ data class UiState(
     val overlayPermissionGranted: Boolean = false,
     val openChatRequestId: Int = 0,
     val overlayPromptVisible: Boolean = false,
+    val motionRecognitionAllowed: Boolean = false,
 )
 
 data class UiActions(
@@ -57,4 +58,5 @@ data class UiActions(
     val setTelegramReceiving: (enabled: Boolean) -> Unit = {},
     val selectHistoryDay: (String) -> Unit = {},
     val loadMoreHistory: () -> Unit = {},
+    val requestMotionRecognition: () -> Unit = {},
 )

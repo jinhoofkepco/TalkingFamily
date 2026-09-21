@@ -27,9 +27,12 @@ import android.os.Looper
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import java.io.FileDescriptor
+import java.io.PrintWriter
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
@@ -59,6 +62,10 @@ class TrackingService : Service(), SensorEventListener {
     private lateinit var repository: AppRepository
     private lateinit var sensors: SensorManager
     private lateinit var policy: AutomaticLocationPolicy
+    private lateinit var activityMotionMonitor: ActivityMotionMonitor
+    private val stationaryFilter = StationaryLocationFilter()
+    private var lastFilteredDisplay: FilteredLocation? = null
+    private var lastFilteredAtElapsedMillis: Long? = null
     private val detector = VerticalMovementDetector()
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -99,6 +106,9 @@ class TrackingService : Service(), SensorEventListener {
     override fun onCreate() {
         super.onCreate()
         repository = AppRepository(applicationContext)
+        activityMotionMonitor = ActivityMotionMonitor(this) { state, at, persistentUntilExit ->
+            stationaryFilter.updateMotion(state, at, persistentUntilExit)
+        }
         runningInstance = this
         sensors = getSystemService(SENSOR_SERVICE) as SensorManager
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(
@@ -166,6 +176,7 @@ class TrackingService : Service(), SensorEventListener {
         lastHeartbeatMillis = now
         repository.noteTrackingStatus("자동 공유 중 · 5분마다 새 위치 확인 · 첫 위치를 기다리고 있어요")
         registerSensors()
+        activityMotionMonitor.refresh()
         startLocationUpdates()
         outboxRelay = scope.launch { TrackingOutboxRelay.run(repository) }
         outgoing.trySend("sharing_status" to JSONObject().put("enabled", true))
@@ -292,18 +303,33 @@ class TrackingService : Service(), SensorEventListener {
             return
         }
         if (!policy.reserve(sample, now)) return
-        val queued = outgoing.trySend("location" to JSONObject()
+        activityMotionMonitor.refresh()
+        val display = stationaryFilter.filter(sample, now)
+        lastFilteredDisplay = display
+        lastFilteredAtElapsedMillis = sample.elapsedRealtimeMillis
+        val payload = JSONObject()
             .put("latitude", sample.latitude)
             .put("longitude", sample.longitude)
             .put("accuracy", sample.accuracyMeters)
             .put("capturedAt", Instant.ofEpochMilli(sample.capturedAtMillis).toString())
-            .put("source", "automatic"))
+            .put("source", "automatic")
+            .put("displayLatitude", display.displayLatitude)
+            .put("displayLongitude", display.displayLongitude)
+            .put("displayAccuracy", display.displayAccuracyMeters)
+            .put("positionAdjusted", display.adjusted)
+            .put("motion", display.motionState.name.lowercase(Locale.ROOT))
+        display.stationarySinceElapsedMillis?.let { since ->
+            val durationAtFix = (sample.elapsedRealtimeMillis - since).coerceAtLeast(0L)
+            payload.put("stationarySince", Instant.ofEpochMilli(sample.capturedAtMillis - durationAtFix).toString())
+        }
+        val queued = outgoing.trySend("location" to payload)
         if (queued.isFailure) policy.cancelReservation()
         // "Saved" is reported by the writer only after the SQLite transaction has committed.
     }
 
     private fun checkDeadlines() {
         if (!started || !repository.sharingEnabled) return
+        activityMotionMonitor.refresh()
         val now = SystemClock.elapsedRealtime()
         if (now - lastHeartbeatMillis >= INTERVAL_MILLIS) {
             lastHeartbeatMillis = now
@@ -374,6 +400,7 @@ class TrackingService : Service(), SensorEventListener {
         ticker?.cancel()
         locationJob?.cancel()
         stopLocationUpdates()
+        activityMotionMonitor.stop()
         unregisterSensors()
         repository.noteTrackingStatus("자동 위치 공유 종료")
         // Stop collection immediately, then let the repository durably save queued metadata.
@@ -403,6 +430,7 @@ class TrackingService : Service(), SensorEventListener {
         mutableRuntime.value = TrackingRuntime(error = error)
         if (repository.sharingEnabled) repository.noteTrackingStatus(error ?: "자동 위치 공유 재개 대기 · 앱을 열면 다시 시작해요.")
         stopLocationUpdates()
+        activityMotionMonitor.stop()
         unregisterSensors()
         outgoing.close()
         scope.cancel()
@@ -411,6 +439,17 @@ class TrackingService : Service(), SensorEventListener {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun dump(fd: FileDescriptor, writer: PrintWriter, args: Array<out String>?) {
+        writer.println("sharingRunning=$started sharingStopping=$stopping")
+        activityMotionMonitor.dump(writer)
+        val display = lastFilteredDisplay
+        val duration = display?.stationarySinceElapsedMillis?.let { since ->
+            lastFilteredAtElapsedMillis?.let { (it - since).coerceAtLeast(0L) }
+        }
+        writer.println("lastDisplayMotion=${display?.motionState ?: MotionState.UNKNOWN} lastPositionAdjusted=${display?.adjusted ?: false}")
+        writer.println("stationaryDurationAtLastFixMillis=${duration ?: "none"}")
+    }
 
     companion object {
         data class TrackingRuntime(val running: Boolean = false, val starting: Boolean = false,
@@ -455,6 +494,26 @@ class TrackingService : Service(), SensorEventListener {
                 TrackingStartPolicy.Decision.CLEAR_CONSENT_AND_STOP -> stop(context)
                 TrackingStartPolicy.Decision.START -> if (!runtime.value.stopping) start(context)
             }
+        }
+
+        /** Refresh an existing child's session after a visible Activity returns from permission UI. */
+        fun refreshActivityRecognition(context: Context) {
+            val active = runningInstance ?: return
+            fun refresh() {
+                if (active.started && !active.stopping &&
+                    startDecision(active.repository, context) == TrackingStartPolicy.Decision.START) {
+                    active.activityMotionMonitor.refresh()
+                }
+            }
+            if (Looper.myLooper() == Looper.getMainLooper()) refresh() else active.handler.post { refresh() }
+        }
+
+        /** A receipt can only enrich an already running, valid, opted-in child session. */
+        internal fun receiveActivityMotion(intent: Intent) {
+            val active = runningInstance ?: return
+            if (!active.started || active.stopping ||
+                startDecision(active.repository, active) != TrackingStartPolicy.Decision.START) return
+            active.activityMotionMonitor.receive(intent)
         }
 
         private fun startDecision(repo: AppRepository, context: Context) = TrackingStartPolicy.decide(

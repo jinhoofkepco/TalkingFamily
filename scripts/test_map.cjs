@@ -217,6 +217,36 @@ async function markerCenter(page) {
       "record beyond the drawn vertex limit remains exactly selectable");
     checks.push("Day route fits all points, timeline inset preserves attribution, refresh preserves view, and all 2501 records remain selectable");
 
+    // Native policy supplies validated display coordinates in the existing numeric tuple.
+    // Stationary records keep distinct timestamps while sharing one stabilized anchor.
+    const stablePoints = [
+      [37.552, 126.965, 35, 1790042400000],
+      [37.552, 126.965, 40, 1790042700000],
+      [37.552, 126.965, 45, 1790043000000],
+      [37.558, 126.971, 12, 1790043300000],
+    ];
+    await page.evaluate(points => {
+      window.FamilyMap.setHistory(points);
+      window.FamilyMap.fitHistory();
+      window.FamilyMap.selectHistory(0);
+    }, stablePoints);
+    await loaded(page);
+    const anchorMarker = await markerCenter(page);
+    const firstTimeLabel = await page.locator(".leaflet-tooltip").last().textContent();
+    await page.evaluate(() => window.FamilyMap.selectHistory(2));
+    assert.deepEqual(await markerCenter(page), anchorMarker, "later stationary record remains at the same anchor");
+    assert.notEqual(await page.locator(".leaflet-tooltip").last().textContent(), firstTimeLabel,
+      "stationary records retain their individual measurement times");
+    const stableRoute = await routeLine.getAttribute("d");
+    await page.evaluate(points => window.FamilyMap.setHistory([points[0], points[3]]), stablePoints);
+    assert.equal(await routeLine.getAttribute("d"), stableRoute,
+      "repeated stabilized anchors introduce no route zigzag");
+    await page.evaluate(() => window.FamilyMap.selectHistory(1));
+    const movementMarker = await markerCenter(page);
+    assert.ok(Math.hypot(movementMarker.x - anchorMarker.x, movementMarker.y - anchorMarker.y) > 20,
+      "movement resumes at the fresh location instead of retaining the stationary anchor");
+    checks.push("Stationary anchor removes route zigzag without losing timestamps; movement resumes at the fresh point");
+
     failTiles = true;
     await page.reload();
     await page.waitForFunction(() => !!window.FamilyMap);

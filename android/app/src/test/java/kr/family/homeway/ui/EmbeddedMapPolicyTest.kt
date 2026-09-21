@@ -8,6 +8,56 @@ import org.junit.Test
 import java.util.Locale
 
 class EmbeddedMapPolicyTest {
+    @Test fun stabilizedStationaryPointsShareAnAnchorWhileMovementUsesItsFreshPosition() {
+        val points = listOf(
+            EmbeddedMapHistoryPoint(37.5501, 126.98, 10.0, 300_000,
+                37.55, 126.98, 30.0, true, "still", 0),
+            EmbeddedMapHistoryPoint(37.5499, 126.98, 10.0, 600_000,
+                37.55, 126.98, 30.0, true, "still", 0),
+            EmbeddedMapHistoryPoint(37.552, 126.981, 12.0, 900_000,
+                37.552, 126.981, 12.0, false, "walking"),
+        )
+        val history = EmbeddedMapPolicy.history(points, 1)
+        assertEquals(1, history.selectedIndex)
+        assertEquals(history.points[0].location, history.points[1].location)
+        assertEquals(37.552, history.points[2].location.latitude, 0.0)
+        assertEquals(30.0, history.points[1].location.accuracy!!, 0.0)
+        assertEquals("정지 추정 · 약 10분", history.points[1].activityLabel())
+        assertEquals("걷는 중 추정", history.points[2].activityLabel())
+        assertEquals(37.5499, points[1].latitude, 0.0) // Raw evidence remains unchanged.
+    }
+
+    @Test fun malformedAdjustmentFallsBackToRawCoordinatesWithoutDiscardingTheRecord() {
+        val valid = EmbeddedMapHistoryPoint(37.5501, 126.98, 10.0, 600_000,
+            37.55, 126.98, 30.0, true, "still", 0)
+        val malformed = listOf(
+            valid.copy(displayLongitude = null),
+            valid.copy(displayLatitude = Double.NaN),
+            valid.copy(displayAccuracy = Double.POSITIVE_INFINITY),
+            valid.copy(displayAccuracy = 10.0), // Uncertainty must cover the displaced raw fix.
+            valid.copy(displayLatitude = 38.0, displayAccuracy = 100_000.0),
+            valid.copy(motion = "vehicle"),
+            valid.copy(stationarySinceMillis = 600_001),
+            valid.copy(positionAdjusted = false),
+        )
+        for (point in malformed) {
+            val actual = EmbeddedMapPolicy.historyPoint(point)!!
+            assertEquals(37.5501, actual.location.latitude, 0.0)
+            assertEquals(10.0, actual.location.accuracy!!, 0.0)
+            assertFalse(actual.positionAdjusted)
+            assertNull(actual.stationarySinceMillis)
+        }
+    }
+
+    @Test fun stationaryDurationIsBoundToTheSelectedRecordEvenWhenCoordinatesWereNotAdjusted() {
+        val point = EmbeddedMapHistoryPoint(37.55, 126.98, 10.0, 600_000,
+            37.55, 126.98, 10.0, false, "still", 0)
+        assertEquals("정지 추정 · 약 10분", EmbeddedMapPolicy.historyPoint(point)!!.activityLabel())
+        assertEquals("정지 추정 · 약 5분", EmbeddedMapPolicy.historyPoint(point.copy(measuredAtMillis = 300_000))!!.activityLabel())
+        assertEquals("정지 추정 · 1분 미만", EmbeddedMapPolicy.historyPoint(point.copy(measuredAtMillis = 30_000))!!.activityLabel())
+        assertNull(EmbeddedMapPolicy.historyPoint(point.copy(motion = "unknown"))!!.activityLabel())
+    }
+
     @Test fun historyKeepsSelectionAlignedWhenInvalidRecordsAreSkipped() {
         val points = listOf(
             EmbeddedMapHistoryPoint(Double.NaN, 127.0, 10.0, 1000),

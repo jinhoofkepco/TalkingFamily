@@ -10,6 +10,7 @@
 | 0.4.1 | `versionCode = 6`, `versionName = "0.4.1"` |
 | 0.4.2 | `versionCode = 7`, `versionName = "0.4.2"` |
 | 0.4.3 | `versionCode = 8`, `versionName = "0.4.3"` |
+| 0.4.4 | `versionCode = 9`, `versionName = "0.4.4"` |
 | 인증서 SHA-256 | `db2c91c3bd56513a79878f2d25d59778f61804ff650c866de7c71445c34d12ce` |
 | 이후 배포 | 같은 인증서로 서명하고 `versionCode` 증가 |
 

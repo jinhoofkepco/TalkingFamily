@@ -49,7 +49,14 @@ class MainActivity : ComponentActivity() {
     private var notificationPermissionInFlight = false
     private var trackingResumeAttempted = false
     private var overlayResumeAttempted = false
+    private var motionRecognitionAllowed by mutableStateOf(false)
+    private val motionPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        motionRecognitionAllowed = Build.VERSION.SDK_INT < 29 || has(Manifest.permission.ACTIVITY_RECOGNITION)
+        TrackingService.refreshActivityRecognition(this)
+    }
     private val permissionLauncher=registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        motionRecognitionAllowed = Build.VERSION.SDK_INT < 29 || has(Manifest.permission.ACTIVITY_RECOGNITION)
+        TrackingService.refreshActivityRecognition(this)
         val callback=afterPermission
         afterPermission=null
         val fine=has(Manifest.permission.ACCESS_FINE_LOCATION)
@@ -75,6 +82,7 @@ class MainActivity : ComponentActivity() {
     }
     override fun onCreate(savedInstanceState:Bundle?) {
         super.onCreate(savedInstanceState)
+        motionRecognitionAllowed = Build.VERSION.SDK_INT < 29 || has(Manifest.permission.ACTIVITY_RECOGNITION)
         overlayPermissionGranted = Settings.canDrawOverlays(this)
         overlaySavedEnabled = FloatingStarService.wantsOverlay(this)
         if (savedInstanceState == null) {
@@ -107,6 +115,7 @@ class MainActivity : ComponentActivity() {
                 overlayPermissionGranted = overlayPermissionGranted,
                 openChatRequestId = openChatRequestId,
                 overlayPromptVisible = overlayPromptVisible,
+                motionRecognitionAllowed = motionRecognitionAllowed,
             ), UiActions(
                 configure={ role,token,peer ->
                     getSharedPreferences("homeway_receiver", MODE_PRIVATE).edit().putBoolean("enabled", true).apply()
@@ -124,6 +133,10 @@ class MainActivity : ComponentActivity() {
                 refresh=model::refresh,
                 selectHistoryDay=model::selectHistoryDay,
                 loadMoreHistory=model::loadMoreHistory,
+                requestMotionRecognition={
+                    if (Build.VERSION.SDK_INT >= 29) motionPermissionLauncher.launch(Manifest.permission.ACTIVITY_RECOGNITION)
+                    else TrackingService.refreshActivityRecognition(this)
+                },
                 clearNotice=model::clearNotice,
                 resetConfiguration={
                     if (!model.state.value.demoMode && model.state.value.role == "child" && model.state.value.sharingEnabled) model.resetConfiguration()
@@ -202,6 +215,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onPostResume() {
         super.onPostResume()
+        motionRecognitionAllowed = Build.VERSION.SDK_INT < 29 || has(Manifest.permission.ACTIVITY_RECOGNITION)
+        TrackingService.refreshActivityRecognition(this)
         trackingResumeAttempted = false
         overlayResumeAttempted = false
         overlayPermissionGranted = Settings.canDrawOverlays(this)

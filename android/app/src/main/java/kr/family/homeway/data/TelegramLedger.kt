@@ -39,6 +39,7 @@ internal object TelegramLedger {
                     .put("longitude", number(p, "longitude", -180.0, 180.0))
                     .put("accuracy", number(p, "accuracy", 0.0, 100_000.0))
                     .put("capturedAt", timestamp(p.opt("capturedAt"))).put("source", source)
+                LocationMotionMetadata.copyValidated(p, payload)
             }
             "vertical" -> {
                 val phase = p.opt("phase")
@@ -194,7 +195,11 @@ internal object TelegramLedger {
     private fun digest(event: FamilyEvent): String {
         // Payloads contain only validated primitives; sorting keys makes JSON key order irrelevant.
         val parts = JSONArray().put(event.id).put(event.kind).put(event.sender).put(event.createdAt)
-        event.payload.keys().asSequence().sorted().forEach { key -> parts.put(key).put(event.payload.get(key)) }
+        // Older receivers discard display estimates. Keep the raw event identity stable across an
+        // upgrade/retry; an already-applied event remains immutable (including its original estimates).
+        event.payload.keys().asSequence()
+            .filterNot { event.kind == "location" && it in LocationMotionMetadata.keys }
+            .sorted().forEach { key -> parts.put(key).put(event.payload.get(key)) }
         return MessageDigest.getInstance("SHA-256").digest(parts.toString().toByteArray(Charsets.UTF_8))
             .joinToString("") { "%02x".format(it) }
     }

@@ -1,16 +1,45 @@
 package kr.family.homeway.ui
 
 import java.net.URI
+import kotlin.math.asin
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 data class EmbeddedMapHistoryPoint(
     val latitude: Double,
     val longitude: Double,
     val accuracy: Double,
     val measuredAtMillis: Long,
+    val displayLatitude: Double? = null,
+    val displayLongitude: Double? = null,
+    val displayAccuracy: Double? = null,
+    val positionAdjusted: Boolean = false,
+    val motion: String = "unknown",
+    val stationarySinceMillis: Long? = null,
 )
 
-internal data class ValidatedMapHistoryPoint(val location: EmbeddedMapLocation, val measuredAtMillis: Long) {
+internal data class ValidatedMapHistoryPoint(
+    val location: EmbeddedMapLocation,
+    val measuredAtMillis: Long,
+    val positionAdjusted: Boolean = false,
+    val motion: String = "unknown",
+    val stationarySinceMillis: Long? = null,
+) {
     fun javascriptTuple(): String = "[${location.latitude},${location.longitude},${location.accuracy ?: "null"},$measuredAtMillis]"
+
+    /** Historical estimates end at this measurement, never at the viewer's current time. */
+    fun activityLabel(): String? = when (motion) {
+        "still" -> stationarySinceMillis?.let {
+            val minutes = (measuredAtMillis - it) / 60_000
+            if (minutes == 0L) "정지 추정 · 1분 미만" else "정지 추정 · 약 ${minutes}분"
+        } ?: "정지 추정"
+        "walking" -> "걷는 중 추정"
+        "running" -> "달리는 중 추정"
+        "bicycle" -> "자전거 이동 추정"
+        "vehicle" -> "차량 이동 추정"
+        else -> null
+    }
 }
 
 internal data class ValidatedMapHistory(val points: List<ValidatedMapHistoryPoint>, val selectedIndex: Int) {
@@ -38,11 +67,38 @@ internal object EmbeddedMapPolicy {
 
     fun history(points: List<EmbeddedMapHistoryPoint>, selectedIndex: Int): ValidatedMapHistory {
         val valid = points.mapIndexedNotNull { index, point ->
-            val location = location(point.latitude, point.longitude, point.accuracy) ?: return@mapIndexedNotNull null
-            if (point.measuredAtMillis !in 0L..253402300799999L) return@mapIndexedNotNull null
-            index to ValidatedMapHistoryPoint(location, point.measuredAtMillis)
+            index to (historyPoint(point) ?: return@mapIndexedNotNull null)
         }
         return ValidatedMapHistory(valid.map { it.second }, valid.indexOfFirst { it.first == selectedIndex })
+    }
+
+    fun historyPoint(point: EmbeddedMapHistoryPoint): ValidatedMapHistoryPoint? {
+        val raw = location(point.latitude, point.longitude, point.accuracy) ?: return null
+        if (point.measuredAtMillis !in 0L..253402300799999L) return null
+        val motion = point.motion.takeIf { it in setOf("still", "walking", "running", "bicycle", "vehicle") } ?: "unknown"
+        val stationarySince = point.stationarySinceMillis?.takeIf { motion == "still" && it in 0L..point.measuredAtMillis }
+        // Optional metadata cannot invalidate a usable raw record. A partial or
+        // contradictory adjustment falls back to the original GPS measurement.
+        val candidate = if ((!point.positionAdjusted || (motion == "still" && stationarySince != null)) &&
+            point.displayLatitude != null && point.displayLongitude != null &&
+            point.displayAccuracy?.let { it.isFinite() && it in 0.0..100_000.0 } == true
+        ) location(point.displayLatitude, point.displayLongitude, point.displayAccuracy!!) else null
+        val display = candidate?.takeIf {
+            val displacement = distanceMeters(point.latitude, point.longitude, point.displayLatitude!!, point.displayLongitude!!)
+            point.accuracy.isFinite() && point.accuracy >= 0.0 && displacement <= 250.0 &&
+                it.accuracy!! + 0.01 >= point.accuracy + displacement &&
+                (point.positionAdjusted || displacement <= 0.01)
+        }
+        return ValidatedMapHistoryPoint(display ?: raw, point.measuredAtMillis, display != null && point.positionAdjusted,
+            motion, stationarySince.takeIf { display != null })
+    }
+
+    private fun distanceMeters(latitude: Double, longitude: Double, otherLatitude: Double, otherLongitude: Double): Double {
+        val latitudes = Math.toRadians(otherLatitude - latitude)
+        val longitudes = Math.toRadians(otherLongitude - longitude)
+        val a = sin(latitudes / 2) * sin(latitudes / 2) +
+            cos(Math.toRadians(latitude)) * cos(Math.toRadians(otherLatitude)) * sin(longitudes / 2) * sin(longitudes / 2)
+        return 6_371_000.0 * 2 * asin(sqrt(a.coerceIn(0.0, 1.0)))
     }
 
     fun location(latitude: Double, longitude: Double, accuracy: Double): EmbeddedMapLocation? {
