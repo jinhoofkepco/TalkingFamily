@@ -66,6 +66,7 @@ class TrackingService : Service(), SensorEventListener {
     private val stationaryFilter = StationaryLocationFilter()
     private var lastFilteredDisplay: FilteredLocation? = null
     private var lastFilteredAtElapsedMillis: Long? = null
+    private var lastRawAccuracyMeters: Double? = null
     private val detector = VerticalMovementDetector()
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -307,6 +308,7 @@ class TrackingService : Service(), SensorEventListener {
         val display = stationaryFilter.filter(sample, now)
         lastFilteredDisplay = display
         lastFilteredAtElapsedMillis = sample.elapsedRealtimeMillis
+        lastRawAccuracyMeters = sample.accuracyMeters
         val payload = JSONObject()
             .put("latitude", sample.latitude)
             .put("longitude", sample.longitude)
@@ -448,6 +450,7 @@ class TrackingService : Service(), SensorEventListener {
             lastFilteredAtElapsedMillis?.let { (it - since).coerceAtLeast(0L) }
         }
         writer.println("lastDisplayMotion=${display?.motionState ?: MotionState.UNKNOWN} lastPositionAdjusted=${display?.adjusted ?: false}")
+        writer.println("lastRawAccuracyMeters=${lastRawAccuracyMeters ?: "none"} lastDisplayAccuracyMeters=${display?.displayAccuracyMeters ?: "none"} lastFixAgeMillis=${lastFilteredAtElapsedMillis?.let { SystemClock.elapsedRealtime() - it } ?: "none"}")
         writer.println("stationaryDurationAtLastFixMillis=${duration ?: "none"}")
     }
 

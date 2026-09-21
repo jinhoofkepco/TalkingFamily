@@ -518,7 +518,14 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
                 Text("점선은 기록된 위치를 이은 선이며 실제 이동 경로와 다를 수 있어요.", fontSize = 11.sp, color = Muted, lineHeight = 17.sp)
                 if (state.historyHasMore) Text("이 날짜의 이전 기록은 ‘이전 기록 더 보기’로 지도에 추가할 수 있어요.", fontSize = 12.sp, color = Muted, lineHeight = 18.sp)
                 val displayed = selectedMapPoint.location
-                Text("${coordinateText(displayed.latitude, displayed.longitude)}${displayed.accuracy?.let { " · 오차 약 ${it.toInt()}m" }.orEmpty()}", fontSize = 12.sp, color = Muted)
+                Text(coordinateText(displayed.latitude, displayed.longitude), fontSize = 12.sp, color = Muted)
+                val rawAccuracy = historyPoints[selectedIndex].accuracy.takeIf { it.isFinite() && it >= 0.0 }
+                rawAccuracy?.let { accuracy ->
+                    Text("GPS 측정 오차 약 ${accuracy.roundToInt()}m", fontSize = 12.sp, color = Muted)
+                }
+                if (selectedMapPoint.stationarySinceMillis != null && displayed.accuracy != null) {
+                    Text("보정 표시 범위 약 ${displayed.accuracy.roundToInt()}m · 정지 기준점과의 차이 포함", fontSize = 12.sp, color = Muted)
+                }
                 val locationAge = elapsedMinutes(eventTime(selected), now)
                 if (!state.demoMode && locationAge != null && locationAge >= 10) {
                     Text("저장된 과거 위치입니다. 현재 위치와 다를 수 있어요.", fontSize = 12.sp, color = Gold, lineHeight = 19.sp)
