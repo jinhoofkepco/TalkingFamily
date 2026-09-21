@@ -117,7 +117,7 @@ class FamilyFlowTest {
         compose.onNodeWithTag("nav-chat").assertDoesNotExist()
         compose.onNodeWithTag("nav-stickers").assertDoesNotExist()
         compose.onNodeWithText("자녀 위치").assertDoesNotExist()
-        compose.onNodeWithText("우리 오는 길", useUnmergedTree = true).assertDoesNotExist()
+        compose.onNodeWithText("우리집 칭찬톡", useUnmergedTree = true).assertDoesNotExist()
         screenshot("child-chat")
         compose.onNodeWithTag("share-current-location").assertIsDisplayed().performClick()
         compose.onNodeWithText("체험 위치를 대화에 표시했어요. 실제로 전송하지 않았어요.").assertExists()
@@ -168,7 +168,7 @@ class FamilyFlowTest {
                 compose.onAllNodesWithTag("embedded-location-map").fetchSemanticsNodes().isNotEmpty()
         }
         compose.onNodeWithTag("nav-location").assertIsSelected()
-        compose.onNodeWithText("우리 오는 길", useUnmergedTree = true).assertDoesNotExist()
+        compose.onNodeWithText("우리집 칭찬톡", useUnmergedTree = true).assertDoesNotExist()
         compose.onNodeWithText("보호자의 공간").assertDoesNotExist()
         compose.onNodeWithText("아이의 오는 길").assertDoesNotExist()
         compose.onNodeWithContentDescription("설정").assertDoesNotExist()

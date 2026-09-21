@@ -30,6 +30,8 @@ import android.view.WindowInsets
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import java.io.FileDescriptor
+import java.io.PrintWriter
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -37,7 +39,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kr.family.homeway.MainActivity
 import kr.family.homeway.R
-import kr.family.homeway.data.AppRepository
 
 data class OverlayRuntime(
     val running: Boolean = false,
@@ -66,8 +67,12 @@ class FloatingStarService : Service() {
     private var safeBounds = Rect()
     private val windowRecovery = OverlayWindowRecovery()
     private var recoveryPending = false
+    private var windowFailureCount = 0L
+    private var recoveryAttemptCount = 0L
+    private var lastWindowFailure = "none"
     private val recoverWindow = Runnable {
         recoveryPending = false
+        recoveryAttemptCount += 1
         refreshBubble(resetRecovery = false)
     }
 
@@ -171,10 +176,13 @@ class FloatingStarService : Service() {
 
     private fun showBubble() {
         if (bubble != null || recoveryPending) return
+        // A previous waiting error must not make MainActivity's collapse wait abort before
+        // this new attach has a chance to complete.
+        mutableRuntime.value = mutableRuntime.value.copy(error = null)
         try {
             attachBubble()
         } catch (_: RuntimeException) {
-            handleWindowFailure()
+            handleWindowFailure("attach")
         }
     }
 
@@ -190,7 +198,7 @@ class FloatingStarService : Service() {
             gravity = Gravity.TOP or Gravity.LEFT
             // Android's obscuring-opacity ceiling is 0.8: use only one small, translucent window.
             alpha = 0.72f
-            title = "우리 오는 길 메신저 별"
+            title = "우리집 칭찬톡 메신저 별"
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) setFitInsetsTypes(0)
             x = OverlayGeometry.coordinate(safeBounds.left, safeBounds.right, size, if (preferences.edgeRight) 1f else 0f)
             y = OverlayGeometry.coordinate(safeBounds.top, safeBounds.bottom, size, preferences.verticalFraction)
@@ -211,7 +219,7 @@ class FloatingStarService : Service() {
                     handler.post {
                         if (started && !stopping && bubble == null && !recoveryPending) {
                             try { windowManager.removeViewImmediate(detached) } catch (_: RuntimeException) { }
-                            handleWindowFailure()
+                            handleWindowFailure("detach")
                         }
                     }
                 }
@@ -235,7 +243,9 @@ class FloatingStarService : Service() {
         mutableRuntime.value = mutableRuntime.value.copy(visible = false)
     }
 
-    private fun handleWindowFailure() {
+    private fun handleWindowFailure(reason: String) {
+        windowFailureCount += 1
+        lastWindowFailure = reason
         hideBubble()
         if (!started || stopping) return
         val decision = startDecision(this)
@@ -244,11 +254,16 @@ class FloatingStarService : Service() {
             return
         }
         if (messengerVisible || !screenIsAvailable()) return
-        if (windowRecovery.retryOnce()) {
+        val delay = windowRecovery.nextDelayMillis()
+        if (delay != null) {
             recoveryPending = true
-            handler.postDelayed(recoverWindow, 300L)
+            handler.postDelayed(recoverWindow, delay)
         } else {
-            end("별 아이콘 재개 대기 · 앱을 다시 열면 재시도해요.")
+            // stopSelf would cancel the sticky session and its unlock receiver. Keep the
+            // existing foreground service so the next unlock/activity/configuration event
+            // can recreate the window, with no continuing timer, wake lock or restart loop.
+            mutableRuntime.value = OverlayRuntime(running = true,
+                error = "별 아이콘 표시를 기다리고 있어요. 화면 전환 후 자동으로 다시 표시해요.")
         }
     }
 
@@ -307,7 +322,7 @@ class FloatingStarService : Service() {
             return
         }
         try { windowManager.updateViewLayout(view, layout) } catch (_: RuntimeException) {
-            handleWindowFailure()
+            handleWindowFailure("update")
         }
     }
 
@@ -354,7 +369,7 @@ class FloatingStarService : Service() {
         val open = PendingIntent.getActivity(this, 4100, chatIntent(this),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_homeway)
+            .setSmallIcon(R.drawable.ic_family_notification)
             .setContentTitle("메신저 별 아이콘 켜짐")
             .setContentText("별을 누르면 대화가 열려요. 닫으면 별로 돌아와요.")
             .setContentIntent(open)
@@ -394,6 +409,34 @@ class FloatingStarService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun dump(fd: FileDescriptor, writer: PrintWriter, args: Array<out String>?) {
+        dumpState(writer)
+    }
+
+    private fun dumpState(writer: PrintWriter) {
+        val permission = Settings.canDrawOverlays(this)
+        val interactive = getSystemService(PowerManager::class.java).isInteractive
+        val locked = getSystemService(KeyguardManager::class.java).isKeyguardLocked
+        val account = accountAvailable(this)
+        val state = when {
+            stopping -> "stopping"
+            !started -> "not_started"
+            !preferences.enabled -> "disabled"
+            !permission -> "permission_unavailable"
+            !account -> "account_unavailable"
+            !interactive || locked -> "screen_unavailable"
+            messengerVisible -> "messenger_open"
+            recoveryPending -> "window_retry_pending"
+            bubble?.isAttachedToWindow == true -> "window_attached"
+            else -> "waiting_for_window"
+        }
+        writer.println("overlayServicePresent=true overlayState=$state savedEnabled=${preferences.enabled} hasSavedChoice=${preferences.hasSavedChoice}")
+        writer.println("overlayPermission=$permission accountEligible=$account started=$started stopping=$stopping")
+        writer.println("screenInteractive=$interactive keyguardLocked=$locked messengerVisible=$messengerVisible")
+        writer.println("windowAttached=${bubble?.isAttachedToWindow == true} reportedVisible=${mutableRuntime.value.visible}")
+        writer.println("windowFailures=$windowFailureCount recoveryAttempts=$recoveryAttemptCount burstAttempts=${windowRecovery.attemptsUsed} recoveryPending=$recoveryPending lastWindowFailure=$lastWindowFailure")
+    }
+
     companion object {
         const val ACTION_OPEN_CHAT = "kr.family.homeway.OPEN_CHAT"
         private const val ACTION_START = "kr.family.homeway.START_FLOATING_STAR"
@@ -410,6 +453,21 @@ class FloatingStarService : Service() {
 
         fun wantsOverlay(context: Context): Boolean = OverlayPreferences(context).enabled
         fun hasSavedChoice(context: Context): Boolean = OverlayPreferences(context).hasSavedChoice
+
+        /** MainActivity may expose this through its normal Android dump even when the service is absent. */
+        fun dumpDiagnostics(context: Context, writer: PrintWriter) {
+            val active = runningInstance
+            if (active != null) {
+                active.dumpState(writer)
+                return
+            }
+            val saved = OverlayPreferences(context)
+            val runtime = mutableRuntime.value
+            writer.println("overlayServicePresent=false savedEnabled=${saved.enabled} hasSavedChoice=${saved.hasSavedChoice}")
+            writer.println("overlayPermission=${Settings.canDrawOverlays(context)} accountEligible=${accountAvailable(context)}")
+            writer.println("screenInteractive=${context.getSystemService(PowerManager::class.java).isInteractive} keyguardLocked=${context.getSystemService(KeyguardManager::class.java).isKeyguardLocked} messengerVisible=$messengerVisible")
+            writer.println("runtimeRunning=${runtime.running} runtimeVisible=${runtime.visible} runtimeStarting=${runtime.starting} runtimeStopping=${runtime.stopping} runtimeErrorPresent=${runtime.error != null}")
+        }
 
         /** Call from a visible activity after explaining and obtaining the system overlay permission. */
         fun start(context: Context): Boolean {
@@ -444,9 +502,19 @@ class FloatingStarService : Service() {
         private fun startDecision(context: Context): OverlayStartPolicy.Decision {
             val enabled = OverlayPreferences(context).enabled
             if (!enabled) return OverlayStartPolicy.Decision.STOP
-            val repository = AppRepository(context)
-            return OverlayStartPolicy.decide(enabled, Settings.canDrawOverlays(context), repository.demoMode || repository.configured)
+            return OverlayStartPolicy.decide(enabled, Settings.canDrawOverlays(context), accountAvailable(context))
         }
+
+        private fun accountAvailable(context: Context): Boolean = runCatching {
+            // A visual shortcut does not need to decrypt Telegram credentials. Keystore can
+            // be temporarily unavailable; treating that as disconnect used to erase saved ON.
+            // Only inspect durable configuration and encrypted-record presence, never contents.
+            val settings = context.applicationContext.getSharedPreferences("homeway_settings", Context.MODE_PRIVATE)
+            val credentials = context.applicationContext.getSharedPreferences("homeway_credentials", Context.MODE_PRIVATE)
+            OverlayStartPolicy.accountAvailable(settings.getBoolean("demoMode", false),
+                settings.getString("transport", "") == "telegram_direct", settings.getLong("peerBotId", 0) > 0,
+                !credentials.getString("token", null).isNullOrBlank(), !credentials.getString("iv", null).isNullOrBlank())
+        }.getOrDefault(false)
 
         fun stop(context: Context) {
             OverlayPreferences(context).enabled = false

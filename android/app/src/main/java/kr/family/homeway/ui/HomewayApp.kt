@@ -5,6 +5,7 @@ import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -25,6 +26,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.onSizeChanged
@@ -32,6 +34,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
@@ -45,6 +49,7 @@ import kr.family.homeway.data.FamilyEvent
 import kr.family.homeway.data.Redemption
 import kr.family.homeway.data.Reward
 import kr.family.homeway.data.ServiceNotificationSettings
+import kr.family.homeway.R
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.time.Duration
@@ -103,11 +108,9 @@ private fun Onboarding(state: UiState, actions: UiActions) {
         verticalArrangement = Arrangement.spacedBy(18.dp),
     ) {
         Spacer(Modifier.height(12.dp))
-        Box(Modifier.size(62.dp).background(Forest, RoundedCornerShape(20.dp)), contentAlignment = Alignment.Center) {
-            Icon(Icons.Outlined.Cottage, null, Modifier.size(34.dp), tint = Color.White)
-        }
-        Text("우리 오는 길", fontSize = 32.sp, fontWeight = FontWeight.Bold)
-        Text("집으로 오는 길에도,\n우리의 대화는 이어져요.", fontSize = 20.sp, lineHeight = 29.sp, color = Forest)
+        Image(painterResource(R.drawable.ic_homeway), null, Modifier.size(62.dp).clip(RoundedCornerShape(20.dp)))
+        Text(stringResource(R.string.app_name), fontSize = 32.sp, fontWeight = FontWeight.Bold)
+        Text("대화는 가깝게,\n칭찬은 차곡차곡.", fontSize = 20.sp, lineHeight = 29.sp, color = Forest)
         Text("대화하고, 마음을 전하고, 칭찬을 모으는\n우리 가족만의 작은 공간이에요.", color = Muted, lineHeight = 23.sp)
         SectionCard {
             Text("이 휴대폰은 누가 쓰나요?", fontWeight = FontWeight.Bold)

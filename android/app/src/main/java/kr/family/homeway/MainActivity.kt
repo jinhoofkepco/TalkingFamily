@@ -8,6 +8,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import java.io.FileDescriptor
+import java.io.PrintWriter
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -286,6 +288,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun dump(prefix: String, fd: FileDescriptor?, writer: PrintWriter, args: Array<out String>?) {
+        if (args?.contains("--overlay") == true) {
+            FloatingStarService.dumpDiagnostics(this, writer)
+            return
+        }
+        super.dump(prefix, fd, writer, args)
+    }
+
     private fun startTelegramReceiving() {
         if (!model.state.value.configured) return
         try { TelegramReceiveService.start(this) }
@@ -306,7 +316,7 @@ class MainActivity : ComponentActivity() {
                 Uri.parse("package:$packageName")))
         } catch (_: ActivityNotFoundException) {
             waitingForOverlayPermission = false
-            model.showError("설정 → 앱 → 특별한 접근 → 다른 앱 위에 표시에서 우리 오는 길을 허용해 주세요.")
+            model.showError("설정 → 앱 → 특별한 접근 → 다른 앱 위에 표시에서 우리집 칭찬톡을 허용해 주세요.")
         }
     }
 

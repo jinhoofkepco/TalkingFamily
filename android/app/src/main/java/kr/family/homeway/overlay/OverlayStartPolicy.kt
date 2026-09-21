@@ -5,20 +5,32 @@ internal object OverlayStartPolicy {
 
     fun decide(enabled: Boolean, permission: Boolean, accountAvailable: Boolean): Decision = when {
         !enabled -> Decision.STOP
-        !permission || !accountAvailable -> Decision.CLEAR_CHOICE_AND_STOP
+        !permission -> Decision.CLEAR_CHOICE_AND_STOP
+        // Explicit disconnect already turns the shortcut off. Temporary account unavailability
+        // must never rewrite an enabled preference as a deliberate user choice.
+        !accountAvailable -> Decision.STOP
         else -> Decision.START
     }
+
+    fun accountAvailable(demoMode: Boolean, telegramTransport: Boolean, peerConfigured: Boolean,
+        storedToken: Boolean, storedIv: Boolean): Boolean =
+        demoMode || (telegramTransport && peerConfigured && storedToken && storedIv)
 }
 
-/** A window failure may recreate once, never loop after repeated add/detach failures. */
+/** A short bounded recovery burst, then wait for a real visibility event without stopping the FGS. */
 internal class OverlayWindowRecovery {
-    private var attempted = false
+    var attemptsUsed = 0
+        private set
 
-    fun retryOnce(): Boolean {
-        if (attempted) return false
-        attempted = true
-        return true
+    fun nextDelayMillis(): Long? {
+        val delay = DELAYS_MILLIS.getOrNull(attemptsUsed) ?: return null
+        attemptsUsed += 1
+        return delay
     }
 
-    fun resetForVisibilityEvent() { attempted = false }
+    fun resetForVisibilityEvent() { attemptsUsed = 0 }
+
+    private companion object {
+        val DELAYS_MILLIS = longArrayOf(300L, 1_500L, 5_000L)
+    }
 }

@@ -45,7 +45,7 @@ class TelegramReceiveService : Service() {
             .setAction(FloatingStarService.ACTION_OPEN_CHAT), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val stopIntent = PendingIntent.getService(this, 43, Intent(this, TelegramReceiveService::class.java)
             .setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val notification = NotificationCompat.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_homeway)
+        val notification = NotificationCompat.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_family_notification)
             .setContentTitle("가족 소식 수신 중").setContentText("텔레그램으로 대화와 칭찬을 주고받고 있어요.")
             .setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true).setSilent(true)
             .addAction(0, "수신 중지", stopIntent).build()

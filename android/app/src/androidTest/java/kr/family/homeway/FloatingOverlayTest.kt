@@ -6,6 +6,8 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.os.Build
+import android.os.Handler
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import androidx.compose.ui.test.*
@@ -30,6 +32,8 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.io.PrintWriter
+import java.io.StringWriter
 
 /** Uses a real WindowManager overlay rather than a Compose-only fake bubble. */
 @RunWith(AndroidJUnit4::class)
@@ -123,6 +127,10 @@ class FloatingOverlayTest {
         val star = device.wait(Until.findObject(By.desc(STAR_DESCRIPTION)), 5000)
         assertNotNull("Expected tappable overlay star", star)
         star!!.click()
+        awaitMessenger()
+    }
+
+    private fun awaitMessenger() {
         compose.waitUntil(10_000) { mainActivities(Stage.RESUMED).isNotEmpty() }
         compose.waitUntil(10_000) {
             runCatching { compose.onAllNodesWithTag("chat-input").fetchSemanticsNodes().isNotEmpty() }.getOrDefault(false)
@@ -202,6 +210,76 @@ class FloatingOverlayTest {
         assertTrue(notification!!.notification.actions.orEmpty().none { it.title.toString() == "별 아이콘 끄기" })
         assertTrue(OverlayPreferences(context).enabled)
         assertNoTrackingService()
+    }
+
+    @Test fun exhaustedWindowRetriesKeepForegroundSessionAndRecoverAfterUnlockAndHome() {
+        launchDemo(overlay = true)
+        awaitStar()
+        val instanceField = FloatingStarService::class.java.getDeclaredField("runningInstance").apply { isAccessible = true }
+        val failureMethod = FloatingStarService::class.java.getDeclaredMethod("handleWindowFailure", String::class.java)
+            .apply { isAccessible = true }
+        val handlerField = FloatingStarService::class.java.getDeclaredField("handler").apply { isAccessible = true }
+        val recoveryField = FloatingStarService::class.java.getDeclaredField("recoverWindow").apply { isAccessible = true }
+        lateinit var service: FloatingStarService
+        instrumentation.runOnMainSync {
+            service = instanceField.get(null) as FloatingStarService
+            // Simulate repeated WindowManager failures within one recovery burst. Each
+            // failure cancels the earlier pending callback before consuming the next slot.
+            repeat(4) { failureMethod.invoke(service, "instrumented_window_failure") }
+        }
+        assertTrue("Window failure must preserve the user's saved ON", OverlayPreferences(context).enabled)
+        assertTrue("Exhausted retries must keep the existing session", FloatingStarService.runtime.value.running)
+        assertFalse(FloatingStarService.runtime.value.visible)
+        assertTrue(device.wait(Until.gone(By.desc(STAR_DESCRIPTION)), 5000))
+        val manager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        @Suppress("DEPRECATION")
+        assertTrue("The waiting service must still be in the foreground", manager.getRunningServices(Int.MAX_VALUE)
+            .any { it.service.className == FloatingStarService::class.java.name && it.foreground })
+        assertTrue("Foreground notification must survive the failed windows",
+            context.getSystemService(NotificationManager::class.java).activeNotifications.any { it.id == 4100 })
+        instrumentation.runOnMainSync {
+            assertSame(service, instanceField.get(null))
+            if (Build.VERSION.SDK_INT >= 29) {
+                assertFalse("The exhausted burst must not leave a retry loop",
+                    (handlerField.get(service) as Handler).hasCallbacks(recoveryField.get(service) as Runnable))
+            }
+        }
+        val waiting = overlayDiagnostics("overlay-recovery-waiting")
+        assertTrue(waiting, waiting.contains("overlayState=waiting_for_window"))
+        assertTrue(waiting, waiting.contains("burstAttempts=3 recoveryPending=false"))
+
+        device.sleep()
+        compose.waitUntil(5000) { !context.getSystemService(PowerManager::class.java).isInteractive }
+        assertTrue(FloatingStarService.runtime.value.running)
+        assertTrue(OverlayPreferences(context).enabled)
+        device.wakeUp()
+        device.executeShellCommand("wm dismiss-keyguard")
+        awaitStar()
+        instrumentation.runOnMainSync { assertSame("Unlock must recover the same service", service, instanceField.get(null)) }
+        assertNull(FloatingStarService.runtime.value.error)
+        assertTrue(overlayDiagnostics("overlay-recovery-after-unlock").contains("windowAttached=true"))
+        screenshot("overlay-recovered-after-unlock")
+
+        tapStar()
+        device.pressHome()
+        awaitStar()
+        instrumentation.runOnMainSync { context.startActivity(FloatingStarService.chatIntent(context)) }
+        awaitMessenger()
+        screenshot("overlay-reopened-chat")
+        device.pressBack()
+        awaitStar()
+        instrumentation.runOnMainSync { assertSame("Home and reopen must retain the session", service, instanceField.get(null)) }
+        assertTrue(OverlayPreferences(context).enabled)
+        assertNoTrackingService()
+    }
+
+    private fun overlayDiagnostics(name: String): String {
+        val output = StringWriter()
+        instrumentation.runOnMainSync { FloatingStarService.dumpDiagnostics(context, PrintWriter(output)) }
+        val text = output.toString()
+        val dir = File(context.getExternalFilesDir(null), "ui-review").apply { mkdirs() }
+        File(dir, "$name.txt").writeText(text)
+        return text
     }
 
     @Test fun explicitlyDisabledStarStaysOffWithPermissionGrantedOnNextLaunch() {

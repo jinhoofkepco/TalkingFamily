@@ -14,18 +14,36 @@ class OverlayStartPolicyTest {
         assertEquals(OverlayStartPolicy.Decision.START, OverlayStartPolicy.decide(true, true, true))
     }
 
-    @Test fun permissionRevocationAndAccountRemovalInvalidateTheSavedSession() {
+    @Test fun permissionRevocationInvalidatesButAccountUnavailabilityPreservesSavedChoice() {
         assertEquals(OverlayStartPolicy.Decision.CLEAR_CHOICE_AND_STOP, OverlayStartPolicy.decide(true, false, true))
-        assertEquals(OverlayStartPolicy.Decision.CLEAR_CHOICE_AND_STOP, OverlayStartPolicy.decide(true, true, false))
+        assertEquals(OverlayStartPolicy.Decision.STOP, OverlayStartPolicy.decide(true, true, false))
+        // The unchanged enabled choice can resume when the account becomes available again.
+        assertEquals(OverlayStartPolicy.Decision.START, OverlayStartPolicy.decide(true, true, true))
     }
 
-    @Test fun repeatedWindowDetachCannotCreateAnUnboundedRecoveryLoop() {
+    @Test fun repeatedWindowDetachUsesOnlyABoundedBurstThenCanRecoverOnANewVisibilityEvent() {
         val recovery = OverlayWindowRecovery()
-        assertTrue(recovery.retryOnce())
-        repeat(10) { assertFalse(recovery.retryOnce()) }
-        // A later real unlock/activity transition can try again without a timer/polling loop.
+        assertEquals(300L, recovery.nextDelayMillis())
+        assertEquals(1_500L, recovery.nextDelayMillis())
+        assertEquals(5_000L, recovery.nextDelayMillis())
+        repeat(10) { assertEquals(null, recovery.nextDelayMillis()) }
+        assertEquals(3, recovery.attemptsUsed)
         recovery.resetForVisibilityEvent()
-        assertTrue(recovery.retryOnce())
-        assertFalse(recovery.retryOnce())
+        assertEquals(0, recovery.attemptsUsed)
+        assertEquals(300L, recovery.nextDelayMillis())
+    }
+
+    @Test fun overlayEligibilityUsesStoredConfigurationWithoutNeedingADecryptedToken() {
+        assertTrue(OverlayStartPolicy.accountAvailable(false, true, true, true, true))
+        assertFalse(OverlayStartPolicy.accountAvailable(false, false, true, true, true))
+        assertFalse(OverlayStartPolicy.accountAvailable(false, true, false, true, true))
+        assertFalse(OverlayStartPolicy.accountAvailable(false, true, true, false, true))
+        assertFalse(OverlayStartPolicy.accountAvailable(false, true, true, true, false))
+        assertTrue(OverlayStartPolicy.accountAvailable(true, false, false, false, false))
+    }
+
+    @Test fun explicitDisconnectOrOffCannotBeResurrectedByRecovery() {
+        assertEquals(OverlayStartPolicy.Decision.STOP, OverlayStartPolicy.decide(false, true, false))
+        assertEquals(OverlayStartPolicy.Decision.STOP, OverlayStartPolicy.decide(false, true, true))
     }
 }
