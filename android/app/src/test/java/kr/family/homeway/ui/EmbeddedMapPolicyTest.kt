@@ -8,6 +8,29 @@ import org.junit.Test
 import java.util.Locale
 
 class EmbeddedMapPolicyTest {
+    @Test fun historyKeepsSelectionAlignedWhenInvalidRecordsAreSkipped() {
+        val points = listOf(
+            EmbeddedMapHistoryPoint(Double.NaN, 127.0, 10.0, 1000),
+            EmbeddedMapHistoryPoint(37.5, 127.0, 10.0, -1),
+            EmbeddedMapHistoryPoint(37.55, 126.98, Double.NaN, 2000),
+            EmbeddedMapHistoryPoint(37.56, 126.99, 12.0, 3000),
+        )
+        val history = EmbeddedMapPolicy.history(points, 3)
+        assertEquals(2, history.points.size)
+        assertEquals(1, history.selectedIndex)
+        assertEquals("window.FamilyMap.setHistory([[37.55,126.98,null,2000], [37.56,126.99,12.0,3000]]);", history.javascriptCall())
+        assertEquals(-1, EmbeddedMapPolicy.history(points, 0).selectedIndex)
+        assertEquals(-1, EmbeddedMapPolicy.history(points, 99).selectedIndex)
+    }
+
+    @Test fun completeHistoryRemainsSelectableBeyondTheDrawnRouteLimit() {
+        val points = List(2500) { EmbeddedMapHistoryPoint(37.5 + it / 100000.0, 127.0, 10.0, it.toLong()) }
+        val history = EmbeddedMapPolicy.history(points, 2499)
+        assertEquals(2500, history.points.size)
+        assertEquals(2499, history.selectedIndex)
+        assertEquals(2499L, history.points.last().measuredAtMillis)
+    }
+
     @Test fun rejectsInvalidCoordinatesAndOmitsUnusableAccuracy() {
         for (latitude in listOf(Double.NaN, Double.POSITIVE_INFINITY, -90.001, 90.001)) {
             assertNull(EmbeddedMapPolicy.location(latitude, 127.0, 10.0))

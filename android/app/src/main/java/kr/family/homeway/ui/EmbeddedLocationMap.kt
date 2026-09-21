@@ -56,8 +56,12 @@ fun EmbeddedLocationMap(
     accuracy: Double,
     modifier: Modifier = Modifier,
     focusToken: String? = null,
+    history: List<EmbeddedMapHistoryPoint> = emptyList(),
+    selectedHistoryIndex: Int = -1,
+    timelineInsetDp: Int = 0,
 ) {
     val location = EmbeddedMapPolicy.location(latitude, longitude, accuracy)
+    val validatedHistory = remember(history, selectedHistoryIndex) { EmbeddedMapPolicy.history(history, selectedHistoryIndex) }
     var failed by remember { mutableStateOf(false) }
     var loading by remember { mutableStateOf(true) }
     var attempt by remember { mutableIntStateOf(0) }
@@ -105,7 +109,7 @@ fun EmbeddedLocationMap(
                     modifier = Modifier.fillMaxSize(),
                     onRelease = { controller.release() },
                     update = {
-                        controller.setLocation(location, focusToken)
+                        controller.setLocation(location, focusToken, validatedHistory, timelineInsetDp.coerceIn(0, 300))
                         if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
                             controller.resume()
                         } else {
@@ -128,6 +132,12 @@ private class MapViewController(
     private var deliveredLocation: EmbeddedMapLocation? = null
     private var focusToken: String? = null
     private var focusRequested = false
+    private var hasUpdate = false
+    private var history = ValidatedMapHistory(emptyList(), -1)
+    private var deliveredHistory: List<ValidatedMapHistoryPoint>? = null
+    private var deliveredSelection = -1
+    private var timelineInset = 0
+    private var deliveredInset = -1
     private var ready = false
     private val handler = Handler(Looper.getMainLooper())
     private val loadTimeout = Runnable { if (webView != null && !ready) fail() }
@@ -208,6 +218,9 @@ private class MapViewController(
                 override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                     ready = false
                     deliveredLocation = null
+                    deliveredHistory = null
+                    deliveredSelection = -1
+                    deliveredInset = -1
                     handler.removeCallbacks(loadTimeout)
                     handler.postDelayed(loadTimeout, 15_000L)
                 }
@@ -245,26 +258,37 @@ private class MapViewController(
         }
     }
 
-    fun setLocation(value: EmbeddedMapLocation, focusToken: String?) {
+    fun setLocation(value: EmbeddedMapLocation, focusToken: String?, history: ValidatedMapHistory, timelineInset: Int) {
         location = value
-        if (this.focusToken != focusToken) {
-            this.focusToken = focusToken
-            focusRequested = true
-        }
+        this.history = history
+        this.timelineInset = timelineInset
+        if (hasUpdate && this.focusToken != focusToken) focusRequested = true
+        this.focusToken = focusToken
+        hasUpdate = true
         deliverLocation()
     }
 
     private fun deliverLocation() {
         val value = location ?: return
         val view = webView ?: return
-        if (!ready || (deliveredLocation == value && !focusRequested)) return
+        if (!ready) return
+        val historyChanged = deliveredHistory != history.points
+        val selectionChanged = historyChanged || deliveredSelection != history.selectedIndex
         val script = buildString {
-            if (deliveredLocation != value) append(value.javascriptCall())
+            if (deliveredInset != timelineInset) append("window.FamilyMap.setTimelineInset($timelineInset);")
+            if (historyChanged) append(history.javascriptCall())
+            if (history.selectedIndex >= 0) {
+                if (selectionChanged) append("window.FamilyMap.selectHistory(${history.selectedIndex});")
+            } else if (deliveredLocation != value || historyChanged) append(value.javascriptCall())
             // Focus identity stays native. Only an explicit selection change recentres the map.
             if (focusRequested) append("window.FamilyMap.recenter();")
         }
+        if (script.isEmpty()) return
         view.evaluateJavascript(script, null)
         deliveredLocation = value
+        deliveredHistory = history.points
+        deliveredSelection = history.selectedIndex
+        deliveredInset = timelineInset
         focusRequested = false
     }
 

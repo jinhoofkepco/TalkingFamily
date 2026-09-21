@@ -2,6 +2,21 @@ package kr.family.homeway.ui
 
 import java.net.URI
 
+data class EmbeddedMapHistoryPoint(
+    val latitude: Double,
+    val longitude: Double,
+    val accuracy: Double,
+    val measuredAtMillis: Long,
+)
+
+internal data class ValidatedMapHistoryPoint(val location: EmbeddedMapLocation, val measuredAtMillis: Long) {
+    fun javascriptTuple(): String = "[${location.latitude},${location.longitude},${location.accuracy ?: "null"},$measuredAtMillis]"
+}
+
+internal data class ValidatedMapHistory(val points: List<ValidatedMapHistoryPoint>, val selectedIndex: Int) {
+    fun javascriptCall(): String = "window.FamilyMap.setHistory(${points.joinToString(prefix = "[", postfix = "]") { it.javascriptTuple() }});"
+}
+
 /** The only values exposed to the bundled map page are already validated numbers. */
 internal data class EmbeddedMapLocation(
     val latitude: Double,
@@ -20,6 +35,15 @@ internal object EmbeddedMapPolicy {
     private val tilePath = Regex("/([0-9]{1,2})/([0-9]{1,10})/([0-9]{1,10})\\.png")
 
     enum class Resource { BUNDLED_ASSET, TILE, BLOCKED }
+
+    fun history(points: List<EmbeddedMapHistoryPoint>, selectedIndex: Int): ValidatedMapHistory {
+        val valid = points.mapIndexedNotNull { index, point ->
+            val location = location(point.latitude, point.longitude, point.accuracy) ?: return@mapIndexedNotNull null
+            if (point.measuredAtMillis !in 0L..253402300799999L) return@mapIndexedNotNull null
+            index to ValidatedMapHistoryPoint(location, point.measuredAtMillis)
+        }
+        return ValidatedMapHistory(valid.map { it.second }, valid.indexOfFirst { it.first == selectedIndex })
+    }
 
     fun location(latitude: Double, longitude: Double, accuracy: Double): EmbeddedMapLocation? {
         if (!latitude.isFinite() || latitude !in -90.0..90.0 ||

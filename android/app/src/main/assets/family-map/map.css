@@ -10,6 +10,10 @@ body { font-family: system-ui, sans-serif; color: #24362d; background: #e4efe5; 
 button { font: inherit; font-size: 13px; font-weight: 600; color: #245b46; background: white; border: 0; border-radius: 12px; min-height: 44px; padding: 0 13px; }
 #recenter { position: absolute; z-index: 800; right: 10px; top: 10px; box-shadow: 0 2px 8px #24362d30; }
 #recenter:disabled { opacity: .55; }
+#overview { position: absolute; z-index: 800; right: 10px; top: 62px; box-shadow: 0 2px 8px #24362d30; }
+#overview[hidden] { display: none; }
+.leaflet-bottom { bottom: var(--timeline-inset, 0px); }
 #status { position: absolute; z-index: 800; bottom: 31px; left: 10px; right: 10px; width: fit-content; max-width: calc(100% - 44px); margin: auto; padding: 8px 12px; border-radius: 12px; background: #fffffff2; box-shadow: 0 2px 8px #24362d22; font-size: 12px; text-align: center; }
 #status[hidden], #retry[hidden] { display: none; }
+#status { bottom: calc(var(--timeline-inset, 0px) + 31px); }
 #retry { display: block; margin: 4px auto 0; padding: 0 10px; background: #e4efe5; }

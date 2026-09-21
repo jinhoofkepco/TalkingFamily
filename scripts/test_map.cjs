@@ -167,12 +167,64 @@ async function markerCenter(page) {
     checks.push("History selection API focuses the selected point and refocuses an unchanged record while preserving zoom");
     await page.screenshot({ path: path.join(output, "map-history-selection.png") });
 
+    await page.setViewportSize({ width: 360, height: 440 });
+    await page.reload();
+    await page.waitForFunction(() => !!window.FamilyMap);
+    const dayPoints = [
+      [37.552, 126.965, 9, 1790042400000],
+      [37.558, 126.971, 12, 1790044200000],
+      [37.5665, 126.978, 15, 1790046000000],
+    ];
+    await page.evaluate(points => {
+      window.FamilyMap.setTimelineInset(132);
+      window.FamilyMap.setHistory(points);
+      window.FamilyMap.selectHistory(2);
+    }, dayPoints);
+    await loaded(page);
+    const routeLine = page.locator('path[stroke-dasharray]');
+    assert.equal(await routeLine.count(), 1, "history draws one dashed point-connection line");
+    const routeBox = await routeLine.boundingBox();
+    assert.ok(routeBox.width > 20 && routeBox.height > 20 && routeBox.x >= 0 && routeBox.y >= 0 && routeBox.y + routeBox.height <= 308,
+      "initial history fits the complete route above the native timeline");
+    const insetAttribution = await page.getByRole("link", { name: "OpenStreetMap contributors" }).boundingBox();
+    assert.ok(insetAttribution.y + insetAttribution.height <= 308, "attribution stays above native timeline");
+    assert.match(await page.locator(".leaflet-tooltip").last().textContent(), /\d{2}:\d{2} 기록/);
+    const fullDayView = await viewSnapshot(page);
+    await page.evaluate(points => {
+      window.FamilyMap.setHistory([...points, [37.568, 126.98, 10, 1790047800000]]);
+      window.FamilyMap.selectHistory(3);
+    }, dayPoints);
+    assert.deepEqual(await viewSnapshot(page), fullDayView, "routine history refresh preserves user viewport");
+    assert.equal(await page.evaluate(() => window.FamilyMap.selectHistory(99)), false);
+    await page.evaluate(() => { window.FamilyMap.selectHistory(0); window.FamilyMap.recenter(); });
+    await loaded(page);
+    const scrubbedMarker = await markerCenter(page);
+    assert.ok(Math.abs(scrubbedMarker.x - 180) < 2 && Math.abs(scrubbedMarker.y - 154) < 2,
+      "scrubbing focuses the exact historical point above the bottom controls");
+    await page.getByRole("button", { name: "불러온 위치의 전체 경로 보기" }).click();
+    await loaded(page);
+    await page.screenshot({ path: path.join(output, "map-day-route.png") });
+    await page.evaluate(() => {
+      const points = Array.from({ length: 2501 }, (_, index) => [37.55 + index / 100000, 126.97 + index / 100000, 10, 1790042400000 + index * 1000]);
+      window.FamilyMap.setHistory(points);
+      if (!window.FamilyMap.selectHistory(2500)) throw new Error("Full history selection was truncated");
+      window.FamilyMap.recenter();
+    });
+    await loaded(page);
+    assert.ok(await page.locator("path.leaflet-interactive").count() <= 10, "history uses at most eight minor markers plus selected point and accuracy circle");
+    const lastFullHistoryMarker = await markerCenter(page);
+    assert.ok(Math.abs(lastFullHistoryMarker.x - 180) < 2 && Math.abs(lastFullHistoryMarker.y - 154) < 2,
+      "record beyond the drawn vertex limit remains exactly selectable");
+    checks.push("Day route fits all points, timeline inset preserves attribution, refresh preserves view, and all 2501 records remain selectable");
+
     failTiles = true;
     await page.reload();
     await page.waitForFunction(() => !!window.FamilyMap);
-    await page.evaluate(() => window.FamilyMap.setLocation(37.5665, 126.978, 15));
+    await page.evaluate(() => { window.FamilyMap.setTimelineInset(132); window.FamilyMap.setLocation(37.5665, 126.978, 15); });
     await page.getByRole("button", { name: "다시 보기" }).waitFor({ state: "visible" });
     assert.match(await page.locator("#status-text").textContent(), /불러오지 못했어요/);
+    const insetStatus = await page.locator("#status").boundingBox();
+    assert.ok(insetStatus.y + insetStatus.height <= 308, "offline status stays above the native timeline");
     await page.screenshot({ path: path.join(output, "map-network-error.png") });
     const failedRequests = tileRequests.length;
     failTiles = false;

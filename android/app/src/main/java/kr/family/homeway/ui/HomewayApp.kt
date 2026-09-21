@@ -27,9 +27,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -49,6 +54,7 @@ import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlin.math.roundToInt
 
 private val Forest = Color(0xFF245B46)
 private val Cream = Color(0xFFF8F6EE)
@@ -406,12 +412,30 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
     val readings = state.locationHistory
     var selectedRecordId by rememberSaveable(state.historyDay) { mutableStateOf<String?>(null) }
     var focusRequest by rememberSaveable(state.historyDay) { mutableIntStateOf(0) }
-    val selected = readings.firstOrNull { it.id == selectedRecordId && it.kind == "location" && locationPoint(it) != null }
-        ?: readings.firstOrNull { it.kind == "location" && locationPoint(it) != null }
+    val locations = remember(readings) {
+        readings.filter { it.kind == "location" && locationPoint(it) != null && runCatching { Instant.parse(eventTime(it)) }.isSuccess }
+            .sortedWith(compareBy<FamilyEvent> { Instant.parse(eventTime(it)) }.thenBy { it.id })
+    }
+    val historyPoints = remember(locations) {
+        locations.map { event ->
+            val coordinates = locationPoint(event)!!
+            EmbeddedMapHistoryPoint(coordinates.first, coordinates.second, event.payload.optDouble("accuracy", Double.NaN), Instant.parse(eventTime(event)).toEpochMilli())
+        }
+    }
+    val selectedIndex = locations.indexOfFirst { it.id == selectedRecordId }.takeIf { it >= 0 } ?: locations.lastIndex
+    val selected = locations.getOrNull(selectedIndex)
     val point = selected?.let(::locationPoint)
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     var dateMenu by remember { mutableStateOf(false) }
+    var detailsExpanded by rememberSaveable { mutableStateOf(false) }
+    val density = LocalDensity.current
+    var timelineInset by remember { mutableIntStateOf(132) }
+    val selectPoint: (Int) -> Unit = { index ->
+        locations.getOrNull(index)?.let { event ->
+            if (selectedRecordId != event.id) { selectedRecordId = event.id; focusRequest++ }
+        }
+    }
     val dayIndex = state.historyDays.indexOf(state.historyDay)
     LazyColumn(Modifier.fillMaxSize().testTag("location-list"), state = listState, contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item(key = "history-day") {
@@ -436,38 +460,71 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
             if (point == null) EmptyCard(Icons.Outlined.LocationOn,
                 if (state.historyLoading) "기록을 불러오고 있어요" else if (state.historyHasMore) "불러온 기록에는 위치가 없어요" else "이 날짜의 위치 기록이 없어요",
                 if (state.historyHasMore) "아래의 ‘이전 기록 더 보기’에서 앞선 위치를 찾아볼 수 있어요." else "자녀가 공유한 위치를 날짜별로 모아 보여 드려요.")
-            else SectionCard {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("${displayTime(eventTime(selected))} 위치 기록", Modifier.weight(1f), fontWeight = FontWeight.Bold)
-                    TextButton({
-                        selectedRecordId = null
-                        focusRequest++
-                        state.historyDays.firstOrNull()?.let(actions.selectHistoryDay)
-                    }) { Text("최신 기록") }
+            else Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Surface(shape = RoundedCornerShape(22.dp), modifier = Modifier.fillMaxWidth().height(500.dp).testTag("embedded-location-map")) {
+                    Box(Modifier.fillMaxSize()) {
+                        key(state.historyDay) {
+                            EmbeddedLocationMap(point.first, point.second, selected.payload.optDouble("accuracy", Double.NaN), Modifier.fillMaxSize(),
+                                focusToken = "${state.historyDay}/${selectedRecordId?.takeIf { it == selected.id } ?: "latest"}/$focusRequest",
+                                history = historyPoints, selectedHistoryIndex = selectedIndex, timelineInsetDp = timelineInset)
+                        }
+                        Surface(shape = RoundedCornerShape(18.dp), color = Color.White.copy(alpha = .97f), shadowElevation = 3.dp,
+                            modifier = Modifier.align(Alignment.BottomCenter).padding(12.dp).fillMaxWidth()
+                                .onSizeChanged { size -> timelineInset = with(density) { size.height.toDp().value.roundToInt() } + 24 }
+                                .testTag("map-timeline-controls")) {
+                            Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    IconButton({ selectPoint(selectedIndex - 1) }, enabled = selectedIndex > 0, modifier = Modifier.size(40.dp)) {
+                                        Icon(Icons.Outlined.ChevronLeft, "이전 시각의 위치")
+                                    }
+                                    Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                                        Text(historyClock(eventTime(selected)), fontWeight = FontWeight.Bold, fontSize = 18.sp, modifier = Modifier.testTag("map-selected-time"))
+                                        Text("${selectedIndex + 1} / ${locations.size}${if (state.historyHasMore) "+" else ""} 위치", fontSize = 11.sp, color = Muted)
+                                    }
+                                    IconButton({ selectPoint(selectedIndex + 1) }, enabled = selectedIndex < locations.lastIndex, modifier = Modifier.size(40.dp)) {
+                                        Icon(Icons.Outlined.ChevronRight, "다음 시각의 위치")
+                                    }
+                                    TextButton({
+                                        selectedRecordId = null; focusRequest++
+                                        val latestDay = state.historyDays.firstOrNull()
+                                        if (latestDay != null && latestDay != state.historyDay) actions.selectHistoryDay(latestDay)
+                                    }, contentPadding = PaddingValues(horizontal = 4.dp)) { Text("최신") }
+                                }
+                                Slider(value = selectedIndex.coerceAtLeast(0).toFloat(), onValueChange = { selectPoint(it.roundToInt()) },
+                                    valueRange = 0f..locations.lastIndex.coerceAtLeast(1).toFloat(),
+                                    steps = if (locations.size in 3..102) locations.size - 2 else 0, enabled = locations.size > 1,
+                                    modifier = Modifier.fillMaxWidth().height(32.dp).semantics {
+                                        contentDescription = "위치 기록 시간"
+                                        stateDescription = historyClock(eventTime(selected))
+                                    }.testTag("map-time-slider"))
+                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Text(displayTime(eventTime(locations.first())), fontSize = 11.sp, color = Muted)
+                                    Text("시간 막대로 위치 보기", fontSize = 11.sp, color = Forest)
+                                    Text(displayTime(eventTime(locations.last())), fontSize = 11.sp, color = Muted)
+                                }
+                            }
+                        }
+                    }
                 }
-                Surface(shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth().height(270.dp).testTag("embedded-location-map")) {
-                    EmbeddedLocationMap(point.first, point.second, selected.payload.optDouble("accuracy", Double.NaN), Modifier.fillMaxSize(), focusToken = "${state.historyDay}/${selectedRecordId?.takeIf { it == selected.id } ?: "latest"}/$focusRequest")
-                }
-                Text("측정 ${displayTime(eventTime(selected), includeDate = true)}", fontWeight = FontWeight.Medium)
-                Text(coordinateText(point.first, point.second), fontSize = 12.sp, color = Muted)
+                Text("점선은 기록된 위치를 이은 선이며 실제 이동 경로와 다를 수 있어요.", fontSize = 11.sp, color = Muted, lineHeight = 17.sp)
+                if (state.historyHasMore) Text("이 날짜의 이전 기록은 ‘이전 기록 더 보기’로 지도에 추가할 수 있어요.", fontSize = 12.sp, color = Muted, lineHeight = 18.sp)
+                val accuracy = selected.payload.optDouble("accuracy", Double.NaN)
+                Text("${coordinateText(point.first, point.second)}${if (accuracy.isFinite()) " · 오차 약 ${accuracy.toInt()}m" else ""}", fontSize = 12.sp, color = Muted)
                 val locationAge = elapsedMinutes(eventTime(selected), now)
                 if (!state.demoMode && locationAge != null && locationAge >= 10) {
                     Text("저장된 과거 위치입니다. 현재 위치와 다를 수 있어요.", fontSize = 12.sp, color = Gold, lineHeight = 19.sp)
                 }
-                val accuracy = selected.payload.optDouble("accuracy", Double.NaN)
-                Text(if (accuracy.isFinite()) "위치 오차 약 ${accuracy.toInt()}m" else "위치 정확도 정보 없음", fontSize = 12.sp, color = Muted)
                 if (state.demoMode) Text("체험 위치 · 실제 위치를 수집하지 않아요", fontSize = 12.sp, color = Muted)
             }
         }
         item {
-            Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                Text("시간별 기록", fontSize = 19.sp, fontWeight = FontWeight.Bold)
-                Text("위치 기록을 누르면 그 시각의 지도를 볼 수 있어요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
-                Text("${readings.size}${if (state.historyHasMore) "+" else ""}개 기록 · 최근 시각부터", color = Muted, fontSize = 11.sp)
+            OutlinedButton({ detailsExpanded = !detailsExpanded }, Modifier.fillMaxWidth().testTag("history-details-toggle")) {
+                Text("기록 상세 ${readings.size}${if (state.historyHasMore) "+" else ""}개", Modifier.weight(1f))
+                Icon(if (detailsExpanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore, if (detailsExpanded) "기록 상세 접기" else "기록 상세 펼치기")
             }
         }
         if (readings.isEmpty() && !state.historyLoading) item { Text("이 날짜에 받은 기록이 아직 없어요.", color = Muted, fontSize = 13.sp) }
-        readings.groupBy { historyHour(eventTime(it)) }.forEach { (hour, events) ->
+        if (detailsExpanded) readings.groupBy { historyHour(eventTime(it)) }.forEach { (hour, events) ->
             item(key = "hour-$hour") { Text(hour, fontWeight = FontWeight.Bold, color = Forest, modifier = Modifier.padding(top = 8.dp)) }
             items(events, key = { it.id }) { event ->
                 TimelineCard(event, selected = event.id == selected?.id, onSelect = if (event.kind == "location" && locationPoint(event) != null) ({

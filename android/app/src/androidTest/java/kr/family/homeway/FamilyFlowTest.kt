@@ -150,7 +150,7 @@ class FamilyFlowTest {
         compose.onNodeWithTag("chat-input").assertIsDisplayed()
     }
 
-    @Test fun guardianShowsDateTimelineAndFourDistinctMovementPhases() {
+    @Test fun guardianShowsInMapTimelineAndExpandableMovementDetails() {
         enterDemo(guardian = true)
         // Keep every phase on one local date, including runs just after midnight.
         val day = LocalDate.of(2026, 9, 21)
@@ -172,7 +172,17 @@ class FamilyFlowTest {
         compose.onNodeWithText("보호자의 공간").assertDoesNotExist()
         compose.onNodeWithText("아이의 오는 길").assertDoesNotExist()
         compose.onNodeWithContentDescription("설정").assertDoesNotExist()
+        compose.onNodeWithTag("location-list").performScrollToNode(hasTestTag("map-timeline-controls"))
+        compose.onNodeWithTag("map-timeline-controls").assertIsDisplayed()
+            .assert(hasAnyAncestor(hasTestTag("embedded-location-map")))
+        compose.onNodeWithTag("map-selected-time").assertIsDisplayed()
+        compose.onNodeWithTag("map-time-slider").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithContentDescription("이전 시각의 위치").assertIsDisplayed()
+        compose.onNodeWithContentDescription("다음 시각의 위치").assertIsDisplayed()
         screenshot("guardian-location")
+        compose.onNodeWithText("내려가기 종료").assertDoesNotExist()
+        compose.onNodeWithTag("location-list").performScrollToNode(hasTestTag("history-details-toggle"))
+        compose.onNodeWithTag("history-details-toggle").performClick()
         listOf("내려가기 종료", "내려가기 시작", "올라가기 종료", "올라가기 시작").forEach { title ->
             compose.onNodeWithTag("location-list").performScrollToNode(hasText(title))
             compose.onNodeWithText(title).assertIsDisplayed()
