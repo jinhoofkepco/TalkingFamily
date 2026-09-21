@@ -27,7 +27,7 @@
         <service android:name=".data.TelegramReceiveService" android:exported="false" android:foregroundServiceType="remoteMessaging" />
         <service android:name=".overlay.FloatingStarService" android:exported="false" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="User-enabled persistent floating star shortcut for opening the private family messenger across apps; can be stopped in its notification." />
+                android:value="User-enabled persistent floating star shortcut for opening the private family messenger across apps; can be disabled with confirmation in the app settings." />
         </service>
     </application>
 </manifest>

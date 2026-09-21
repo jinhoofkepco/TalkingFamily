@@ -8,7 +8,10 @@ class OverlayPreferences(context: Context) {
 
     var enabled: Boolean
         get() = preferences.getBoolean("enabled", false)
-        set(value) { preferences.edit().putBoolean("enabled", value).apply() }
+        // Persist the choice before starting/stopping the service, including an explicit off.
+        set(value) { preferences.edit().putBoolean("enabled", value).commit() }
+
+    val hasSavedChoice: Boolean get() = preferences.contains("enabled")
 
     var edgeRight: Boolean
         get() = preferences.getBoolean("edge_right", true)

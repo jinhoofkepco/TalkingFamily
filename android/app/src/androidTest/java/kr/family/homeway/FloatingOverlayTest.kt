@@ -85,11 +85,12 @@ class FloatingOverlayTest {
         device.executeShellCommand("appops set ${context.packageName} SYSTEM_ALERT_WINDOW ${if (allowed) "allow" else "deny"}")
     }
 
-    private fun launchDemo(role: String = "child", overlay: Boolean) {
+    private fun launchDemo(role: String = "child", overlay: Boolean, savedChoice: Boolean? = if (overlay) true else null) {
         runBlocking { AppRepository(context).startDemo(role) }
         DemoStore(context).reset()
         setOverlayPermission(overlay)
-        OverlayPreferences(context).enabled = overlay
+        if (savedChoice == null) context.getSharedPreferences("floating_star", Context.MODE_PRIVATE).edit().remove("enabled").commit()
+        else OverlayPreferences(context).enabled = savedChoice
         assertEquals(overlay, Settings.canDrawOverlays(context))
         // ActivityScenario filters lifecycle events by the original intent. A real star tap
         // changes that intent to OPEN_CHAT, so use the unfiltered lifecycle monitor instead.
@@ -194,16 +195,52 @@ class FloatingOverlayTest {
         device.pressBack()
         awaitStar()
         assertNoTrackingService()
-        // Exercise the same PendingIntent as the service notification's stop action.
+        // The notification must not offer a one-tap action that accidentally disables the star.
         val notification = context.getSystemService(NotificationManager::class.java).activeNotifications
             .firstOrNull { it.notification.extras.getString("android.title") == "메신저 별 아이콘 켜짐" }
         assertNotNull("Overlay foreground notification is required", notification)
-        val stop = notification!!.notification.actions.firstOrNull { it.title.toString() == "별 아이콘 끄기" }
-        assertNotNull("Notification must offer an explicit stop action", stop)
-        stop!!.actionIntent.send()
-        compose.waitUntil(5000) { !FloatingStarService.runtime.value.running && !FloatingStarService.runtime.value.visible }
+        assertTrue(notification!!.notification.actions.orEmpty().none { it.title.toString() == "별 아이콘 끄기" })
+        assertTrue(OverlayPreferences(context).enabled)
+        assertNoTrackingService()
+    }
+
+    @Test fun explicitlyDisabledStarStaysOffWithPermissionGrantedOnNextLaunch() {
+        launchDemo(overlay = true, savedChoice = false)
+        compose.waitUntil(5000) { compose.onAllNodesWithTag("chat-input").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("chat-input").assertIsDisplayed()
+        compose.onNodeWithTag("overlay-permission-prompt").assertDoesNotExist()
+        compose.onNodeWithTag("return-to-star").assertDoesNotExist()
+        assertTrue(OverlayPreferences(context).hasSavedChoice)
         assertFalse(OverlayPreferences(context).enabled)
-        assertTrue(device.wait(Until.gone(By.desc(STAR_DESCRIPTION)), 5000))
+        assertFalse(FloatingStarService.runtime.value.running)
+        assertNoTrackingService()
+    }
+
+    @Test fun childCanCancelStarDisableBeforeDeliberatelyConfirmingIt() {
+        launchDemo(overlay = true)
+        awaitStar()
+        tapStar()
+        compose.onNodeWithTag("chat-input").performTextInput("설정")
+        compose.onNodeWithTag("chat-send").performClick()
+        compose.onNodeWithTag("settings-overlay-menu-item").performClick()
+        compose.onNodeWithTag("overlay-disable").performScrollTo().performClick()
+        compose.onNodeWithTag("overlay-disable-dialog").assertIsDisplayed()
+        assertTrue(OverlayPreferences(context).enabled)
+        assertTrue(FloatingStarService.runtime.value.running)
+
+        compose.onNodeWithTag("overlay-disable-cancel").performClick()
+        compose.onNodeWithTag("overlay-disable-dialog").assertDoesNotExist()
+        assertTrue(OverlayPreferences(context).enabled)
+        compose.onNodeWithTag("overlay-disable").performScrollTo().performClick()
+        device.pressBack()
+        compose.onNodeWithTag("overlay-disable-dialog").assertDoesNotExist()
+        assertTrue(OverlayPreferences(context).enabled)
+
+        compose.onNodeWithTag("overlay-disable").performScrollTo().performClick()
+        compose.onNodeWithTag("overlay-disable-confirm").performClick()
+        compose.waitUntil(5000) { !FloatingStarService.runtime.value.running && !FloatingStarService.runtime.value.visible }
+        compose.onNodeWithTag("overlay-disable-dialog").assertDoesNotExist()
+        assertFalse(OverlayPreferences(context).enabled)
         assertNoTrackingService()
     }
 

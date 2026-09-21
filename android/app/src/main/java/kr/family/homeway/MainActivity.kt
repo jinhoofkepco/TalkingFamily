@@ -38,6 +38,7 @@ class MainActivity : ComponentActivity() {
     private var afterPermission: (() -> Unit)? = null
     private var requestingAutomatic=false
     private var overlayPermissionGranted by mutableStateOf(false)
+    private var overlaySavedEnabled by mutableStateOf(false)
     private var overlayPromptVisible by mutableStateOf(false)
     private var openChatRequestId by mutableIntStateOf(0)
     private var launchWantsBubble = false
@@ -47,6 +48,7 @@ class MainActivity : ComponentActivity() {
     private var collapseJob: Job? = null
     private var notificationPermissionInFlight = false
     private var trackingResumeAttempted = false
+    private var overlayResumeAttempted = false
     private val permissionLauncher=registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         val callback=afterPermission
         afterPermission=null
@@ -64,6 +66,7 @@ class MainActivity : ComponentActivity() {
     private val overlayPermissionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         waitingForOverlayPermission = false
         overlayPermissionGranted = Settings.canDrawOverlays(this)
+        overlaySavedEnabled = FloatingStarService.wantsOverlay(this)
         enableOverlayOnResume = overlayPermissionGranted
         if (!overlayPermissionGranted) {
             model.showError("별 아이콘 권한을 허용하지 않았어요. 지금처럼 앱에서 대화할 수 있어요.")
@@ -73,6 +76,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState:Bundle?) {
         super.onCreate(savedInstanceState)
         overlayPermissionGranted = Settings.canDrawOverlays(this)
+        overlaySavedEnabled = FloatingStarService.wantsOverlay(this)
         if (savedInstanceState == null) {
             routeEntry(intent)
         } else {
@@ -99,6 +103,7 @@ class MainActivity : ComponentActivity() {
                 },
                 error = state.error ?: receiver.error,
                 overlayEnabled = overlay.running,
+                overlaySavedEnabled = overlaySavedEnabled,
                 overlayPermissionGranted = overlayPermissionGranted,
                 openChatRequestId = openChatRequestId,
                 overlayPromptVisible = overlayPromptVisible,
@@ -156,6 +161,14 @@ class MainActivity : ComponentActivity() {
             }
         }
         lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                FloatingStarService.runtime.collect {
+                    overlaySavedEnabled = FloatingStarService.wantsOverlay(this@MainActivity)
+                    handleReadyState()
+                }
+            }
+        }
+        lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 while(true) {
                     model.refresh()
@@ -175,8 +188,14 @@ class MainActivity : ComponentActivity() {
     private fun routeEntry(entry: Intent?) {
         launchWantsBubble = entry?.action == Intent.ACTION_MAIN && entry.hasCategory(Intent.CATEGORY_LAUNCHER)
         if (entry?.action == FloatingStarService.ACTION_OPEN_CHAT) {
+            // An explicit conversation open supersedes an older, still-pending collapse.
+            collapseJob?.cancel()
+            collapseJob = null
+            collapsing = false
+            enableOverlayOnResume = false
             launchWantsBubble = false
             overlayPromptVisible = false
+            FloatingStarService.setMessengerVisible(true)
             openChatRequestId++
         }
     }
@@ -184,7 +203,9 @@ class MainActivity : ComponentActivity() {
     override fun onPostResume() {
         super.onPostResume()
         trackingResumeAttempted = false
+        overlayResumeAttempted = false
         overlayPermissionGranted = Settings.canDrawOverlays(this)
+        overlaySavedEnabled = FloatingStarService.wantsOverlay(this)
         if (!collapsing) FloatingStarService.setMessengerVisible(true)
         handleReadyState()
     }
@@ -218,6 +239,12 @@ class MainActivity : ComponentActivity() {
         // Do not collapse into the star before the location service has entered foreground.
         if (TrackingService.runtime.value.starting) return
         if (!state.configured && !state.demoMode) return
+        if (!overlayResumeAttempted) {
+            overlayResumeAttempted = true
+            // Keep an opened conversation visible while restoring only the saved shortcut choice.
+            FloatingStarService.resumeSavedOverlay(this)
+            overlaySavedEnabled = FloatingStarService.wantsOverlay(this)
+        }
         if (state.configured && TelegramReceiveService.wantsReceiving(this) && Build.VERSION.SDK_INT >= 33 &&
             !has(Manifest.permission.POST_NOTIFICATIONS)) {
             if (notificationPermissionInFlight) return
@@ -236,7 +263,11 @@ class MainActivity : ComponentActivity() {
             startAndCollapse()
         } else if (launchWantsBubble) {
             launchWantsBubble = false // Once per explicit launcher entry, never every onResume.
-            if (Settings.canDrawOverlays(this)) startAndCollapse() else overlayPromptVisible = true
+            when {
+                FloatingStarService.wantsOverlay(this) && Settings.canDrawOverlays(this) -> startAndCollapse()
+                !FloatingStarService.hasSavedChoice(this) -> overlayPromptVisible = true
+                // A deliberate off choice opens the ordinary app until the user enables the star again.
+            }
         }
     }
 
@@ -270,6 +301,8 @@ class MainActivity : ComponentActivity() {
         launchWantsBubble = false
         enableOverlayOnResume = false
         overlayPromptVisible = false
+        overlayResumeAttempted = true
+        overlaySavedEnabled = false
         FloatingStarService.stop(this)
     }
 
@@ -290,23 +323,26 @@ class MainActivity : ComponentActivity() {
                 // Android 15: create the service while this Activity is still visible.
                 FloatingStarService.setMessengerVisible(false)
                 FloatingStarService.start(this@MainActivity)
+                overlaySavedEnabled = FloatingStarService.wantsOverlay(this@MainActivity)
                 val result = withTimeoutOrNull(4000) {
                     FloatingStarService.runtime.first { it.visible || it.error != null }
                 }
                 if (result?.visible == true) {
                     moveTaskToBack(true)
                 } else {
-                    FloatingStarService.stop(this@MainActivity)
-                    FloatingStarService.setMessengerVisible(true)
-                    model.showError(result?.error ?: "별 아이콘을 표시하지 못했어요. 앱에서 다시 켜 주세요.")
+                    // Screen locking or a slow window attachment is not a request to disable the star.
+                    val stillVisible = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+                    FloatingStarService.setMessengerVisible(stillVisible)
+                    if (stillVisible) model.showError(result?.error ?: "별 아이콘 표시를 기다리고 있어요. 설정은 켜진 상태로 유지합니다.")
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: RuntimeException) {
-                FloatingStarService.stop(this@MainActivity)
-                FloatingStarService.setMessengerVisible(true)
-                model.showError("별 아이콘을 시작하지 못했어요. 앱에서 다시 켜 주세요.")
+                val stillVisible = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+                FloatingStarService.setMessengerVisible(stillVisible)
+                if (stillVisible) model.showError("별 아이콘을 표시하지 못했어요. 켜 둔 설정은 유지하며 앱을 다시 열면 재시도합니다.")
             } finally {
+                overlaySavedEnabled = FloatingStarService.wantsOverlay(this@MainActivity)
                 collapsing = false
             }
         }

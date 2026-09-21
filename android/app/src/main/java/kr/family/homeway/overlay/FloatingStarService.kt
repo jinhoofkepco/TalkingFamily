@@ -37,16 +37,19 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kr.family.homeway.MainActivity
 import kr.family.homeway.R
+import kr.family.homeway.data.AppRepository
 
 data class OverlayRuntime(
     val running: Boolean = false,
     val visible: Boolean = false,
     val error: String? = null,
+    val starting: Boolean = false,
+    val stopping: Boolean = false,
 )
 
 /**
  * User-started chat shortcut. No boot receiver, polling, wake lock, sensors or network.
- * A killed process is not restarted in the background; the next launcher opening can start it again.
+ * Saved choice survives system sticky restarts; new starts happen only from a visible Activity.
  * The service keeps its notification while the messenger is open but removes its overlay window.
  */
 class FloatingStarService : Service() {
@@ -61,6 +64,12 @@ class FloatingStarService : Service() {
     private var receiverRegistered = false
     private var watchingPermission = false
     private var safeBounds = Rect()
+    private val windowRecovery = OverlayWindowRecovery()
+    private var recoveryPending = false
+    private val recoverWindow = Runnable {
+        recoveryPending = false
+        refreshBubble(resetRecovery = false)
+    }
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -71,7 +80,7 @@ class FloatingStarService : Service() {
         if (operation == AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW && packageName == this.packageName) {
             handler.post {
                 if (started && !Settings.canDrawOverlays(this)) {
-                    end("다른 앱 위에 표시 권한이 꺼져 별 아이콘을 종료했어요.")
+                    end("다른 앱 위에 표시 권한이 꺼져 별 아이콘을 종료했어요.", clearChoice = true)
                 }
             }
         }
@@ -80,11 +89,12 @@ class FloatingStarService : Service() {
     override fun onCreate() {
         super.onCreate()
         preferences = OverlayPreferences(this)
+        runningInstance = this
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         appOps = getSystemService(APP_OPS_SERVICE) as AppOpsManager
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "메신저 별 아이콘", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "다른 앱 위에 떠 있는 별로 메신저를 여는 동안 표시해요. 알림에서 끌 수 있어요."
+                description = "다른 앱 위에 떠 있는 별로 메신저를 여는 동안 표시해요. 앱 설정에서 끌 수 있어요."
                 setSound(null, null)
                 enableVibration(false)
                 setShowBadge(false)
@@ -94,35 +104,45 @@ class FloatingStarService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            end()
+            end(clearChoice = true)
             return START_NOT_STICKY
         }
-        if (intent?.action != ACTION_START || stopping) {
+        if (stopping) return START_NOT_STICKY
+        if (intent != null && intent.action != ACTION_START) {
             if (!started) stopSelf()
-            return START_NOT_STICKY
+            return if (started) START_STICKY else START_NOT_STICKY
         }
-        if (!preferences.enabled || !Settings.canDrawOverlays(this)) {
-            end("별 아이콘을 켜려면 다른 앱 위에 표시 권한을 허용해 주세요.")
+        // Null intent is a system sticky restart, never a new opt-in.
+        val decision = startDecision(this)
+        if (decision != OverlayStartPolicy.Decision.START) {
+            end(clearChoice = decision == OverlayStartPolicy.Decision.CLEAR_CHOICE_AND_STOP)
             return START_NOT_STICKY
         }
         if (!started) {
+            mutableRuntime.value = OverlayRuntime(starting = true)
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     startForeground(NOTIFICATION_ID, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
                 } else startForeground(NOTIFICATION_ID, notification())
             } catch (_: RuntimeException) {
-                end("별 아이콘을 시작하지 못했어요. 앱을 열어 다시 켜 주세요.")
+                end("별 아이콘 재개 대기 · 앱을 다시 열면 재시도해요.",
+                    clearChoice = startDecision(this) == OverlayStartPolicy.Decision.CLEAR_CHOICE_AND_STOP)
                 return START_NOT_STICKY
             }
             started = true
             runningInstance = this
             mutableRuntime.value = OverlayRuntime(running = true)
-            ContextCompat.registerReceiver(this, screenReceiver, IntentFilter().apply {
-                addAction(Intent.ACTION_SCREEN_OFF)
-                addAction(Intent.ACTION_SCREEN_ON)
-                addAction(Intent.ACTION_USER_PRESENT)
-            }, ContextCompat.RECEIVER_NOT_EXPORTED)
-            receiverRegistered = true
+            try {
+                ContextCompat.registerReceiver(this, screenReceiver, IntentFilter().apply {
+                    addAction(Intent.ACTION_SCREEN_OFF)
+                    addAction(Intent.ACTION_SCREEN_ON)
+                    addAction(Intent.ACTION_USER_PRESENT)
+                }, ContextCompat.RECEIVER_NOT_EXPORTED)
+                receiverRegistered = true
+            } catch (_: RuntimeException) {
+                end("별 아이콘 재개 대기 · 앱을 다시 열면 재시도해요.")
+                return START_NOT_STICKY
+            }
             try {
                 appOps.startWatchingMode(AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW, packageName, permissionListener)
                 watchingPermission = true
@@ -131,24 +151,34 @@ class FloatingStarService : Service() {
             }
         }
         refreshBubble()
-        return START_NOT_STICKY
+        return if (stopping) START_NOT_STICKY else START_STICKY
     }
 
     private fun screenIsAvailable(): Boolean =
         getSystemService(PowerManager::class.java).isInteractive &&
             !getSystemService(KeyguardManager::class.java).isKeyguardLocked
 
-    private fun refreshBubble() {
+    private fun refreshBubble(resetRecovery: Boolean = true) {
         if (!started || stopping) return
-        if (!Settings.canDrawOverlays(this)) {
-            end("다른 앱 위에 표시 권한이 꺼져 별 아이콘을 종료했어요.")
+        val decision = startDecision(this)
+        if (decision != OverlayStartPolicy.Decision.START) {
+            end(clearChoice = decision == OverlayStartPolicy.Decision.CLEAR_CHOICE_AND_STOP)
             return
         }
+        if (resetRecovery) windowRecovery.resetForVisibilityEvent()
         if (messengerVisible || !screenIsAvailable()) hideBubble() else showBubble()
     }
 
     private fun showBubble() {
-        if (bubble != null) return
+        if (bubble != null || recoveryPending) return
+        try {
+            attachBubble()
+        } catch (_: RuntimeException) {
+            handleWindowFailure()
+        }
+    }
+
+    private fun attachBubble() {
         val size = (48f * resources.displayMetrics.density).roundToInt()
         safeBounds = availableBounds()
         val layout = WindowManager.LayoutParams(
@@ -169,32 +199,57 @@ class FloatingStarService : Service() {
         view.setOnClickListener { openMessenger() }
         view.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
             override fun onViewAttachedToWindow(attached: View) {
-                if (bubble === attached && started && !stopping) mutableRuntime.value = OverlayRuntime(true, true)
+                if (bubble === attached && started && !stopping) mutableRuntime.value = OverlayRuntime(running = true, visible = true)
             }
             override fun onViewDetachedFromWindow(detached: View) {
-                if (bubble === detached || bubble == null) mutableRuntime.value = mutableRuntime.value.copy(visible = false)
+                // Intentional hides clear bubble before removing the view. An unexpected detach
+                // must release its stale reference or showBubble would never create another one.
+                if (bubble === detached) {
+                    bubble = null
+                    params = null
+                    mutableRuntime.value = mutableRuntime.value.copy(visible = false)
+                    handler.post {
+                        if (started && !stopping && bubble == null && !recoveryPending) {
+                            try { windowManager.removeViewImmediate(detached) } catch (_: RuntimeException) { }
+                            handleWindowFailure()
+                        }
+                    }
+                }
             }
         })
         installDrag(view, layout)
         bubble = view
         params = layout
-        try {
-            windowManager.addView(view, layout)
-        } catch (_: RuntimeException) {
-            bubble = null
-            params = null
-            end("별 아이콘을 표시하지 못했어요. 다른 앱 위에 표시 권한을 확인해 주세요.")
-        }
+        windowManager.addView(view, layout)
     }
 
     private fun hideBubble() {
+        handler.removeCallbacks(recoverWindow)
+        recoveryPending = false
         val view = bubble
         bubble = null
         params = null
         if (view != null) {
-            try { windowManager.removeViewImmediate(view) } catch (_: IllegalArgumentException) { }
+            try { windowManager.removeViewImmediate(view) } catch (_: RuntimeException) { }
         }
         mutableRuntime.value = mutableRuntime.value.copy(visible = false)
+    }
+
+    private fun handleWindowFailure() {
+        hideBubble()
+        if (!started || stopping) return
+        val decision = startDecision(this)
+        if (decision != OverlayStartPolicy.Decision.START) {
+            end(clearChoice = decision == OverlayStartPolicy.Decision.CLEAR_CHOICE_AND_STOP)
+            return
+        }
+        if (messengerVisible || !screenIsAvailable()) return
+        if (windowRecovery.retryOnce()) {
+            recoveryPending = true
+            handler.postDelayed(recoverWindow, 300L)
+        } else {
+            end("별 아이콘 재개 대기 · 앱을 다시 열면 재시도해요.")
+        }
     }
 
     private fun installDrag(view: FloatingStarView, layout: WindowManager.LayoutParams) {
@@ -248,11 +303,11 @@ class FloatingStarService : Service() {
     private fun updateLayout(view: View, layout: WindowManager.LayoutParams) {
         if (bubble !== view || !started || stopping) return
         if (!Settings.canDrawOverlays(this)) {
-            end("다른 앱 위에 표시 권한이 꺼져 별 아이콘을 종료했어요.")
+            end("다른 앱 위에 표시 권한이 꺼져 별 아이콘을 종료했어요.", clearChoice = true)
             return
         }
         try { windowManager.updateViewLayout(view, layout) } catch (_: RuntimeException) {
-            end("별 아이콘을 표시하지 못했어요. 앱을 열어 다시 켜 주세요.")
+            handleWindowFailure()
         }
     }
 
@@ -298,8 +353,6 @@ class FloatingStarService : Service() {
     private fun notification(): Notification {
         val open = PendingIntent.getActivity(this, 4100, chatIntent(this),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val stop = PendingIntent.getService(this, 4101, Intent(this, FloatingStarService::class.java).setAction(ACTION_STOP),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_homeway)
             .setContentTitle("메신저 별 아이콘 켜짐")
@@ -311,17 +364,16 @@ class FloatingStarService : Service() {
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .addAction(android.R.drawable.ic_dialog_email, "메신저 열기", open)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "별 아이콘 끄기", stop)
             .build()
     }
 
-    private fun end(error: String? = null) {
+    private fun end(error: String? = null, clearChoice: Boolean = false) {
+        if (clearChoice) preferences.enabled = false
         if (stopping) return
         stopping = true
-        preferences.enabled = false
         started = false
         hideBubble()
-        mutableRuntime.value = OverlayRuntime(error = error)
+        mutableRuntime.value = OverlayRuntime(error = error, stopping = true)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -331,10 +383,11 @@ class FloatingStarService : Service() {
         stopping = true
         hideBubble()
         if (runningInstance === this) runningInstance = null
-        if (receiverRegistered) unregisterReceiver(screenReceiver)
-        if (watchingPermission) appOps.stopWatchingMode(permissionListener)
+        if (receiverRegistered) try { unregisterReceiver(screenReceiver) } catch (_: RuntimeException) { }
+        if (watchingPermission) try { appOps.stopWatchingMode(permissionListener) } catch (_: RuntimeException) { }
         handler.removeCallbacksAndMessages(null)
-        mutableRuntime.value = mutableRuntime.value.copy(running = false, visible = false)
+        // Unexpected destruction preserves the saved choice for OS/visible-Activity resume.
+        mutableRuntime.value = mutableRuntime.value.copy(running = false, visible = false, starting = false, stopping = false)
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }
@@ -355,30 +408,64 @@ class FloatingStarService : Service() {
         val isRunning: Boolean get() = mutableRuntime.value.running
         val isBubbleVisible: Boolean get() = mutableRuntime.value.visible
 
+        fun wantsOverlay(context: Context): Boolean = OverlayPreferences(context).enabled
+        fun hasSavedChoice(context: Context): Boolean = OverlayPreferences(context).hasSavedChoice
+
         /** Call from a visible activity after explaining and obtaining the system overlay permission. */
-        fun start(context: Context) {
-            check(runningInstance?.stopping != true) { "별 아이콘을 종료하고 있어요. 잠시 후 다시 켜 주세요." }
-            check(Settings.canDrawOverlays(context)) { "다른 앱 위에 표시 권한을 허용해 주세요." }
-            val preferences = OverlayPreferences(context)
-            preferences.enabled = true
-            mutableRuntime.value = mutableRuntime.value.copy(error = null)
+        fun start(context: Context): Boolean {
+            OverlayPreferences(context).enabled = true
+            return resumeSavedOverlay(context)
+        }
+
+        /** Restore only a prior enabled choice, and only when called from a visible Activity. */
+        fun resumeSavedOverlay(context: Context): Boolean {
+            val decision = startDecision(context)
+            if (decision != OverlayStartPolicy.Decision.START) {
+                if (decision == OverlayStartPolicy.Decision.CLEAR_CHOICE_AND_STOP) stop(context)
+                return false
+            }
+            if (runningInstance?.stopping == true || mutableRuntime.value.stopping) return false
+            if (mutableRuntime.value.running || mutableRuntime.value.starting) return true
+            mutableRuntime.value = OverlayRuntime(starting = true)
             try {
                 ContextCompat.startForegroundService(context, Intent(context, FloatingStarService::class.java).setAction(ACTION_START))
-            } catch (failure: RuntimeException) {
-                preferences.enabled = false
-                mutableRuntime.value = OverlayRuntime(error = "별 아이콘을 시작하지 못했어요. 앱을 열어 다시 켜 주세요.")
-                throw failure
+                return true
+            } catch (_: RuntimeException) {
+                // Android 15 may reject a new FGS if Activity visibility changed in flight.
+                // Keep the saved choice unless permission/account eligibility actually changed.
+                if (startDecision(context) == OverlayStartPolicy.Decision.CLEAR_CHOICE_AND_STOP) {
+                    OverlayPreferences(context).enabled = false
+                }
+                mutableRuntime.value = OverlayRuntime(error = "별 아이콘 재개 대기 · 앱을 다시 열면 재시도해요.")
+                return false
             }
+        }
+
+        private fun startDecision(context: Context): OverlayStartPolicy.Decision {
+            val enabled = OverlayPreferences(context).enabled
+            if (!enabled) return OverlayStartPolicy.Decision.STOP
+            val repository = AppRepository(context)
+            return OverlayStartPolicy.decide(enabled, Settings.canDrawOverlays(context), repository.demoMode || repository.configured)
         }
 
         fun stop(context: Context) {
             OverlayPreferences(context).enabled = false
+            stopSession(context, clearChoice = true)
+        }
+
+        /** A temporary failure must not turn the user's saved enabled choice into an off. */
+        fun pause(context: Context, error: String? = null) {
+            stopSession(context, clearChoice = false, error = error)
+        }
+
+        private fun stopSession(context: Context, clearChoice: Boolean, error: String? = null) {
             val active = runningInstance
             if (active != null) {
-                if (Looper.myLooper() == Looper.getMainLooper()) active.end() else active.handler.post { active.end() }
+                if (Looper.myLooper() == Looper.getMainLooper()) active.end(error, clearChoice)
+                else active.handler.post { active.end(error, clearChoice) }
             } else {
                 context.stopService(Intent(context, FloatingStarService::class.java))
-                mutableRuntime.value = OverlayRuntime()
+                mutableRuntime.value = OverlayRuntime(error = error)
             }
         }
 

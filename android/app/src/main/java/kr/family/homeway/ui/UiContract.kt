@@ -29,6 +29,7 @@ data class UiState(
     val telegramReceiving: Boolean = false,
     val needsOnboarding: Boolean = true,
     val overlayEnabled: Boolean = false,
+    val overlaySavedEnabled: Boolean = false,
     val overlayPermissionGranted: Boolean = false,
     val openChatRequestId: Int = 0,
     val overlayPromptVisible: Boolean = false,

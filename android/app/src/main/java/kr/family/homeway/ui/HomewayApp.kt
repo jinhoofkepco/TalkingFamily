@@ -798,7 +798,11 @@ private fun SettingsMenu(state: UiState, select: (String) -> Unit) {
         SettingsMenuItem("자동 위치 공유", "현재 ${if (state.sharingEnabled) "켜짐" else "꺼짐"} · 공유 켜기 / 끄기", Icons.Outlined.MyLocation, "settings-location-menu-item") { select("settings-location") }
         SettingsMenuItem("공유 정보 안내", "공유하는 정보와 기록 보관", Icons.Outlined.Shield, "settings-info-menu-item") { select("settings-info") }
         SettingsMenuItem("가족 연결", "연결 상태 · 처음 안내 다시 보기", Icons.Outlined.FavoriteBorder, "settings-family-menu-item") { select("settings-family") }
-        SettingsMenuItem("별 아이콘", if (state.overlayEnabled && state.overlayPermissionGranted) "켜짐 · 다른 앱에서 대화 열기" else "화면 위에 작게 띄워 두기", Icons.Outlined.StarOutline, "settings-overlay-menu-item") { select("settings-overlay") }
+        SettingsMenuItem("별 아이콘", when {
+            state.overlayEnabled && state.overlayPermissionGranted -> "켜짐 · 다른 앱에서 대화 열기"
+            state.overlaySavedEnabled -> "다시 표시 대기"
+            else -> "화면 위에 작게 띄워 두기"
+        }, Icons.Outlined.StarOutline, "settings-overlay-menu-item") { select("settings-overlay") }
     }
 }
 
@@ -930,24 +934,37 @@ private fun OverlayPermissionIntro(actions: UiActions) {
 @Composable
 private fun OverlaySettings(state: UiState, actions: UiActions) {
     val active = state.overlayEnabled && state.overlayPermissionGranted
+    var disableDialog by rememberSaveable { mutableStateOf(false) }
     SectionCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Filled.Star, null, Modifier.size(22.dp), tint = Gold)
             Spacer(Modifier.width(9.dp))
             Text("별 아이콘", Modifier.weight(1f), fontWeight = FontWeight.Bold)
-            Pill(if (active) "켜짐" else if (state.overlayEnabled) "권한 필요" else "꺼짐")
+            Pill(if (active) "켜짐" else if (state.overlaySavedEnabled) "다시 표시 대기" else if (state.overlayEnabled) "권한 필요" else "꺼짐")
         }
         Text("다른 앱 위에 작은 반투명 별을 띄워 둬요. 별을 끌어 옮기거나 눌러서 대화를 열 수 있어요.", fontSize = 13.sp, color = Muted, lineHeight = 21.sp)
+        Text("켜 둔 별 설정은 기억해요. 일시적으로 별이 사라져도 앱을 다시 열면 표시를 다시 시도해요. 대화의 닫기 버튼은 별로 돌아가는 버튼이에요.", fontSize = 12.sp, color = Muted, lineHeight = 19.sp)
         LabelValue("화면 위 표시", if (state.overlayPermissionGranted) "허용됨" else "권한 필요")
         Text("별 아이콘을 켜거나 꺼도 자동 위치 공유 설정은 바뀌지 않아요.", fontSize = 12.sp, color = Muted, lineHeight = 19.sp)
         if (state.demoMode) Text("체험 모드에서도 별 아이콘은 실제 화면 위에 표시돼요. 메시지·위치 전송은 하지 않아요.", fontSize = 12.sp, color = Muted, lineHeight = 19.sp)
         if (active) {
             Button(actions.returnToStar, Modifier.fillMaxWidth().testTag("overlay-return")) { Text("별 아이콘으로 돌아가기") }
         } else {
-            Button(actions.enableOverlay, Modifier.fillMaxWidth().testTag("overlay-enable")) { Text(if (state.overlayPermissionGranted) "별 아이콘 켜기" else "권한 설정 열기") }
+            Button(actions.enableOverlay, Modifier.fillMaxWidth().testTag("overlay-enable")) {
+                Text(if (!state.overlayPermissionGranted) "권한 설정 열기" else if (state.overlaySavedEnabled) "별 아이콘 다시 표시" else "별 아이콘 켜기")
+            }
         }
-        if (state.overlayEnabled) OutlinedButton(actions.disableOverlay, Modifier.fillMaxWidth().testTag("overlay-disable")) { Text("별 아이콘 끄기") }
+        if (state.overlayEnabled || state.overlaySavedEnabled) OutlinedButton({ disableDialog = true }, Modifier.fillMaxWidth().testTag("overlay-disable")) { Text("별 아이콘 끄기") }
     }
+    if (disableDialog) AlertDialog(
+        onDismissRequest = { disableDialog = false },
+        modifier = Modifier.testTag("overlay-disable-dialog"),
+        icon = { Icon(Icons.Outlined.StarOutline, null, tint = Gold) },
+        title = { Text("별 아이콘을 끌까요?") },
+        text = { Text("다른 앱 위의 별이 사라져요. 대화는 앱을 열어 사용할 수 있고, 자동 위치 공유 설정은 그대로 유지돼요.", lineHeight = 22.sp) },
+        confirmButton = { TextButton({ disableDialog = false; actions.disableOverlay() }, Modifier.testTag("overlay-disable-confirm")) { Text("별 끄기") } },
+        dismissButton = { Button({ disableDialog = false }, Modifier.testTag("overlay-disable-cancel")) { Text("켜 두기") } },
+    )
 }
 
 @Composable
