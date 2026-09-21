@@ -67,6 +67,11 @@ internal class TelegramExchange(
                                         events!!.getJSONObject(j).takeIf { it.optString("id") == packet.id }
                                             ?.put("delivery", "relayed")
                                     }
+                                    // These records outlive the bounded event list and must retain its receipt status.
+                                    listOf("latestLocation", "latestHeartbeat").forEach { key ->
+                                        state.optJSONObject(key)?.takeIf { it.optString("id") == packet.id }
+                                            ?.put("delivery", "relayed")
+                                    }
                                     store.cache(state)
                                     store.remove(packet.id!!)
                                     store.setMeta("sentAt", 0)

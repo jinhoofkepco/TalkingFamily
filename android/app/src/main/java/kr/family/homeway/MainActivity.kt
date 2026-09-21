@@ -25,6 +25,7 @@ import kr.family.homeway.ui.HomewayApp
 import kr.family.homeway.ui.UiActions
 import kr.family.homeway.overlay.FloatingStarService
 import kr.family.homeway.data.TelegramReceiveService
+import kr.family.homeway.tracking.TrackingService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -45,6 +46,7 @@ class MainActivity : ComponentActivity() {
     private var collapsing = false
     private var collapseJob: Job? = null
     private var notificationPermissionInFlight = false
+    private var trackingResumeAttempted = false
     private val permissionLauncher=registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         val callback=afterPermission
         afterPermission=null
@@ -85,8 +87,16 @@ class MainActivity : ComponentActivity() {
             val state=model.state.collectAsStateWithLifecycle().value
             val overlay = FloatingStarService.runtime.collectAsStateWithLifecycle().value
             val receiver = TelegramReceiveService.runtime.collectAsStateWithLifecycle().value
+            val tracking = TrackingService.runtime.collectAsStateWithLifecycle().value
             HomewayApp(state.copy(
                 telegramReceiving = receiver.running,
+                trackingStatus = if (state.role != "child" || state.demoMode) state.trackingStatus else when {
+                    tracking.error != null -> tracking.error
+                    tracking.starting -> "자동 위치 공유 시작 중…"
+                    tracking.stopping -> "자동 위치 공유 종료 중…"
+                    state.sharingEnabled && !tracking.running -> "자동 위치 공유 재개 대기 · 앱을 열면 다시 시작해요."
+                    else -> state.trackingStatus
+                },
                 error = state.error ?: receiver.error,
                 overlayEnabled = overlay.running,
                 overlayPermissionGranted = overlayPermissionGranted,
@@ -141,6 +151,11 @@ class MainActivity : ComponentActivity() {
             }
         }
         lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                TrackingService.runtime.collect { handleReadyState() }
+            }
+        }
+        lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 while(true) {
                     model.refresh()
@@ -168,6 +183,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onPostResume() {
         super.onPostResume()
+        trackingResumeAttempted = false
         overlayPermissionGranted = Settings.canDrawOverlays(this)
         if (!collapsing) FloatingStarService.setMessengerVisible(true)
         handleReadyState()
@@ -194,6 +210,13 @@ class MainActivity : ComponentActivity() {
     private fun handleReadyState() {
         if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) || collapsing || waitingForOverlayPermission) return
         val state = model.state.value
+        if (!trackingResumeAttempted) {
+            trackingResumeAttempted = true
+            // Resume only the saved child choice, with current permissions, while visible.
+            TrackingService.resumeSavedSharing(this)
+        }
+        // Do not collapse into the star before the location service has entered foreground.
+        if (TrackingService.runtime.value.starting) return
         if (!state.configured && !state.demoMode) return
         if (state.configured && TelegramReceiveService.wantsReceiving(this) && Build.VERSION.SDK_INT >= 33 &&
             !has(Manifest.permission.POST_NOTIFICATIONS)) {

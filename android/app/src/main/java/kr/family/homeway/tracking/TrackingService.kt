@@ -1,6 +1,7 @@
 package kr.family.homeway.tracking
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -17,6 +18,7 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.TriggerEvent
 import android.hardware.TriggerEventListener
+import android.location.Location
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
@@ -26,7 +28,13 @@ import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import java.time.Instant
-import java.util.UUID
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 import kotlin.math.abs
 import kotlin.math.sqrt
 import kotlinx.coroutines.CancellationException
@@ -38,16 +46,19 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kr.family.homeway.data.AppRepository
 import org.json.JSONObject
 
-/** Visible, child-initiated session. No boot receiver, sticky restart or wake lock. */
+/** Child-consented sharing; new starts require a visible Activity, OS sticky restarts retain opt-in. */
 class TrackingService : Service(), SensorEventListener {
     private lateinit var repository: AppRepository
     private lateinit var sensors: SensorManager
-    private lateinit var policy: MovementSamplingPolicy
+    private lateinit var policy: AutomaticLocationPolicy
     private val detector = VerticalMovementDetector()
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -59,6 +70,17 @@ class TrackingService : Service(), SensorEventListener {
     private var ticker: Job? = null
     private var sender: Job? = null
     private var locationJob: Job? = null
+    private var outboxRelay: Job? = null
+    private val fusedLocation by lazy { LocationServices.getFusedLocationProviderClient(this) }
+    private var subscriptionActive = false
+    private var subscriptionStarting = false
+    private var lastSubscriptionAttemptAt: Long? = null
+    private val locationCallback = object : LocationCallback() {
+        override fun onLocationResult(result: LocationResult) {
+            // With batching disabled, prefer the newest fresh fix if a provider still returns several.
+            result.locations.maxByOrNull { it.elapsedRealtimeNanos }?.let(::acceptLocation)
+        }
+    }
     private var significantMotion: Sensor? = null
     private var lastMotionMillis = Long.MIN_VALUE
     private var accelerationCount = 0
@@ -77,6 +99,7 @@ class TrackingService : Service(), SensorEventListener {
     override fun onCreate() {
         super.onCreate()
         repository = AppRepository(applicationContext)
+        runningInstance = this
         sensors = getSystemService(SENSOR_SERVICE) as SensorManager
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "자녀 위치 공유", NotificationManager.IMPORTANCE_LOW).apply {
@@ -87,13 +110,18 @@ class TrackingService : Service(), SensorEventListener {
             },
         )
         sender = scope.launch {
+            val writer = TrackingEventWriter(repository::enqueueEventOnly, onFailure = {
+                repository.noteTrackingStatus("기록 저장을 완료하지 못했어요. 저장을 다시 시도하고 있어요.")
+            })
             for ((kind, payload) in outgoing) {
-                try {
-                    repository.enqueueEventOnly(kind, payload, UUID.randomUUID().toString())
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    repository.noteTrackingStatus("통신 연결을 확인해 주세요. 저장된 기록은 연결 후 다시 보냅니다.")
+                writer.write(kind, payload)
+                if (kind == "location") {
+                    policy.committed()
+                    if (started && !stopping) {
+                        val savedTime = Instant.parse(payload.getString("capturedAt")).atZone(ZoneId.systemDefault())
+                            .format(DateTimeFormatter.ofPattern("HH:mm:ss"))
+                        repository.noteTrackingStatus("자동 공유 중 · 마지막 위치 저장 $savedTime")
+                    }
                 }
             }
         }
@@ -104,44 +132,55 @@ class TrackingService : Service(), SensorEventListener {
             stopSharing()
             return START_NOT_STICKY
         }
-        if (started || stopping) return START_NOT_STICKY
-        if (intent?.action != ACTION_START || !repository.configured || !repository.isChild ||
-            repository.demoMode || !repository.sharingEnabled || !hasRequiredPermissions(this)) {
-            repository.sharingEnabled = false
+        if (stopping) return START_NOT_STICKY
+        // A null intent is delivered only by Android when restarting an existing sticky service.
+        if (intent != null && intent.action != ACTION_START) {
+            if (!started) stopSelf()
+            return if (started) START_STICKY else START_NOT_STICKY
+        }
+        if (startDecision(repository, this) != TrackingStartPolicy.Decision.START) {
             repository.noteTrackingStatus("자녀 화면에서 위치 공유 안내와 권한을 확인하고 다시 시작해 주세요.")
-            stopSelf()
+            stopSharing()
             return START_NOT_STICKY
         }
+        if (started) return START_STICKY
+        mutableRuntime.value = TrackingRuntime(starting = true)
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(NOTIFICATION_ID, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
             } else startForeground(NOTIFICATION_ID, notification())
-        } catch (_: SecurityException) {
-            repository.sharingEnabled = false
-            repository.noteTrackingStatus("위치 공유를 시작하지 못했어요. 위치 권한을 확인해 주세요.")
+        } catch (_: RuntimeException) {
+            // Background/while-in-use rejection is not withdrawal of a still-valid opt-in.
+            if (startDecision(repository, this) != TrackingStartPolicy.Decision.START) repository.sharingEnabled = false
+            val message = "자동 위치 공유를 시작하지 못했어요. 앱을 열고 위치 권한을 확인해 주세요."
+            repository.noteTrackingStatus(message)
+            mutableRuntime.value = TrackingRuntime(error = message)
             stopSelf()
             return START_NOT_STICKY
         }
         started = true
         runningInstance = this
+        mutableRuntime.value = TrackingRuntime(running = true)
         val now = SystemClock.elapsedRealtime()
-        policy = MovementSamplingPolicy(now)
+        policy = AutomaticLocationPolicy(now)
         lastHeartbeatMillis = now
-        repository.noteTrackingStatus("자동 공유 중 · 움직임이 있는 5분 구간마다 위치 확인 · 높이 변화는 추정")
+        repository.noteTrackingStatus("자동 공유 중 · 5분마다 새 위치 확인 · 첫 위치를 기다리고 있어요")
         registerSensors()
+        startLocationUpdates()
+        outboxRelay = scope.launch { TrackingOutboxRelay.run(repository) }
         outgoing.trySend("sharing_status" to JSONObject().put("enabled", true))
         enqueueHeartbeat()
         ticker = scope.launch {
             while (started) {
                 delay(30_000L)
-                if (!repository.sharingEnabled || !repository.isChild || !hasRequiredPermissions(this@TrackingService)) {
+                if (startDecision(repository, this@TrackingService) != TrackingStartPolicy.Decision.START) {
                     stopSharing()
                     break
                 }
                 checkDeadlines()
             }
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
     private fun registerSensors() {
@@ -192,7 +231,6 @@ class TrackingService : Service(), SensorEventListener {
                 if (!pressureReliable) return
                 val recentMotion = lastMotionMillis != Long.MIN_VALUE && at - lastMotionMillis in 0..30_000L
                 detector.addPressure(event.values[0].toDouble(), at, recentMotion).forEach { movement ->
-                    policy.noteMovement()
                     outgoing.trySend("vertical" to JSONObject()
                         .put("phase", movement.phase)
                         .put("relativeMeters", movement.relativeMeters)
@@ -206,8 +244,62 @@ class TrackingService : Service(), SensorEventListener {
 
     private fun noteMovement(at: Long) {
         lastMotionMillis = maxOf(lastMotionMillis, at)
-        policy.noteMovement()
         checkDeadlines()
+    }
+
+    /** The provider owns the five-minute schedule, including delivery while the screen is off. */
+    @SuppressLint("MissingPermission")
+    private fun startLocationUpdates() {
+        if (!started || subscriptionActive || subscriptionStarting) return
+        subscriptionStarting = true
+        lastSubscriptionAttemptAt = SystemClock.elapsedRealtime()
+        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, INTERVAL_MILLIS)
+            .setMinUpdateIntervalMillis(INTERVAL_MILLIS)
+            .setMaxUpdateDelayMillis(0)
+            .setMaxUpdateAgeMillis(0)
+            .setMinUpdateDistanceMeters(0f)
+            .build()
+        try {
+            fusedLocation.requestLocationUpdates(request, locationCallback, Looper.getMainLooper())
+                .addOnSuccessListener {
+                    subscriptionStarting = false
+                    if (started) subscriptionActive = true else stopLocationUpdates()
+                }
+                .addOnFailureListener {
+                    subscriptionStarting = false
+                    subscriptionActive = false
+                    if (started) repository.noteTrackingStatus("위치 자동 확인을 연결하지 못했어요. 권한과 위치 설정을 확인해 주세요.")
+                }
+        } catch (_: SecurityException) {
+            subscriptionStarting = false
+            repository.noteTrackingStatus("정확한 위치 권한을 확인해 주세요. 새 위치를 기록하지 못했어요.")
+        }
+    }
+
+    private fun stopLocationUpdates() {
+        outboxRelay?.cancel()
+        subscriptionActive = false
+        subscriptionStarting = false
+        runCatching { fusedLocation.removeLocationUpdates(locationCallback) }
+    }
+
+    private fun acceptLocation(location: Location) {
+        if (!started || !repository.sharingEnabled) return
+        val sample = location.toFixSample()
+        val now = SystemClock.elapsedRealtime()
+        LocationFixValidation.error(sample, now)?.let {
+            repository.noteTrackingStatus(it)
+            return
+        }
+        if (!policy.reserve(sample, now)) return
+        val queued = outgoing.trySend("location" to JSONObject()
+            .put("latitude", sample.latitude)
+            .put("longitude", sample.longitude)
+            .put("accuracy", sample.accuracyMeters)
+            .put("capturedAt", Instant.ofEpochMilli(sample.capturedAtMillis).toString())
+            .put("source", "automatic"))
+        if (queued.isFailure) policy.cancelReservation()
+        // "Saved" is reported by the writer only after the SQLite transaction has committed.
     }
 
     private fun checkDeadlines() {
@@ -217,23 +309,19 @@ class TrackingService : Service(), SensorEventListener {
             lastHeartbeatMillis = now
             enqueueHeartbeat()
         }
-        if (locationJob?.isActive != true && policy.consumeDue(now)) {
+        if (!subscriptionActive && !subscriptionStarting &&
+            lastSubscriptionAttemptAt?.let { now - it >= INTERVAL_MILLIS } != false) startLocationUpdates()
+        // This awake-only watchdog is recovery, not the authoritative GPS timer.
+        if (locationJob?.isActive != true && policy.beginWatchdog(now)) {
             locationJob = scope.launch {
                 try {
-                    val location = CurrentLocationProvider.capture(this@TrackingService)
-                    if (!started || !repository.sharingEnabled) return@launch
-                    outgoing.send("location" to JSONObject()
-                        .put("latitude", location.latitude)
-                        .put("longitude", location.longitude)
-                        .put("accuracy", location.accuracy.toDouble())
-                        .put("capturedAt", Instant.ofEpochMilli(location.time).toString())
-                        .put("source", "automatic"))
-                    repository.noteTrackingStatus("현재 위치 기록 · ${Instant.ofEpochMilli(location.time)}")
+                    val location = CurrentLocationProvider.capture(this@TrackingService, durationMillis = 30_000L)
+                    acceptLocation(location)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (_: Exception) {
-                    policy.retryNextInterval()
-                    repository.noteTrackingStatus("현재 위치를 찾지 못했어요. 다음 5분 구간에 다시 확인합니다.")
+                    if (started && repository.sharingEnabled && policy.awaitingFreshFix(SystemClock.elapsedRealtime())) repository.noteTrackingStatus(
+                        "현재 위치를 찾지 못했어요. 이전 위치를 새 기록으로 보내지 않고 새 위치를 기다려요.")
                 }
             }
         }
@@ -265,7 +353,7 @@ class TrackingService : Service(), SensorEventListener {
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setContentTitle("아빠에게 위치 공유 중")
-            .setContentText("움직임이 있는 5분 구간마다 위치를 확인해요. 높이 변화는 추정해요.")
+            .setContentText("5분마다 새 위치를 확인해요. 높이 변화는 추정해요.")
             .setOngoing(true).setOnlyAlertOnce(true).setSilent(true).setCategory(NotificationCompat.CATEGORY_SERVICE)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "공유 종료", stop)
         // Notification entry opens the app; only an explicit launcher entry starts collapsed.
@@ -280,10 +368,12 @@ class TrackingService : Service(), SensorEventListener {
     private fun stopSharing() {
         if (stopping) return
         stopping = true
+        mutableRuntime.value = TrackingRuntime(stopping = true)
         repository.sharingEnabled = false
         started = false
         ticker?.cancel()
         locationJob?.cancel()
+        stopLocationUpdates()
         unregisterSensors()
         repository.noteTrackingStatus("자동 위치 공유 종료")
         // Stop collection immediately, then let the repository durably save queued metadata.
@@ -292,7 +382,7 @@ class TrackingService : Service(), SensorEventListener {
                 outgoing.send("sharing_status" to JSONObject().put("enabled", false))
             }
             outgoing.close()
-            sender?.join()
+            withTimeoutOrNull(5_000L) { sender?.join() }
             stopForeground(STOP_FOREGROUND_REMOVE)
             (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).cancel(NOTIFICATION_ID)
             stopSelf()
@@ -309,7 +399,10 @@ class TrackingService : Service(), SensorEventListener {
     override fun onDestroy() {
         started = false
         if (runningInstance === this) runningInstance = null
-        repository.sharingEnabled = false
+        val error = mutableRuntime.value.error
+        mutableRuntime.value = TrackingRuntime(error = error)
+        if (repository.sharingEnabled) repository.noteTrackingStatus(error ?: "자동 위치 공유 재개 대기 · 앱을 열면 다시 시작해요.")
+        stopLocationUpdates()
         unregisterSensors()
         outgoing.close()
         scope.cancel()
@@ -320,6 +413,10 @@ class TrackingService : Service(), SensorEventListener {
     override fun onBind(intent: Intent?): IBinder? = null
 
     companion object {
+        data class TrackingRuntime(val running: Boolean = false, val starting: Boolean = false,
+            val stopping: Boolean = false, val error: String? = null)
+        private val mutableRuntime = MutableStateFlow(TrackingRuntime())
+        val runtime = mutableRuntime.asStateFlow()
         @Volatile private var runningInstance: TrackingService? = null
         private const val CHANNEL_ID = "homeway_location_sharing"
         private const val NOTIFICATION_ID = 4001
@@ -328,10 +425,40 @@ class TrackingService : Service(), SensorEventListener {
         private const val INTERVAL_MILLIS = 5 * 60_000L
 
         /** Call only from a visible activity after the child's explicit sharing consent. */
-        fun start(context: Context) {
+        fun start(context: Context): Boolean {
             check(runningInstance?.stopping != true) { "위치 공유를 종료하고 있어요. 잠시 후 다시 켜 주세요." }
-            ContextCompat.startForegroundService(context, Intent(context, TrackingService::class.java).setAction(ACTION_START))
+            if (runtime.value.running || runtime.value.starting) return true
+            val repo = AppRepository(context)
+            if (startDecision(repo, context) != TrackingStartPolicy.Decision.START) {
+                repo.sharingEnabled = false
+                repo.noteTrackingStatus("위치 공유 설정과 권한을 확인해 주세요.")
+                return false
+            }
+            mutableRuntime.value = TrackingRuntime(starting = true)
+            repo.noteTrackingStatus("자동 위치 공유 시작 중…")
+            return try {
+                ContextCompat.startForegroundService(context, Intent(context, TrackingService::class.java).setAction(ACTION_START))
+                true
+            } catch (_: RuntimeException) {
+                val message = "자동 위치 공유 재개 대기 · 앱을 열고 다시 시도해 주세요."
+                repo.noteTrackingStatus(message)
+                mutableRuntime.value = TrackingRuntime(error = message)
+                false
+            }
         }
+
+        /** Call only while an Activity is visible; never changes an off preference to on. */
+        fun resumeSavedSharing(context: Context) {
+            val repo = AppRepository(context)
+            when (startDecision(repo, context)) {
+                TrackingStartPolicy.Decision.STOP -> Unit
+                TrackingStartPolicy.Decision.CLEAR_CONSENT_AND_STOP -> stop(context)
+                TrackingStartPolicy.Decision.START -> if (!runtime.value.stopping) start(context)
+            }
+        }
+
+        private fun startDecision(repo: AppRepository, context: Context) = TrackingStartPolicy.decide(
+            repo.sharingEnabled, repo.configured, repo.isChild, repo.demoMode, hasRequiredPermissions(context))
 
         fun stop(context: Context) {
             // Do not create a service for demo/reset flows, and stop collection before returning.
@@ -339,7 +466,11 @@ class TrackingService : Service(), SensorEventListener {
             if (active != null) {
                 if (Looper.myLooper() == Looper.getMainLooper()) active.stopSharing()
                 else active.handler.post { active.stopSharing() }
-            } else AppRepository(context).sharingEnabled = false
+            } else {
+                AppRepository(context).apply { sharingEnabled = false; noteTrackingStatus("자동 위치 공유 종료") }
+                context.stopService(Intent(context, TrackingService::class.java))
+                mutableRuntime.value = TrackingRuntime()
+            }
         }
 
         /** Wait before clearing account settings so queued sensor writes cannot cross accounts. */
@@ -348,7 +479,7 @@ class TrackingService : Service(), SensorEventListener {
             if (active != null) {
                 active.stopSharing()
                 active.stopped.await()
-            } else AppRepository(context).sharingEnabled = false
+            } else stop(context)
         }
 
         fun hasRequiredPermissions(context: Context): Boolean {

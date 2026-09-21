@@ -15,6 +15,40 @@ class TelegramExchangeTest {
     private fun award() = event("sticker_award", JSONObject().put("count", 1).put("reason", "잘했어요"))
     private fun chat(text: String, role: String) = event("chat", JSONObject().put("text", text), role)
 
+    @Test fun `ACK keeps retained location and heartbeat received after timeline truncation and restart`() {
+        val measuredAt = "2026-09-21T06:00:00Z"
+        val samples = listOf(
+            "latestLocation" to event("location", JSONObject().put("latitude", 37.567).put("longitude", 126.9785)
+                .put("accuracy", 12).put("capturedAt", measuredAt).put("source", "automatic"), "child"),
+            "latestHeartbeat" to event("heartbeat", JSONObject().put("recordedAt", measuredAt).put("batteryPercent", 70), "child"),
+        )
+        for ((key, sample) in samples) {
+            val family = Family()
+            family.child.enqueue(sample)
+            family.syncChild()
+            family.syncGuardian() // The real exchange sends an ACK; the child has not received it yet.
+            val state = family.child.cached()
+            val recent = JSONArray().put(sample.json())
+            repeat(999) { recent.put(chat("recent $it", "guardian").copy(delivery = "relayed").json()) }
+            state.put("events", recent)
+            family.child.cache(TelegramLedger.apply(state, chat("trim oldest", "guardian").copy(delivery = "relayed")))
+            assertEquals(1, FamilySnapshot.parse(family.child.cached()).events.count { it.id == sample.id })
+            assertEquals("pending", family.child.cached().getJSONObject(key).getString("delivery"))
+            val trimmedEvents = family.child.cached().getJSONArray("events")
+            assertFalse((0 until trimmedEvents.length()).any {
+                trimmedEvents.getJSONObject(it).getString("id") == sample.id
+            })
+
+            family.syncChild()
+            assertTrue(family.child.pending().isEmpty())
+            family.child = MemoryStore(family.child.saved())
+            assertEquals("relayed", family.child.cached().getJSONObject(key).getString("delivery"))
+            val restored = FamilySnapshot.parse(family.child.cached()).events.single { it.id == sample.id }
+            assertEquals("relayed", restored.delivery)
+            assertEquals(sample.measuredAt, restored.measuredAt)
+        }
+    }
+
     @Test fun `lost event response survives sender restart and peer ACK completes the original attempt`() {
         val family = Family()
         val award = award()

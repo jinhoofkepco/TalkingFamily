@@ -140,11 +140,11 @@ private fun Onboarding(state: UiState, actions: UiActions) {
                 lineHeight = 23.sp,
             )
             Text(
-                "자동 공유 중에는 움직임을 감지해 이동 중 5분 간격으로 GPS 위치를 확인합니다. 위도·경도, 측정 시각, 정확도와 움직임 상태를 공유합니다. 기압계가 있는 기기는 기압에 따른 상대 높이 변화로 올라가기·내려가기의 시작과 종료를 추정해 공유합니다. 정확한 층수는 알 수 없습니다.",
+                "자동 공유를 켜면 움직임이 없어도 약 5분마다 새 위치를 요청합니다. 위도·경도, 측정 시각, 정확도와 움직임 상태를 공유합니다. 기압계가 있는 기기는 기압에 따른 상대 높이 변화로 올라가기·내려가기의 시작과 종료를 추정해 공유합니다. 정확한 층수는 알 수 없습니다.",
                 lineHeight = 23.sp,
             )
             Text(
-                "위치는 텔레그램을 거쳐 연결된 보호자에게 전달됩니다. 자동 공유 중에는 휴대폰 알림이 표시되며 설정에서 언제든 끌 수 있습니다. 위치·신체 활동·알림 권한은 기능을 사용할 때 요청합니다.",
+                "위치는 텔레그램을 거쳐 연결된 보호자에게 전달됩니다. 자동 공유 중에는 휴대폰 알림이 표시되며 설정에서 언제든 끌 수 있습니다. 켠 설정은 앱을 다시 열어도 유지됩니다. 위치 신호·절전·통신 상태에 따라 기록과 전달이 늦어질 수 있습니다. 위치·신체 활동·알림 권한은 기능을 사용할 때 요청합니다.",
                 lineHeight = 23.sp,
             )
             Text(
@@ -827,13 +827,25 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                     Text("자동 위치 공유", fontWeight = FontWeight.Medium)
-                    Text(if (child) "움직일 때 5분 간격으로 아빠에게 알려요." else "자녀 휴대폰에서 직접 켜고 끌 수 있어요.", fontSize = 12.sp, color = Muted, lineHeight = 19.sp)
+                    Text(if (child) "가만히 있어도 약 5분마다 위치를 확인해요." else "자녀 휴대폰에서 직접 켜고 끌 수 있어요.", fontSize = 12.sp, color = Muted, lineHeight = 19.sp)
                 }
                 Switch(state.sharingEnabled, onCheckedChange = { enabled -> if (enabled) consentDialog = true else actions.setSharing(false) }, enabled = child && !state.loading, modifier = Modifier.testTag("sharing-switch"))
             }
             Text(if (child) state.trackingStatus else "마지막으로 전달받은 자녀의 공유 설정입니다.", color = Forest, fontSize = 13.sp)
+            if (child && !state.demoMode) {
+                val latestAutomatic = state.events.asSequence()
+                    .filter { it.kind == "location" && it.sender == "child" && it.payload.optString("source") == "automatic" }
+                    .maxByOrNull { runCatching { Instant.parse(eventTime(it)) }.getOrDefault(Instant.MIN) }
+                val measuredAt = latestAutomatic?.let { event ->
+                    runCatching { Instant.parse(eventTime(event)).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("M월 d일 HH:mm:ss")) }
+                        .getOrDefault("시각 확인 중")
+                }
+                LabelValue("최근 자동 측정", measuredAt ?: "표시할 기록 없음")
+                latestAutomatic?.let { LabelValue("보호자에게 전달", deliveryLabel(it.delivery, false)) }
+            }
             HorizontalDivider(color = Cream)
             Text("언제든 이 설정에서 위치 공유를 끌 수 있어요. 공유를 끄면 새 자동 수집을 멈춥니다.", color = Muted, fontSize = 13.sp, lineHeight = 21.sp)
+            if (child) Text("공유 설정을 켜 두면 앱을 다시 열 때 이어서 공유해요. 5분은 요청 간격이며 위치 신호·절전·통신 상태에 따라 기록과 전달이 늦어질 수 있어요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
             if (!state.demoMode && child) {
                 OutlinedButton({ ServiceNotificationSettings.open(context, ServiceNotificationSettings.Kind.LOCATION) }, Modifier.fillMaxWidth().testTag("location-notification-settings")) { Text("위치 공유 알림 표시 설정") }
                 Text("열린 Android 설정에서 이 알림의 허용을 끄면 실행 알림을 숨길 수 있어요. 대화 알림과 위치 공유는 계속 유지됩니다.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
@@ -885,8 +897,9 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
         icon = { Icon(Icons.Outlined.MyLocation, null, tint = Forest) },
         title = { Text("자동 위치를 공유할까요?") },
         text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("이동 중 5분 간격으로 GPS 좌표·측정 시각·정확도와 움직임 상태를 보호자에게 보냅니다. 기압계가 있으면 상대 높이 변화로 오르내림 시작과 종료도 추정해 보냅니다.", lineHeight = 22.sp)
-            Text("화면이 꺼져 있어도 공유가 계속됩니다. 텔레그램 봇을 통해 보호자의 앱으로 전달되며, 공유 중에는 휴대폰 알림이 표시됩니다. 언제든 이 설정에서 끌 수 있어요. 보호자 휴대폰에서 메시지 수신을 켜 두어야 빠르게 받을 수 있어요.", lineHeight = 22.sp)
+            Text("움직임이 없어도 약 5분마다 새 위치를 요청해 좌표·측정 시각·정확도와 움직임 상태를 보호자에게 보냅니다. 기압계가 있으면 상대 높이 변화로 오르내림 시작과 종료도 추정해 보냅니다.", lineHeight = 22.sp)
+            Text("화면이 꺼져 있어도 공유를 이어가며, 켠 설정은 직접 끄기 전까지 기억해 앱을 다시 열면 이어서 공유합니다. 위치 신호·절전·통신 상태에 따라 기록과 전달이 늦어질 수 있어요.", lineHeight = 22.sp)
+            Text("텔레그램 봇을 통해 보호자의 앱으로 전달되며 공유 중에는 휴대폰 알림이 표시됩니다. 언제든 이 설정에서 끌 수 있어요. 보호자 휴대폰에서 메시지 수신을 켜 두어야 빠르게 받을 수 있어요.", lineHeight = 22.sp)
             if (state.demoMode) Text("지금은 체험 모드여서 실제로 수집하거나 공유하지 않아요.", color = Gold, fontWeight = FontWeight.Medium)
         } },
         confirmButton = { TextButton({ consentDialog = false; actions.setSharing(true) }) { Text(if (state.demoMode) "공유 켜기 체험" else "동의하고 공유 켜기") } },
@@ -962,7 +975,8 @@ private fun FirstGuide() {
             Text("대화하면서 위치를 보낼 수 있어요", fontWeight = FontWeight.Medium)
             Text("대화의 ‘현재 위치 공유’를 누르면 그때의 위치를 한 번 아빠에게 보내요.", fontSize = 14.sp, lineHeight = 22.sp)
             Text("자동 공유는 따로 켜요", fontWeight = FontWeight.Medium)
-            Text("자녀 대화에 정확히 ‘설정’을 보내고 자동 위치 공유를 고르세요. 동의하고 켜면 화면이 꺼져 있어도 움직임이 있는 5분 구간마다 위치를 기록해요. 필요한 위치·신체 활동·알림 권한을 요청해요.", fontSize = 14.sp, lineHeight = 22.sp)
+            Text("자녀 대화에 정확히 ‘설정’을 보내고 자동 위치 공유를 고르세요. 동의하고 켜면 움직임이 없어도 약 5분마다 새 위치를 요청해요. 화면이 꺼져 있어도 공유를 이어가고, 앱을 다시 열면 켜 둔 공유 설정을 이어가요. 필요한 위치·신체 활동·알림 권한을 요청해요.", fontSize = 14.sp, lineHeight = 22.sp)
+            Text("위치 신호·절전·통신 상태에 따라 기록과 전달이 늦어질 수 있어요. 자동 위치 공유 설정에서 최근 측정 시각과 전달 상태를 확인할 수 있어요.", fontSize = 13.sp, color = Muted, lineHeight = 21.sp)
             Text("공유 중임을 항상 알려요", fontWeight = FontWeight.Medium)
             Text("휴대폰 알림에서 공유 상태를 확인하고, 언제든 설정이나 알림에서 자동 공유를 끌 수 있어요.", fontSize = 14.sp, lineHeight = 22.sp)
         }
