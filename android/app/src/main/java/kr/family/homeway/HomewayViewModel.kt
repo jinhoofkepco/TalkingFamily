@@ -3,8 +3,6 @@ package kr.family.homeway
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.google.firebase.FirebaseApp
-import com.google.firebase.messaging.FirebaseMessaging
 import kr.family.homeway.data.AppRepository
 import kr.family.homeway.data.DemoStore
 import kr.family.homeway.data.FamilySnapshot
@@ -16,7 +14,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.tasks.await
 import org.json.JSONObject
 import java.time.Instant
 import java.util.UUID
@@ -35,30 +32,30 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
     private fun render(snapshot: FamilySnapshot, error: String? = null) {
         mutableState.update { old -> old.copy(
             role=repo.role, configured=repo.configured, demoMode=repo.demoMode,
-            needsOnboarding=!repo.configured && !repo.demoMode, serverUrl=repo.serverUrl,
+            needsOnboarding=!repo.configured && !repo.demoMode,
+            botUsername=repo.botUsername, peerBotUsername=repo.peerBotUsername,
             events=snapshot.events, stickerBalance=snapshot.stickerBalance, redemptions=snapshot.redemptions,
             rewards=snapshot.rewards,
             sharingEnabled=if(repo.isChild && !repo.demoMode) repo.sharingEnabled else snapshot.sharingEnabled,
             trackingStatus=if(repo.demoMode) "체험 기록 · 실제 위치를 수집하지 않아요" else repo.trackingStatus,
-            transport=snapshot.transport, pushConfigured=snapshot.pushConfigured, error=error
+            transport=snapshot.transport, error=error ?: repo.connectionError
         ) }
         awaitedLocationId?.let { id ->
             val event = snapshot.events.firstOrNull { it.id == id }
             if(event?.delivery=="relayed") {
                 awaitedLocationId=null
-                notice("아빠에게 위치 알림을 보냈어요. 읽음 여부는 확인되지 않아요.")
+                notice("보호자 휴대폰이 위치를 받았어요. 읽음 여부는 확인되지 않아요.")
             } else if(event?.delivery=="failed") {
                 awaitedLocationId=null
                 showError("위치를 전달하지 못했어요. 연결 설정을 확인한 뒤 다시 보내 주세요.")
             }
         }
     }
-    fun configure(role: String, url: String, token: String) = perform {
+    fun configure(role: String, botToken: String, peerBotUsername: String) = perform {
         TrackingService.stopAndAwait(getApplication())
-        render(repo.configure(role,url,token))
-        notice(if (role == "child") "가족 연결이 완료됐어요. 대화에 정확히 '설정'을 보내면 자동 위치 공유를 켤 수 있어요."
-            else "가족 연결이 완료됐어요. 자동 위치 공유는 자녀가 대화에 '설정'을 보내 켤 수 있어요.")
-        registerPush()
+        render(repo.configure(role,botToken,peerBotUsername))
+        notice(if (role == "child") "텔레그램 봇을 연결했어요. 상대 휴대폰도 연결해 주세요. 자동 위치 공유는 대화에 '설정'을 보내 따로 켤 수 있어요."
+            else "텔레그램 봇을 연결했어요. 자녀 휴대폰도 연결해 주세요. 자동 위치 공유는 자녀가 따로 켤 수 있어요.")
     }
     fun startDemo(role: String) = perform {
         refreshJob?.cancel()
@@ -75,7 +72,8 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         if(!repo.configured) return
         refreshJob=viewModelScope.launch {
             try { render(repo.refresh()) }
-            catch(_: Exception) { render(repo.cached(), "연결이 원활하지 않아요. 마지막 받은 기록을 표시하고 있어요.") }
+            catch(e: kotlinx.coroutines.CancellationException) { throw e }
+            catch(_: Exception) { render(repo.cached(), repo.connectionError ?: "연결이 원활하지 않아요. 마지막 받은 기록을 표시하고 있어요.") }
         }
     }
     fun sendChat(text:String) {
@@ -132,7 +130,7 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
             showError(sent.deliveryError ?: "요청을 처리하지 못했어요. 최신 약속과 스티커 수를 확인한 뒤 다시 시도해 주세요.")
             return@perform
         }
-        if(!accepted) notice("전송을 기다리고 있어요. 연결되면 다시 시도할게요.")
+        if(!accepted) notice("상대 기기의 수신을 기다리고 있어요. 두 휴대폰의 인터넷 연결과 메시지 수신 설정을 확인해 주세요.")
         refresh()
     }
     fun shareCurrentLocation() = perform {
@@ -150,7 +148,7 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         val accepted=repo.sendEvent("location",JSONObject().put("latitude",location.latitude).put("longitude",location.longitude)
             .put("accuracy",location.accuracy.toDouble()).put("capturedAt",Instant.ofEpochMilli(location.time).toString()).put("source","manual"),id)
         render(repo.cached())
-        notice(if(accepted) "위치를 보냈어요. 텔레그램 전달을 확인하고 있어요…" else "위치가 전송 대기 중이에요. 인터넷 연결을 확인해 주세요.")
+        notice(if(accepted) "보호자 휴대폰이 위치를 받았어요. 읽음 여부는 확인되지 않아요." else "위치가 전송 대기 중이에요. 두 휴대폰의 인터넷 연결과 메시지 수신 설정을 확인해 주세요.")
         refresh()
     }
     fun setSharing(enabled:Boolean) {
@@ -184,15 +182,12 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
     fun clearNotice() { mutableState.update { it.copy(notice=null,error=null) } }
     fun showError(message:String) { mutableState.update { it.copy(error=message,loading=false,notice=null) } }
     private fun notice(message:String) { mutableState.update { it.copy(notice=message) } }
-    fun registerPush() {
-        if(!repo.configured || FirebaseApp.getApps(getApplication()).isEmpty()) return
-        viewModelScope.launch { runCatching { repo.registerPush(FirebaseMessaging.getInstance().token.await()) } }
-    }
     private fun perform(block:suspend () -> Unit) {
         if(mutableState.value.loading) return
         mutableState.update { it.copy(loading=true,error=null) }
         viewModelScope.launch {
-            try { block() } catch(e:Exception) { showError(e.message ?: "잠시 후 다시 시도해 주세요.") }
+            try { block() } catch(e:kotlinx.coroutines.CancellationException) { throw e }
+            catch(e:Exception) { showError(e.message ?: "잠시 후 다시 시도해 주세요.") }
             finally { mutableState.update { it.copy(loading=false) } }
         }
     }

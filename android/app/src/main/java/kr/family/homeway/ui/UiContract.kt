@@ -18,8 +18,9 @@ data class UiState(
     val sharingEnabled: Boolean = false,
     val trackingStatus: String = "위치 공유 꺼짐",
     val transport: String = "연결 전",
-    val pushConfigured: Boolean = false,
-    val serverUrl: String = "",
+    val botUsername: String = "",
+    val peerBotUsername: String = "",
+    val telegramReceiving: Boolean = false,
     val needsOnboarding: Boolean = true,
     val overlayEnabled: Boolean = false,
     val overlayPermissionGranted: Boolean = false,
@@ -28,7 +29,7 @@ data class UiState(
 )
 
 data class UiActions(
-    val configure: (role: String, url: String, token: String) -> Unit,
+    val configure: (role: String, botToken: String, peerBotUsername: String) -> Unit,
     val startDemo: (role: String) -> Unit,
     val sendChat: (text: String) -> Unit,
     val shareCurrentLocation: () -> Unit,
@@ -46,4 +47,5 @@ data class UiActions(
     val enableOverlay: () -> Unit = {},
     val disableOverlay: () -> Unit = {},
     val dismissOverlayPrompt: () -> Unit = {},
+    val setTelegramReceiving: (enabled: Boolean) -> Unit = {},
 )

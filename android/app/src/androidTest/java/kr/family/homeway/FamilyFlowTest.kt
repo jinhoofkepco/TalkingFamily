@@ -4,6 +4,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.text.AnnotatedString
 import androidx.test.platform.app.InstrumentationRegistry
 import kr.family.homeway.data.DemoStore
 import kr.family.homeway.data.LocalStore
@@ -78,6 +80,32 @@ class FamilyFlowTest {
             File(dir, "$name.png").outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
             bitmap.recycle()
         }
+    }
+
+    @Test fun telegramOnboardingRequiresConsentAndDoesNotRestoreSecretToken() {
+        compose.onNodeWithText("가족 서버 주소").assertDoesNotExist()
+        compose.onNodeWithText("가족 연결 키").assertDoesNotExist()
+        compose.onNodeWithTag("connect-family").performScrollTo().assertIsNotEnabled()
+
+        compose.onNodeWithTag("bot-token-input").performScrollTo()
+            .assert(SemanticsMatcher.keyIsDefined(SemanticsProperties.Password))
+            .performTextInput("123456:OnlyForUiTest_NotARealToken")
+        compose.onNodeWithTag("peer-bot-input").performScrollTo()
+            .assert(SemanticsMatcher.keyNotDefined(SemanticsProperties.Password))
+            .performTextInput("@parent_family_bot")
+        compose.onNodeWithTag("connect-family").performScrollTo().assertIsNotEnabled()
+
+        compose.onNode(isToggleable()).performScrollTo().assertIsOff().performClick()
+        compose.onNodeWithTag("connect-family").performScrollTo().assertIsEnabled()
+        // Do not connect: the test must never submit the synthetic token to Telegram.
+        compose.activityRule.scenario.recreate()
+
+        compose.onNodeWithTag("bot-token-input").performScrollTo()
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString("")))
+        compose.onNodeWithTag("peer-bot-input").performScrollTo().assertTextContains("@parent_family_bot")
+        compose.onNode(isToggleable()).performScrollTo().assertIsOn()
+        compose.onNodeWithTag("connect-family").performScrollTo().assertIsNotEnabled()
+        screenshot("telegram-onboarding")
     }
 
     @Test fun childHasFullChatAndStickerPopupPreservesDraft() {

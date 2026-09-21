@@ -6,6 +6,7 @@
 | --- | --- |
 | 패키지 이름 | `kr.family.homeway` |
 | 0.3.1 | `versionCode = 4`, `versionName = "0.3.1"` |
+| 0.4.0 | `versionCode = 5`, `versionName = "0.4.0"` |
 | 인증서 SHA-256 | `db2c91c3bd56513a79878f2d25d59778f61804ff650c866de7c71445c34d12ce` |
 | 이후 배포 | 같은 인증서로 서명하고 `versionCode` 증가 |
 

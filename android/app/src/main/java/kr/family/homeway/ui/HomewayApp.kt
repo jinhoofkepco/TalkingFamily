@@ -94,9 +94,10 @@ fun HomewayApp(state: UiState, actions: UiActions) {
 @Composable
 private fun Onboarding(state: UiState, actions: UiActions) {
     var role by rememberSaveable { mutableStateOf(state.role) }
-    var url by rememberSaveable { mutableStateOf(state.serverUrl) }
+    var peerBotUsername by rememberSaveable { mutableStateOf(state.peerBotUsername) }
     var token by remember { mutableStateOf("") }
     var acknowledged by rememberSaveable { mutableStateOf(false) }
+    val context = LocalContext.current
     Column(
         Modifier.fillMaxSize().systemBarsPadding().imePadding()
             .verticalScroll(rememberScrollState()).padding(24.dp),
@@ -117,12 +118,22 @@ private fun Onboarding(state: UiState, actions: UiActions) {
             }
         }
         SectionCard {
+            Text("텔레그램 봇으로 가족을 연결해요", fontWeight = FontWeight.Bold)
+            Text("별도의 가족 서버는 필요하지 않아요. 휴대폰마다 텔레그램 봇을 하나씩 연결해 대화와 위치를 주고받아요.", lineHeight = 23.sp)
+            Text("1. 텔레그램 @BotFather에서 /newbot으로 자녀용·보호자용 봇을 각각 만드세요.", lineHeight = 23.sp)
+            Text("2. 두 봇 모두 Bot Settings에서 Bot-to-Bot Communication Mode를 켜세요.", lineHeight = 23.sp)
+            Text("3. 아래에 이 휴대폰 봇의 토큰과 상대방 봇의 사용자명을 넣으세요. 상대 휴대폰에서도 서로 반대로 연결하세요.", lineHeight = 23.sp)
+            TextButton({ context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://t.me/BotFather"))) }) {
+                Text("텔레그램 BotFather 열기")
+            }
+        }
+        SectionCard {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Icon(Icons.Outlined.PrivacyTip, null, tint = Forest)
                 Text("처음에 함께 읽어 주세요", fontWeight = FontWeight.Bold)
             }
             Text(
-                "대화 내용과 칭찬 기록은 가족의 중계 서버에 저장되고, 텔레그램 봇을 통해 보호자에게 전달됩니다.",
+                "대화·칭찬·위치 기록은 텔레그램 봇을 통해 연결된 상대 휴대폰으로 전달되고, 각 휴대폰에 저장됩니다. 텔레그램 봇 대화는 종단간 암호화되지 않습니다.",
                 lineHeight = 23.sp,
             )
             Text(
@@ -134,11 +145,11 @@ private fun Onboarding(state: UiState, actions: UiActions) {
                 lineHeight = 23.sp,
             )
             Text(
-                "이 정보는 중계 서버와 텔레그램을 거쳐 연결된 보호자에게 전달됩니다. 자동 공유 중에는 휴대폰 알림이 표시되며 설정에서 언제든 끌 수 있습니다. 위치·신체 활동·알림 권한은 기능을 사용할 때 요청합니다.",
+                "위치는 텔레그램을 거쳐 연결된 보호자에게 전달됩니다. 자동 공유 중에는 휴대폰 알림이 표시되며 설정에서 언제든 끌 수 있습니다. 위치·신체 활동·알림 권한은 기능을 사용할 때 요청합니다.",
                 lineHeight = 23.sp,
             )
             Text(
-                "현재 버전의 기록은 서버 운영자가 삭제할 때까지 서버에 보관됩니다. 텔레그램의 기록은 별도로 관리해야 합니다. 앱 연결을 해제해도 기존 서버·텔레그램 기록은 삭제되지 않습니다.",
+                "봇 토큰은 이 휴대폰에 Android Keystore로 보호해 저장합니다. 토큰을 아는 사람은 봇을 사용할 수 있으니 공유하지 마세요. 연결 해제는 이 휴대폰의 연결 정보와 앱 기록을 지웁니다. 상대 휴대폰과 텔레그램의 기록은 별도로 관리해야 합니다.",
                 lineHeight = 23.sp, fontSize = 13.sp, color = Muted,
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -149,20 +160,22 @@ private fun Onboarding(state: UiState, actions: UiActions) {
         SectionCard {
             Text("우리 가족 연결", fontWeight = FontWeight.Bold)
             OutlinedTextField(
-                url, { url = it }, Modifier.fillMaxWidth(), label = { Text("가족 서버 주소") },
-                placeholder = { Text("https://family.example.com") }, singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-            )
-            OutlinedTextField(
-                token, { token = it }, Modifier.fillMaxWidth(), label = { Text("가족 연결 키") },
+                token, { token = it }, Modifier.fillMaxWidth().testTag("bot-token-input"), label = { Text("이 휴대폰의 텔레그램 봇 토큰") },
                 singleLine = true, visualTransformation = PasswordVisualTransformation(),
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                supportingText = { Text("이 휴대폰 역할에 맞는 연결 키를 입력해 주세요.") },
+                supportingText = { Text(if (role == "child") "BotFather에서 받은 자녀용 봇의 토큰" else "BotFather에서 받은 보호자용 봇의 토큰") },
             )
+            OutlinedTextField(
+                peerBotUsername, { peerBotUsername = it }, Modifier.fillMaxWidth().testTag("peer-bot-input"), label = { Text("상대방 봇 사용자명") },
+                placeholder = { Text(if (role == "child") "@parent_family_bot" else "@child_family_bot") }, singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+                supportingText = { Text(if (role == "child") "보호자용 봇의 @사용자명 · 상대 토큰은 필요 없어요." else "자녀용 봇의 @사용자명 · 상대 토큰은 필요 없어요.") },
+            )
+            Text("화면을 닫아도 받으려면 두 휴대폰에서 ‘메시지 수신’을 켜 두세요. 수신 중에는 알림이 표시됩니다. 절전·강제 종료·네트워크 상태에 따라 수신이 늦어질 수 있어요.", color = Muted, fontSize = 13.sp, lineHeight = 21.sp)
             state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, fontSize = 14.sp) }
             Button(
-                { actions.configure(role, url.trim(), token.trim()) }, Modifier.fillMaxWidth().height(52.dp),
-                enabled = acknowledged && url.isNotBlank() && token.isNotBlank() && !state.loading,
+                { actions.configure(role, token.trim(), peerBotUsername.trim()) }, Modifier.fillMaxWidth().height(52.dp).testTag("connect-family"),
+                enabled = acknowledged && peerBotUsername.isNotBlank() && token.isNotBlank() && !state.loading,
             ) {
                 if (state.loading) CircularProgressIndicator(Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
                 else Text("우리 가족 연결하기", fontWeight = FontWeight.Bold)
@@ -806,10 +819,17 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
                 LabelValue("내 역할", if (child) "자녀" else "보호자")
                 LabelValue("연결 상태", if (state.demoMode) "체험 모드 · 실제 전송 없음" else transportLabel(state.transport))
                 if (!state.demoMode) {
-                    LabelValue("서버", state.serverUrl)
-                    LabelValue("메시지 알림", if (state.pushConfigured) "알림 연결됨" else "알림 연결 전 · 앱에서 새로 고침")
-                    if (!state.pushConfigured) Text("앱이 닫혀 있을 때 알림을 받으려면 푸시 알림 연결이 필요해요. 지금은 앱을 열고 새로 고침해 주세요.", color = Gold, fontSize = 12.sp, lineHeight = 19.sp)
-                    Text("‘텔레그램 경유 완료’는 받는 쪽 봇까지 전달되었다는 뜻이에요. 상대 휴대폰에 도착했거나 읽었다는 뜻은 아니에요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
+                    LabelValue("내 봇", "@${state.botUsername.removePrefix("@")}")
+                    LabelValue("상대 봇", "@${state.peerBotUsername.removePrefix("@")}")
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                            Text("메시지 수신", fontWeight = FontWeight.Medium)
+                            Text(if (state.telegramReceiving) "화면을 닫아도 수신 대기 중" else "꺼짐 · 앱을 열어 새로 고침", fontSize = 12.sp, color = Muted)
+                        }
+                        Switch(state.telegramReceiving, actions.setTelegramReceiving, enabled = !state.loading, modifier = Modifier.testTag("telegram-receiving-switch"))
+                    }
+                    Text("두 휴대폰에서 수신을 켜 두면 대화와 위치를 계속 받을 수 있어요. 수신 중에는 알림이 표시되고 배터리를 사용합니다. 절전·강제 종료·인터넷 끊김으로 수신이 멈출 수 있으니 앱을 다시 열어 확인해 주세요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
+                    Text("‘상대 기기 수신’은 상대 앱이 메시지를 받은 상태예요. 사람이 읽었다는 뜻은 아니에요. 상대 앱에서 받을 때까지 전송 대기로 표시될 수 있어요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
                 }
                 TextButton(firstGuide, Modifier.testTag("first-guide-button")) { Icon(Icons.Outlined.Info, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text("처음 안내 다시 보기") }
                 OutlinedButton(actions.refresh, Modifier.fillMaxWidth(), enabled = !state.loading) { Icon(Icons.Outlined.Refresh, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text("새로 고침") }
@@ -831,13 +851,13 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
         title = { Text("자동 위치를 공유할까요?") },
         text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("이동 중 5분 간격으로 GPS 좌표·측정 시각·정확도와 움직임 상태를 보호자에게 보냅니다. 기압계가 있으면 상대 높이 변화로 오르내림 시작과 종료도 추정해 보냅니다.", lineHeight = 22.sp)
-            Text("화면이 꺼져 있어도 공유가 계속됩니다. 가족 중계 서버와 텔레그램을 통해 전달되며, 공유 중에는 휴대폰 알림이 표시됩니다. 언제든 이 설정에서 끌 수 있어요.", lineHeight = 22.sp)
+            Text("화면이 꺼져 있어도 공유가 계속됩니다. 텔레그램 봇을 통해 보호자의 앱으로 전달되며, 공유 중에는 휴대폰 알림이 표시됩니다. 언제든 이 설정에서 끌 수 있어요. 보호자 휴대폰에서 메시지 수신을 켜 두어야 빠르게 받을 수 있어요.", lineHeight = 22.sp)
             if (state.demoMode) Text("지금은 체험 모드여서 실제로 수집하거나 공유하지 않아요.", color = Gold, fontWeight = FontWeight.Medium)
         } },
         confirmButton = { TextButton({ consentDialog = false; actions.setSharing(true) }) { Text(if (state.demoMode) "공유 켜기 체험" else "동의하고 공유 켜기") } },
         dismissButton = { TextButton({ consentDialog = false }) { Text("나중에") } },
     )
-    if (disconnectDialog) AlertDialog(onDismissRequest = { disconnectDialog = false }, title = { Text(if (state.demoMode) "체험을 마칠까요?" else "이 휴대폰 연결을 해제할까요?") }, text = { Text(if (state.demoMode) "처음 화면에서 우리 가족 서버에 연결할 수 있어요." else "이 휴대폰의 연결 정보를 지웁니다. 서버와 텔레그램에 저장된 기존 기록은 삭제되지 않습니다.") }, confirmButton = { TextButton({ disconnectDialog = false; actions.resetConfiguration() }) { Text(if (state.demoMode) "체험 마치기" else "연결 해제") } }, dismissButton = { TextButton({ disconnectDialog = false }) { Text("취소") } })
+    if (disconnectDialog) AlertDialog(onDismissRequest = { disconnectDialog = false }, title = { Text(if (state.demoMode) "체험을 마칠까요?" else "이 휴대폰 연결을 해제할까요?") }, text = { Text(if (state.demoMode) "처음 화면에서 텔레그램 봇으로 가족을 연결할 수 있어요." else "이 휴대폰의 봇 토큰·연결 정보와 앱 기록을 지웁니다. 상대 휴대폰과 텔레그램의 기록은 삭제되지 않습니다.") }, confirmButton = { TextButton({ disconnectDialog = false; actions.resetConfiguration() }) { Text(if (state.demoMode) "체험 마치기" else "연결 해제") } }, dismissButton = { TextButton({ disconnectDialog = false }) { Text("취소") } })
 }
 
 @Composable
@@ -890,7 +910,7 @@ private fun SharedInformation() {
         Text("올라가고 내려가는 움직임", fontWeight = FontWeight.Medium)
         Text("기압계가 있으면 기압과 상대 높이 변화를 활용해 오르내림의 시작과 종료를 추정해요. 정확한 층수는 알 수 없고, 실내에서는 GPS 위치도 부정확할 수 있어요.", color = Muted, fontSize = 13.sp, lineHeight = 21.sp)
         Text("연결된 보호자에게 전달", fontWeight = FontWeight.Medium)
-        Text("위치와 대화·칭찬 기록은 가족 중계 서버와 텔레그램을 통해 전달돼요. 기록은 서버 운영자가 삭제할 때까지 보관돼요. 텔레그램 기록은 별도로 관리해야 하며, 앱 연결 해제만으로 기존 기록이 삭제되지는 않아요.", color = Muted, fontSize = 13.sp, lineHeight = 21.sp)
+        Text("위치와 대화·칭찬 기록은 텔레그램 봇을 거쳐 연결된 상대 앱으로 전달되고 각 휴대폰에 저장돼요. 봇 대화는 종단간 암호화되지 않아요. 연결 해제는 이 휴대폰의 연결 정보와 앱 기록만 지우며, 상대 휴대폰과 텔레그램의 기록은 별도로 관리해야 해요.", color = Muted, fontSize = 13.sp, lineHeight = 21.sp)
     }
 }
 
@@ -898,6 +918,11 @@ private fun SharedInformation() {
 private fun FirstGuide() {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
         Text("오는 길을 함께 알 수 있어요.", fontSize = 23.sp, fontWeight = FontWeight.Bold)
+        SectionCard {
+            Text("텔레그램으로 직접 연결해요", fontWeight = FontWeight.Medium)
+            Text("휴대폰마다 자기 봇의 토큰과 상대방 봇의 사용자명을 입력해요. 두 봇 모두 BotFather의 Bot-to-Bot Communication Mode가 켜져 있어야 해요.", fontSize = 14.sp, lineHeight = 22.sp)
+            Text("가족 연결 설정에서 ‘메시지 수신’을 켜 두세요. 화면을 닫아도 받을 수 있지만, 절전이나 강제 종료로 중단되면 앱을 다시 열어야 해요.", fontSize = 14.sp, lineHeight = 22.sp)
+        }
         SectionCard {
             Text("대화하면서 위치를 보낼 수 있어요", fontWeight = FontWeight.Medium)
             Text("대화의 ‘현재 위치 공유’를 누르면 그때의 위치를 한 번 아빠에게 보내요.", fontSize = 14.sp, lineHeight = 22.sp)
@@ -967,7 +992,7 @@ private fun deliveryLabel(delivery: String, demo: Boolean): String {
     return when (delivery.lowercase()) {
         "pending", "queued" -> "전송 대기"
         "sending" -> "전송 중"
-        "relayed" -> "텔레그램 경유 완료"
+        "relayed" -> "상대 기기 수신"
         "telegram_sent", "delivered" -> "텔레그램 전달됨"
         "failed", "error" -> "전송 실패 · 재시도 필요"
         else -> "전송 상태 확인 중"
@@ -990,7 +1015,7 @@ private fun elapsedMinutes(value: String, now: Instant): Long? = runCatching {
 }.getOrNull()
 
 private fun transportLabel(transport: String): String = when (transport.lowercase()) {
-    "telegram" -> "텔레그램 가족 연결"
+    "telegram", "telegram_direct" -> "텔레그램 봇 직접 연결"
     "unconfigured", "" -> "가족 연결 전"
     "offline" -> "연결을 기다리는 중"
     else -> transport

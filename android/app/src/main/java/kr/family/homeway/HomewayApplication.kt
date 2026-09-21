@@ -3,7 +3,6 @@ package kr.family.homeway
 import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import com.google.firebase.FirebaseApp
 import kr.family.homeway.data.AppRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -16,7 +15,6 @@ class HomewayApplication : Application() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel("family_messages", "가족 대화와 위치 알림", NotificationManager.IMPORTANCE_HIGH)
         )
-        FirebaseApp.initializeApp(this) // null is expected when the owner has not added google-services.json.
         val repo = AppRepository(this)
         // Android process death terminates this session. Never silently restart tracking after reboot.
         if (repo.sharingEnabled) {

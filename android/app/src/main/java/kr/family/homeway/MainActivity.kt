@@ -24,6 +24,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import kr.family.homeway.ui.HomewayApp
 import kr.family.homeway.ui.UiActions
 import kr.family.homeway.overlay.FloatingStarService
+import kr.family.homeway.data.TelegramReceiveService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -43,6 +44,7 @@ class MainActivity : ComponentActivity() {
     private var enableOverlayOnResume = false
     private var collapsing = false
     private var collapseJob: Job? = null
+    private var notificationPermissionInFlight = false
     private val permissionLauncher=registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         val callback=afterPermission
         afterPermission=null
@@ -51,7 +53,12 @@ class MainActivity : ComponentActivity() {
         if(fine && (!requestingAutomatic || notifications)) callback?.invoke()
         else model.showError(if(!fine) "정확한 위치 권한이 필요해요. 설정에서 허용한 뒤 다시 눌러 주세요." else "자동 공유 상태를 표시하려면 알림 권한이 필요해요.")
     }
-    private val notificationLauncher=registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private val notificationLauncher=registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        notificationPermissionInFlight = false
+        if (granted && model.state.value.configured && TelegramReceiveService.wantsReceiving(this)) startTelegramReceiving()
+        else if (!granted) model.showError("화면이 꺼져 있을 때 가족 소식을 받으려면 알림 권한을 허용해 주세요. 앱을 열어 두면 대화할 수 있어요.")
+        handleReadyState()
+    }
     private val overlayPermissionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         waitingForOverlayPermission = false
         overlayPermissionGranted = Settings.canDrawOverlays(this)
@@ -72,18 +79,25 @@ class MainActivity : ComponentActivity() {
             enableOverlayOnResume = savedInstanceState.getBoolean("enableOverlayOnResume")
             overlayPromptVisible = savedInstanceState.getBoolean("overlayPromptVisible")
             openChatRequestId = savedInstanceState.getInt("openChatRequestId")
+            notificationPermissionInFlight = savedInstanceState.getBoolean("notificationPermissionInFlight")
         }
         setContent {
             val state=model.state.collectAsStateWithLifecycle().value
             val overlay = FloatingStarService.runtime.collectAsStateWithLifecycle().value
+            val receiver = TelegramReceiveService.runtime.collectAsStateWithLifecycle().value
             HomewayApp(state.copy(
+                telegramReceiving = receiver.running,
+                error = state.error ?: receiver.error,
                 overlayEnabled = overlay.running,
                 overlayPermissionGranted = overlayPermissionGranted,
                 openChatRequestId = openChatRequestId,
                 overlayPromptVisible = overlayPromptVisible,
             ), UiActions(
-                configure={ role,url,token -> model.configure(role,url,token) },
-                startDemo=model::startDemo,
+                configure={ role,token,peer ->
+                    getSharedPreferences("homeway_receiver", MODE_PRIVATE).edit().putBoolean("enabled", true).apply()
+                    model.configure(role,token,peer)
+                },
+                startDemo={ role -> TelegramReceiveService.stop(this); model.startDemo(role) },
                 sendChat=model::sendChat,
                 shareCurrentLocation={ if(state.demoMode) model.shareCurrentLocation() else requestLocation(false,model::shareCurrentLocation) },
                 awardSticker=model::awardSticker,
@@ -95,14 +109,28 @@ class MainActivity : ComponentActivity() {
                 refresh=model::refresh,
                 clearNotice=model::clearNotice,
                 resetConfiguration={
-                    disableOverlay()
-                    model.resetConfiguration()
+                    if (!model.state.value.demoMode && model.state.value.role == "child" && model.state.value.sharingEnabled) model.resetConfiguration()
+                    else {
+                        disableOverlay()
+                        TelegramReceiveService.stop(this)
+                        model.resetConfiguration()
+                    }
                 },
                 switchDemoRole=model::switchDemoRole,
                 returnToStar=::startAndCollapse,
                 enableOverlay=::enableOverlay,
                 disableOverlay=::disableOverlay,
-                dismissOverlayPrompt={ overlayPromptVisible = false }
+                dismissOverlayPrompt={ overlayPromptVisible = false },
+                setTelegramReceiving={ enabled ->
+                    if (enabled) {
+                        getSharedPreferences("homeway_receiver", MODE_PRIVATE).edit().putBoolean("enabled", true).apply()
+                        if (Build.VERSION.SDK_INT >= 33 && !has(Manifest.permission.POST_NOTIFICATIONS)) {
+                            getSharedPreferences("homeway_permissions", MODE_PRIVATE).edit().putBoolean("notificationAsked", true).apply()
+                            notificationPermissionInFlight = true
+                            notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        } else startTelegramReceiving()
+                    } else TelegramReceiveService.stop(this)
+                }
             ))
         }
         lifecycleScope.launch {
@@ -112,17 +140,8 @@ class MainActivity : ComponentActivity() {
         }
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
-                model.registerPush()
                 while(true) {
                     model.refresh()
-                    if(model.state.value.configured && !launchWantsBubble && !collapsing && !overlayPromptVisible &&
-                        !waitingForOverlayPermission && Build.VERSION.SDK_INT>=33 && !has(Manifest.permission.POST_NOTIFICATIONS)) {
-                        val p=getSharedPreferences("homeway_permissions",MODE_PRIVATE)
-                        if(!p.getBoolean("notificationAsked",false)) {
-                            p.edit().putBoolean("notificationAsked",true).apply()
-                            notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                        }
-                    }
                     delay(5000)
                 }
             }
@@ -166,6 +185,7 @@ class MainActivity : ComponentActivity() {
         outState.putBoolean("enableOverlayOnResume", enableOverlayOnResume)
         outState.putBoolean("overlayPromptVisible", overlayPromptVisible)
         outState.putInt("openChatRequestId", openChatRequestId)
+        outState.putBoolean("notificationPermissionInFlight", notificationPermissionInFlight)
         super.onSaveInstanceState(outState)
     }
 
@@ -173,6 +193,19 @@ class MainActivity : ComponentActivity() {
         if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) || collapsing || waitingForOverlayPermission) return
         val state = model.state.value
         if (!state.configured && !state.demoMode) return
+        if (state.configured && TelegramReceiveService.wantsReceiving(this) && Build.VERSION.SDK_INT >= 33 &&
+            !has(Manifest.permission.POST_NOTIFICATIONS)) {
+            if (notificationPermissionInFlight) return
+            val permissionPrefs = getSharedPreferences("homeway_permissions", MODE_PRIVATE)
+            if (!permissionPrefs.getBoolean("notificationAsked", false)) {
+                permissionPrefs.edit().putBoolean("notificationAsked", true).apply()
+                notificationPermissionInFlight = true
+                notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                return
+            }
+        }
+        if (state.configured && TelegramReceiveService.wantsReceiving(this) && !TelegramReceiveService.runtime.value.running &&
+            (Build.VERSION.SDK_INT < 33 || has(Manifest.permission.POST_NOTIFICATIONS))) startTelegramReceiving()
         if (enableOverlayOnResume) {
             enableOverlayOnResume = false
             startAndCollapse()
@@ -180,6 +213,12 @@ class MainActivity : ComponentActivity() {
             launchWantsBubble = false // Once per explicit launcher entry, never every onResume.
             if (Settings.canDrawOverlays(this)) startAndCollapse() else overlayPromptVisible = true
         }
+    }
+
+    private fun startTelegramReceiving() {
+        if (!model.state.value.configured) return
+        try { TelegramReceiveService.start(this) }
+        catch (_: RuntimeException) { model.showError("가족 소식 수신을 시작하지 못했어요. 앱을 다시 열고 가족 연결에서 수신을 켜 주세요.") }
     }
 
     private fun enableOverlay() {
