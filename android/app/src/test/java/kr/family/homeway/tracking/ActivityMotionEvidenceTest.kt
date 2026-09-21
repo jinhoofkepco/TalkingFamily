@@ -4,6 +4,12 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ActivityMotionEvidenceTest {
+    private fun fix(at: Long, northMeters: Double = 0.0) = LocationFixSample(
+        37.5 + Math.toDegrees(northMeters / 6_371_000.0), 127.0, 10.0, 1_700_000_000_000L + at, at)
+
+    private fun StationaryLocationFilter.accept(observation: ActivityMotionEvidence.Observation) =
+        updateMotion(observation.state, observation.atElapsedMillis, observation.persistentUntilExit)
+
     @Test fun oldSessionFutureStaleAndOutOfOrderEvidenceIsRejected() {
         val evidence = ActivityMotionEvidence(1_000)
         assertNull(evidence.sample(MotionState.STILL, 100, 999, 1_000))
@@ -96,5 +102,71 @@ class ActivityMotionEvidenceTest {
         evidence.transition(MotionState.STILL, true, 1_000, 1_000)
         evidence.sample(MotionState.UNKNOWN, 95, 2_000, 2_000)
         assertEquals(MotionState.UNKNOWN, evidence.transition(MotionState.STILL, false, 3_000, 3_000)?.state)
+    }
+
+    @Test fun freshStillAfterTransitionRegistrationBootstrapsLongQuietStationaryEpisode() {
+        val evidence = ActivityMotionEvidence(0)
+        val filter = StationaryLocationFilter()
+        val initial = checkNotNull(evidence.sample(MotionState.STILL, 95, 1_000, 1_000,
+            transitionWatchStartedAtMillis = 500))
+        assertTrue(initial.persistentUntilExit)
+        filter.accept(initial)
+        filter.filter(fix(1_000), 1_000)
+        // No new activity event for thirty minutes; regular fresh GPS records still arrive.
+        for (slot in 1..6) {
+            val at = 1_000L + slot * 300_000L
+            val display = filter.filter(fix(at, 10.0), at)
+            assertEquals(MotionState.STILL, display.motionState)
+            assertEquals(1_000L, display.stationarySinceElapsedMillis)
+            assertTrue(display.adjusted)
+        }
+    }
+
+    @Test fun cachedStillMeasuredBeforeTransitionRegistrationStillExpires() {
+        val evidence = ActivityMotionEvidence(0)
+        val filter = StationaryLocationFilter()
+        val cached = checkNotNull(evidence.sample(MotionState.STILL, 95, 1_000, 2_000,
+            transitionWatchStartedAtMillis = 2_000))
+        assertFalse(cached.persistentUntilExit)
+        filter.accept(cached)
+        filter.filter(fix(2_000), 2_000)
+        for (slot in 1..3) {
+            val at = 2_000L + slot * 300_000L
+            filter.filter(fix(at, 10.0), at)
+        }
+        val expired = filter.filter(fix(1_202_000, 10.0), 1_202_000)
+        assertEquals(MotionState.UNKNOWN, expired.motionState)
+        assertNull(expired.stationarySinceElapsedMillis)
+        assertFalse(expired.adjusted)
+    }
+
+    @Test fun laterExitReleasesBootstrappedStillWithoutAnInitialEnter() {
+        val evidence = ActivityMotionEvidence(0)
+        val filter = StationaryLocationFilter()
+        filter.accept(checkNotNull(evidence.sample(MotionState.STILL, 95, 1_000, 1_000,
+            transitionWatchStartedAtMillis = 500)))
+        filter.filter(fix(1_000), 1_000)
+        assertTrue(filter.filter(fix(301_000, 10.0), 301_000).adjusted)
+        filter.accept(checkNotNull(evidence.transition(MotionState.STILL, false, 302_000, 302_000)))
+        val afterExit = filter.filter(fix(601_000, 15.0), 601_000)
+        assertEquals(MotionState.UNKNOWN, afterExit.motionState)
+        assertNull(afterExit.stationarySinceElapsedMillis)
+        assertFalse(afterExit.adjusted)
+    }
+
+    @Test fun bootstrapStillStillRequiresActiveWatchAndCannotEraseMovingTransition() {
+        val evidence = ActivityMotionEvidence(0)
+        assertFalse(checkNotNull(evidence.sample(MotionState.STILL, 95, 1_000, 1_000)).persistentUntilExit)
+        evidence.transition(MotionState.VEHICLE, true, 2_000, 2_000)
+        assertNull(evidence.sample(MotionState.STILL, 100, 3_000, 3_000, transitionWatchStartedAtMillis = 500))
+        assertNull(evidence.sample(MotionState.STILL, 74, 4_000, 4_000, transitionWatchStartedAtMillis = 500))
+    }
+
+    @Test fun bootstrapSnapshotCannotUndoAnExitAtTheSameTimestamp() {
+        val evidence = ActivityMotionEvidence(0)
+        evidence.sample(MotionState.STILL, 95, 1_000, 1_000, transitionWatchStartedAtMillis = 500)
+        assertEquals(MotionState.UNKNOWN, evidence.transition(MotionState.STILL, false, 2_000, 2_000)?.state)
+        assertNull(evidence.sample(MotionState.STILL, 100, 2_000, 2_000, transitionWatchStartedAtMillis = 500))
+        assertEquals(MotionState.STILL, evidence.transition(MotionState.STILL, true, 2_000, 2_000)?.state)
     }
 }

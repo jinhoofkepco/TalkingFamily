@@ -24,12 +24,22 @@ class ActivityMotionEvidence(private val sessionStartedAtMillis: Long) {
         return observe(if (entering) state else MotionState.UNKNOWN, at, persistentUntilExit = entering)
     }
 
-    fun sample(state: MotionState, confidence: Int, at: Long, now: Long): Observation? {
+    fun sample(state: MotionState, confidence: Int, at: Long, now: Long,
+        transitionWatchStartedAtMillis: Long? = null): Observation? {
         if (confidence !in MIN_CONFIDENCE..100 || !validTime(at, now)) return null
+        // A snapshot at the exact time of a known exit/movement cannot undo that transition.
+        if (state == MotionState.STILL && at == lastObservedAtMillis && currentState != MotionState.STILL) return null
         // Sampling can momentarily call a smoothly moving vehicle STILL. Only a transition
         // exit/new STILL entry can end an explicit moving episode; snapshots cannot erase it.
         if (state == MotionState.STILL && activeTransitionState?.let { it != MotionState.STILL } == true) return null
-        return observe(state, at)
+        // A phone already still when monitoring begins may never emit an initial ENTER,
+        // and Google may stop periodic samples during prolonged stillness. A fresh STILL
+        // measured after a successful transition subscription can seed the state whose
+        // future EXIT we are watching. Cached samples from before registration cannot.
+        val watchedStill = state == MotionState.STILL && transitionWatchStartedAtMillis?.let {
+            it >= sessionStartedAtMillis && at >= it
+        } == true
+        return observe(state, at, persistentUntilExit = watchedStill)
     }
 
     private fun updateTransitionState(state: MotionState, entering: Boolean) {

@@ -34,6 +34,7 @@ internal class ActivityMotionMonitor(
     private var transitionsRequested = false
     private var samplesRequested = false
     private var transitionsRegistered = false
+    private var transitionWatchStartedAtMillis: Long? = null
     private var samplesRegistered = false
     private var lastFailure: String? = null
     private var lastMotionState = MotionState.UNKNOWN
@@ -58,6 +59,7 @@ internal class ActivityMotionMonitor(
             owner = this
             sessionId = UUID.randomUUID().toString()
             evidence = ActivityMotionEvidence(now)
+            transitionWatchStartedAtMillis = null
             lastMotionState = MotionState.UNKNOWN
             lastMotionPersistent = false
             lastMotionAt = null
@@ -89,11 +91,15 @@ internal class ActivityMotionMonitor(
                 }
                 client.requestActivityTransitionUpdates(ActivityTransitionRequest(transitions), callback)
             }.addOnSuccessListener {
-                if (owns(registeringSession)) transitionsRegistered = true
+                if (owns(registeringSession)) {
+                    transitionsRegistered = true
+                    transitionWatchStartedAtMillis = SystemClock.elapsedRealtime()
+                }
             }.addOnFailureListener {
                 if (owns(registeringSession)) {
                     transitionsRequested = false
                     transitionsRegistered = false
+                    transitionWatchStartedAtMillis = null
                     lastFailure = failureCode(it)
                 }
             }
@@ -150,7 +156,8 @@ internal class ActivityMotionMonitor(
                     val ambiguous = motionState(strongest.type) != MotionState.UNKNOWN &&
                         supported.size > 1 && strongest.confidence - supported[1].confidence < 10
                     if (!ambiguous) evidence.sample(motionState(strongest.type), strongest.confidence,
-                        result.elapsedRealtimeMillis, now)?.let(::acceptObservation)
+                        result.elapsedRealtimeMillis, now,
+                        transitionWatchStartedAtMillis.takeIf { transitionsRegistered })?.let(::acceptObservation)
                 }
             }
         }
@@ -185,6 +192,7 @@ internal class ActivityMotionMonitor(
         transitionsRequested = false
         samplesRequested = false
         transitionsRegistered = false
+        transitionWatchStartedAtMillis = null
         samplesRegistered = false
         lastMotionState = MotionState.UNKNOWN
         lastMotionPersistent = false
