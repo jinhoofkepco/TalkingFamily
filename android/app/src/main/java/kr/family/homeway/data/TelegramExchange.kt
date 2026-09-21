@@ -28,6 +28,8 @@ internal class TelegramExchange(
     private val now: () -> Long = System::currentTimeMillis,
     private val checkActive: () -> Unit = {},
     private val onReceived: (FamilyEvent) -> Unit = {},
+    private val familyChat: FamilyChatExchange? = null,
+    private val onLegacyFailure: (TelegramException) -> Unit = {},
 ) {
     /** Caller serializes network runs; returns false when the persisted Telegram backoff is still active. */
     fun synchronize(timeout: Int = 0): Boolean {
@@ -41,8 +43,10 @@ internal class TelegramExchange(
                 val update = updates.getJSONObject(i)
                 val updateId = update.optLong("update_id", -1)
                 var received: FamilyEvent? = null
+                var chatReceived: FamilyChatMessage? = null
                 synchronized(lock) {
                     if (updateId >= store.meta("offset")) store.transaction {
+                        chatReceived = familyChat?.processUpdate(update)
                         val packet = TelegramProtocol.receive(update, peerId, peerRole)
                         if (packet != null) when (packet.type) {
                             "event" -> {
@@ -83,22 +87,19 @@ internal class TelegramExchange(
                     }
                 }
                 received?.let(onReceived)
+                chatReceived?.let { familyChat?.notifyReceived(it) }
             }
-            // Receipts never create receipts, including after retries of an ambiguous send.
-            val receipts = synchronized(lock) { store.receipts().take(100) }
-            for (id in receipts) {
-                checkActive()
-                client.send(peerId.toString(), TelegramProtocol.envelope("ack").put("id", id).toString())
-                synchronized(lock) { store.transaction { store.removeReceipt(id) } }
+            if (synchronized(lock) { store.meta("legacyRetryAfter") <= now() }) {
+                try { flushLegacy() }
+                catch (error: TelegramException) {
+                    // A paired phone's failure must not freeze an otherwise healthy family room.
+                    // Keep the original two-phone behavior when no room is active.
+                    if (familyChat == null || error.errorCode in setOf(401, 404, 409, 429)) throw error
+                    synchronized(lock) { store.setMeta("legacyRetryAfter", now() + 15_000) }
+                    onLegacyFailure(error)
+                }
             }
-            val pending = synchronized(lock) { store.pending().firstOrNull() }
-            if (pending != null && synchronized(lock) { store.meta("sentAt") == 0L || now() - store.meta("sentAt") >= 30_000 }) {
-                checkActive()
-                // Telegram may accept the message even if its HTTP response is lost. Persist the
-                // attempt first so a peer ACK remains valid after that failure or a process crash.
-                synchronized(lock) { store.transaction { store.setMeta("sentAt", now().coerceAtLeast(1)) } }
-                client.send(peerId.toString(), TelegramProtocol.event(pending))
-            }
+            familyChat?.flush()
             if (synchronized(lock) { store.meta("ledgerConflict") != 0L }) throw TelegramSyncException()
             return true
         } catch (error: TelegramException) {
@@ -106,6 +107,24 @@ internal class TelegramExchange(
                 store.setMeta("retryAfter", now() + (error.retryAfterSeconds ?: 15).toLong() * 1000)
             }
             throw error
+        }
+    }
+
+    private fun flushLegacy() {
+        if (peerId <= 0) return
+        // Receipts never create receipts, including after retries of an ambiguous send.
+        val receipts = synchronized(lock) { store.receipts().take(100) }
+        for (id in receipts) {
+            checkActive()
+            client.send(peerId.toString(), TelegramProtocol.envelope("ack").put("id", id).toString())
+            synchronized(lock) { store.transaction { store.removeReceipt(id) } }
+        }
+        val pending = synchronized(lock) { store.pending().firstOrNull() }
+        if (pending != null && synchronized(lock) { store.meta("sentAt") == 0L || now() - store.meta("sentAt") >= 30_000 }) {
+            checkActive()
+            // Persist first: Telegram can accept this packet while its HTTP response is lost.
+            synchronized(lock) { store.transaction { store.setMeta("sentAt", now().coerceAtLeast(1)) } }
+            client.send(peerId.toString(), TelegramProtocol.event(pending))
         }
     }
 }

@@ -3,6 +3,8 @@ package kr.family.homeway.ui
 import kr.family.homeway.data.FamilyEvent
 import kr.family.homeway.data.Redemption
 import kr.family.homeway.data.Reward
+import kr.family.homeway.data.FamilyChatRoom
+import kr.family.homeway.data.FamilyChatMemberDraft
 import java.time.LocalDate
 
 data class UiState(
@@ -34,6 +36,14 @@ data class UiState(
     val openChatRequestId: Int = 0,
     val overlayPromptVisible: Boolean = false,
     val motionRecognitionAllowed: Boolean = false,
+    val paired: Boolean = true,
+    val room: FamilyChatRoom? = null,
+    val selfBotId: Long = 0,
+    val roomEvents: List<FamilyEvent> = emptyList(),
+    val roomHasMore: Boolean = false,
+    val roomLoading: Boolean = false,
+    val privateChatHasMore: Boolean = false,
+    val privateChatLoading: Boolean = false,
 )
 
 data class UiActions(
@@ -59,4 +69,10 @@ data class UiActions(
     val selectHistoryDay: (String) -> Unit = {},
     val loadMoreHistory: () -> Unit = {},
     val requestMotionRecognition: () -> Unit = {},
+    val sendRoomChat: (String) -> Unit = {},
+    val loadMoreRoomHistory: () -> Unit = {},
+    val loadMorePrivateChatHistory: () -> Unit = {},
+    val createFamilyRoom: (token: String, title: String, selfName: String, relationship: String, members: List<FamilyChatMemberDraft>) -> Unit = { _, _, _, _, _ -> },
+    val joinFamilyRoom: (token: String, code: String) -> Unit = { _, _ -> },
+    val leaveFamilyRoom: () -> Unit = {},
 )

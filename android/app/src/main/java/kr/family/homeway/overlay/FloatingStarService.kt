@@ -512,7 +512,9 @@ class FloatingStarService : Service() {
             val settings = context.applicationContext.getSharedPreferences("homeway_settings", Context.MODE_PRIVATE)
             val credentials = context.applicationContext.getSharedPreferences("homeway_credentials", Context.MODE_PRIVATE)
             OverlayStartPolicy.accountAvailable(settings.getBoolean("demoMode", false),
-                settings.getString("transport", "") == "telegram_direct", settings.getLong("peerBotId", 0) > 0,
+                settings.getString("transport", "") == "telegram_direct", settings.getLong("peerBotId", 0) > 0 ||
+                    (kr.family.homeway.data.LocalStore.get(context).familyChat.activeRoom()?.members
+                        ?.any { it.botId == settings.getLong("ownBotId", 0) } == true),
                 !credentials.getString("token", null).isNullOrBlank(), !credentials.getString("iv", null).isNullOrBlank())
         }.getOrDefault(false)
 

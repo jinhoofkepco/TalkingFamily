@@ -10,12 +10,15 @@ import java.time.LocalDate
 import java.time.ZoneId
 
 class LocalStore internal constructor(context: Context, databaseName: String = "homeway.db") :
-    SQLiteOpenHelper(context, databaseName, null, 3), TelegramExchangeStore {
+    SQLiteOpenHelper(context, databaseName, null, 4), TelegramExchangeStore {
+    val familyChat = SqliteFamilyChatStore(this)
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE outbox (id TEXT PRIMARY KEY, event TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', error TEXT)")
         db.execSQL("CREATE TABLE cache (id INTEGER PRIMARY KEY CHECK(id=1), state TEXT NOT NULL)")
         createTelegramTables(db)
         createMovementTables(db)
+        createPrivateChatTables(db)
+        SqliteFamilyChatStore.createTables(db)
     }
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         if (oldVersion < 2) createTelegramTables(db)
@@ -36,6 +39,21 @@ class LocalStore internal constructor(context: Context, databaseName: String = "
                 archiveEvents(db, events)
             }
         }
+        if (oldVersion < 4) {
+            createPrivateChatTables(db)
+            SqliteFamilyChatStore.createTables(db)
+            // Recover only retained private chat. No pairing, movement, outbox or receive cursor is reset.
+            db.rawQuery("SELECT state FROM cache WHERE id=1", null).use { rows ->
+                if (rows.moveToFirst()) archivePrivateState(db, JSONObject(rows.getString(0)))
+            }
+            db.rawQuery("SELECT event,status,error FROM outbox", null).use { rows ->
+                while (rows.moveToNext()) {
+                    runCatching { FamilyEvent.parse(JSONObject(rows.getString(0))).copy(
+                        delivery = if (rows.getString(1) == "failed") "failed" else "queued",
+                        deliveryError = rows.getString(2)) }.getOrNull()?.let { archivePrivateEvents(db, listOf(it)) }
+                }
+            }
+        }
     }
     private fun createTelegramTables(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE telegram_receipts (id TEXT PRIMARY KEY)")
@@ -47,6 +65,10 @@ class LocalStore internal constructor(context: Context, databaseName: String = "
         db.execSQL("CREATE INDEX movement_history_time ON movement_history(measured_at DESC)")
         db.execSQL("CREATE TABLE movement_settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
         db.execSQL("INSERT INTO movement_settings(name,value) VALUES('zone',?)", arrayOf(ZoneId.systemDefault().id))
+    }
+    private fun createPrivateChatTables(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE private_chat_history (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, event TEXT NOT NULL)")
+        db.execSQL("CREATE INDEX private_chat_history_time ON private_chat_history(created_at DESC,id DESC)")
     }
     override fun <T> transaction(block: () -> T): T {
         val db = writableDatabase
@@ -69,10 +91,11 @@ class LocalStore internal constructor(context: Context, databaseName: String = "
         buildList { while (it.moveToNext()) add(it.getString(0)) }
     }
     override fun removeReceipt(id: String) { writableDatabase.delete("telegram_receipts", "id=?", arrayOf(id)) }
-    fun enqueue(event: FamilyEvent) {
+    fun enqueue(event: FamilyEvent) = transaction {
         writableDatabase.insertWithOnConflict("outbox", null, ContentValues().apply {
             put("id", event.id); put("event", event.json().toString()); put("status", "pending")
         }, SQLiteDatabase.CONFLICT_IGNORE)
+        archivePrivateEvents(writableDatabase, listOf(event.copy(delivery = "queued")))
     }
     override fun pending(): List<FamilyEvent> = readableDatabase.rawQuery("SELECT event FROM outbox WHERE status='pending' ORDER BY rowid", null).use { c ->
         buildList { while (c.moveToNext()) add(FamilyEvent.parse(JSONObject(c.getString(0)))) }
@@ -90,6 +113,7 @@ class LocalStore internal constructor(context: Context, databaseName: String = "
         transaction {
             val db = writableDatabase
             archiveState(db, state)
+            archivePrivateState(db, state)
             db.insertWithOnConflict("cache", null, ContentValues().apply { put("id", 1); put("state", state.toString()) }, SQLiteDatabase.CONFLICT_REPLACE)
         }
     }
@@ -98,6 +122,71 @@ class LocalStore internal constructor(context: Context, databaseName: String = "
         writableDatabase.execSQL("DELETE FROM outbox"); writableDatabase.execSQL("DELETE FROM cache")
         writableDatabase.execSQL("DELETE FROM telegram_receipts"); writableDatabase.execSQL("DELETE FROM telegram_meta")
         writableDatabase.execSQL("DELETE FROM movement_history")
+        writableDatabase.execSQL("DELETE FROM private_chat_history")
+        SqliteFamilyChatStore.clearTables(writableDatabase)
+    }
+
+    /** Stable older-message pages, returned oldest first for a conversation list. */
+    fun privateChatHistory(before: MovementHistoryCursor? = null, limit: Int = 200): PrivateChatHistoryPage {
+        require(limit in 1..1000)
+        val args = mutableListOf<String>()
+        val condition = if (before == null) "" else {
+            args.add(before.measuredAt.toString()); args.add(before.measuredAt.toString()); args.add(before.id)
+            "WHERE h.created_at<=? AND (h.created_at<? OR h.id<?)"
+        }
+        val rows = readableDatabase.rawQuery("SELECT h.created_at,h.id,h.event,o.status,o.error FROM private_chat_history h " +
+            "LEFT JOIN outbox o ON o.id=h.id $condition ORDER BY h.created_at DESC,h.id DESC LIMIT ${limit + 1}",
+            args.toTypedArray()).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) {
+                    var event = FamilyEvent.parse(JSONObject(cursor.getString(2)))
+                    if (!cursor.isNull(3)) event = event.copy(
+                        delivery = if (cursor.getString(3) == "failed") "failed" else "queued",
+                        deliveryError = cursor.getString(4))
+                    add(MovementHistoryCursor(cursor.getLong(0), cursor.getString(1)) to event)
+                }
+            }
+        }
+        return PrivateChatHistoryPage(rows.take(limit).map { it.second }.reversed(),
+            if (rows.size > limit) rows[limit - 1].first else null)
+    }
+
+    private fun archivePrivateState(db: SQLiteDatabase, state: JSONObject) {
+        val rows = state.optJSONArray("events") ?: return
+        val events = buildList {
+            for (i in 0 until rows.length()) {
+                val raw = rows.optJSONObject(i) ?: continue
+                if (raw.optString("kind") == "chat") runCatching { FamilyEvent.parse(raw) }.getOrNull()?.let { add(it) }
+            }
+        }
+        archivePrivateEvents(db, events)
+    }
+
+    private fun archivePrivateEvents(db: SQLiteDatabase, events: List<FamilyEvent>) {
+        for (batch in events.filter { it.kind == "chat" }.chunked(300)) {
+            val existing = mutableMapOf<String, String>()
+            val placeholders = batch.joinToString(",") { "?" }
+            db.rawQuery("SELECT id,event FROM private_chat_history WHERE id IN ($placeholders)", batch.map { it.id }.toTypedArray()).use { rows ->
+                while (rows.moveToNext()) existing[rows.getString(0)] = rows.getString(1)
+            }
+            for (input in batch) {
+                val time = runCatching { Instant.parse(input.createdAt).toEpochMilli() }.getOrNull() ?: continue
+                val old = existing[input.id]
+                var event = input
+                if (old != null) {
+                    if (old == input.json().toString()) continue
+                    val saved = FamilyEvent.parse(JSONObject(old))
+                    if (MovementHistoryDates.deliveryRank(saved.delivery) > MovementHistoryDates.deliveryRank(input.delivery)) {
+                        event = input.copy(delivery = saved.delivery, deliveryError = saved.deliveryError)
+                    }
+                }
+                val serialized = event.json().toString()
+                if (old == serialized) continue
+                db.insertWithOnConflict("private_chat_history", null, ContentValues().apply {
+                    put("id", event.id); put("created_at", time); put("event", serialized)
+                }, SQLiteDatabase.CONFLICT_REPLACE)
+            }
+        }
     }
 
     /** Indexed date pages retain movement records even when the main ledger trims its recent timeline. */
@@ -206,6 +295,7 @@ class LocalStore internal constructor(context: Context, databaseName: String = "
 
 data class MovementHistoryCursor(val measuredAt: Long, val id: String)
 data class MovementHistoryPage(val days: List<String>, val day: String, val events: List<FamilyEvent>, val next: MovementHistoryCursor?)
+data class PrivateChatHistoryPage(val events: List<FamilyEvent>, val nextCursor: MovementHistoryCursor?)
 
 internal object MovementHistoryDates {
     const val PAGE_SIZE = 300

@@ -125,13 +125,31 @@ class MainActivity : ComponentActivity() {
                 },
                 startDemo={ role -> TelegramReceiveService.stop(this); model.startDemo(role) },
                 sendChat=model::sendChat,
-                shareCurrentLocation={ if(state.demoMode) model.shareCurrentLocation() else requestLocation(false,model::shareCurrentLocation) },
+                sendRoomChat=model::sendRoomChat,
+                loadMoreRoomHistory=model::loadMoreRoomHistory,
+                loadMorePrivateChatHistory=model::loadMorePrivateChatHistory,
+                createFamilyRoom={ token, title, name, relationship, members ->
+                    getSharedPreferences("homeway_receiver", MODE_PRIVATE).edit().putBoolean("enabled", true).apply()
+                    model.createFamilyRoom(token, title, name, relationship, members)
+                },
+                joinFamilyRoom={ token, code ->
+                    getSharedPreferences("homeway_receiver", MODE_PRIVATE).edit().putBoolean("enabled", true).apply()
+                    model.joinFamilyRoom(token, code)
+                },
+                leaveFamilyRoom=model::leaveFamilyRoom,
+                shareCurrentLocation={
+                    if (!state.demoMode && !state.paired) model.showError("위치 공유는 기존 1:1 가족 연결이 필요해요.")
+                    else if(state.demoMode) model.shareCurrentLocation() else requestLocation(false,model::shareCurrentLocation)
+                },
                 awardSticker=model::awardSticker,
                 requestRedemption=model::requestRedemption,
                 saveReward=model::saveReward,
                 deleteReward=model::deleteReward,
                 approveRedemption=model::approveRedemption,
-                setSharing={ enabled -> if(enabled && !state.demoMode) requestLocation(true) { model.setSharing(true) } else model.setSharing(enabled) },
+                setSharing={ enabled ->
+                    if (!state.demoMode && !state.paired) model.showError("위치 공유는 기존 1:1 가족 연결이 필요해요.")
+                    else if(enabled && !state.demoMode) requestLocation(true) { model.setSharing(true) } else model.setSharing(enabled)
+                },
                 refresh=model::refresh,
                 selectHistoryDay=model::selectHistoryDay,
                 loadMoreHistory=model::loadMoreHistory,

@@ -97,6 +97,18 @@ fun HomewayApp(state: UiState, actions: UiActions) {
 
 @Composable
 private fun Onboarding(state: UiState, actions: UiActions) {
+    var familyRoomFlow by rememberSaveable { mutableStateOf("") }
+    if (familyRoomFlow.isNotEmpty()) {
+        BackHandler { familyRoomFlow = "" }
+        Column(Modifier.fillMaxSize().systemBarsPadding()) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                IconButton({ familyRoomFlow = "" }, Modifier.testTag("room-onboarding-back")) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, "연결 방법으로 돌아가기") }
+                Text("가족 단체방 연결", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            }
+            FamilyRoomSettings(state, actions, initialMode = familyRoomFlow)
+        }
+        return
+    }
     var role by rememberSaveable { mutableStateOf(state.role) }
     var peerBotUsername by rememberSaveable { mutableStateOf(state.peerBotUsername) }
     var token by remember { mutableStateOf("") }
@@ -112,6 +124,13 @@ private fun Onboarding(state: UiState, actions: UiActions) {
         Text(stringResource(R.string.app_name), fontSize = 32.sp, fontWeight = FontWeight.Bold)
         Text("대화는 가깝게,\n칭찬은 차곡차곡.", fontSize = 20.sp, lineHeight = 29.sp, color = Forest)
         Text("대화하고, 마음을 전하고, 칭찬을 모으는\n우리 가족만의 작은 공간이에요.", color = Muted, lineHeight = 23.sp)
+        SectionCard {
+            Text("온 가족이 한 방에서 대화해요", fontWeight = FontWeight.Bold)
+            Text("엄마·아빠·아들·딸이 각자의 봇으로 함께 참여할 수 있어요. 기존 1:1 연결이 없어도 시작할 수 있어요.", fontSize = 13.sp, lineHeight = 21.sp)
+            Button({ familyRoomFlow = "create" }, Modifier.fillMaxWidth().testTag("onboarding-create-room")) { Text("가족방 만들기") }
+            OutlinedButton({ familyRoomFlow = "join" }, Modifier.fillMaxWidth().testTag("onboarding-join-room")) { Text("가족방 코드로 참여") }
+        }
+        Text("위치·칭찬판도 함께 쓰는 1:1 연결", fontWeight = FontWeight.Bold, fontSize = 17.sp)
         SectionCard {
             Text("이 휴대폰은 누가 쓰나요?", fontWeight = FontWeight.Bold)
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -206,7 +225,8 @@ private fun RoleButton(value: String, selected: String, label: String, icon: Ima
 @Composable
 private fun FamilyHome(state: UiState, actions: UiActions) {
     val parent = state.role == "guardian" || state.role == "parent"
-    var tab by rememberSaveable(state.role) { mutableStateOf(if (parent) "location" else "chat") }
+    val paired = state.paired || state.demoMode
+    var tab by rememberSaveable(state.role, state.room?.id, paired) { mutableStateOf(if (parent && paired && state.room == null) "location" else "chat") }
     var popup by rememberSaveable(state.role) { mutableStateOf("") }
     var selectedRewardId by rememberSaveable(state.role) { mutableStateOf<String?>(null) }
     var lastHandledChatRequestId by rememberSaveable { mutableIntStateOf(0) }
@@ -243,7 +263,7 @@ private fun FamilyHome(state: UiState, actions: UiActions) {
             }
         },
         bottomBar = {
-            if (parent) NavigationBar(containerColor = Color.White, tonalElevation = 0.dp) {
+            if (parent && paired) NavigationBar(containerColor = Color.White, tonalElevation = 0.dp) {
                 NavigationBarItem(tab == "chat", { tab = "chat" }, modifier = Modifier.testTag("nav-chat"), icon = { Icon(Icons.AutoMirrored.Outlined.Chat, null) }, label = { Text("대화") })
                 NavigationBarItem(tab == "location", { tab = "location" }, modifier = Modifier.testTag("nav-location"), icon = { Icon(Icons.Outlined.LocationOn, null) }, label = { Text("자녀 위치") })
                 NavigationBarItem(tab == "stickers", { tab = "stickers" }, modifier = Modifier.testTag("nav-stickers"), icon = { Icon(Icons.Outlined.Stars, null) }, label = { Text("칭찬판") })
@@ -252,19 +272,19 @@ private fun FamilyHome(state: UiState, actions: UiActions) {
     ) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
             when {
-                parent && tab == "stickers" -> StickerScreen(state, actions,
+                parent && paired && tab == "stickers" -> StickerScreen(state, actions,
                     openRewards = { openPopup("reward-manager") },
                     selectReward = { selectedRewardId = it; openPopup("reward-confirm") },
                     openFamily = { openPopup("settings-family") },
                 )
-                parent && tab == "location" -> LocationScreen(state, actions)
-                else -> ChatScreen(state, actions, { openPopup("settings-menu") }, { openPopup("stickers") })
+                parent && paired && tab == "location" -> LocationScreen(state, actions)
+                else -> FamilyChatScreen(state, actions, { openPopup("settings-menu") }, { openPopup("stickers") }, { openPopup("settings-room") })
             }
         }
     }
     if (popup.isNotEmpty()) {
         val back = when (popup) {
-            "settings-location", "settings-info", "settings-family", "settings-overlay" -> if (parent) "" else "settings-menu"
+            "settings-location", "settings-info", "settings-family", "settings-overlay", "settings-room" -> "settings-menu"
             "first-guide" -> "settings-family"
             "reward-editor" -> "reward-manager"
             "reward-select", "reward-confirm" -> "stickers"
@@ -277,6 +297,7 @@ private fun FamilyHome(state: UiState, actions: UiActions) {
             "settings-info" -> "공유 정보 안내"
             "settings-family" -> "가족 연결"
             "settings-overlay" -> "별 아이콘"
+            "settings-room" -> "가족 단체방"
             "first-guide" -> "처음 함께 읽기"
             "reward-manager" -> "우리의 약속"
             "reward-editor" -> if (selectedRewardId == null) "약속 추가" else "약속 수정"
@@ -307,6 +328,10 @@ private fun FamilyHome(state: UiState, actions: UiActions) {
                             openFamily = { popup = "settings-family" },
                         )
                         "settings-menu" -> SettingsMenu(state) { popup = it }
+                        "settings-room" -> FamilyRoomSettings(state, actions,
+                            openReceiveSettings = { popup = "settings-family" },
+                            openOverlaySettings = { popup = "settings-overlay" },
+                        )
                         "settings-location", "settings-info", "settings-family", "settings-overlay" -> SettingsScreen(state, actions, popup.removePrefix("settings-")) { popup = "first-guide" }
                         "first-guide" -> FirstGuide()
                         "reward-manager" -> RewardManager(state,
@@ -326,84 +351,6 @@ private fun FamilyHome(state: UiState, actions: UiActions) {
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun ChatScreen(state: UiState, actions: UiActions, openSettings: () -> Unit, openStickers: () -> Unit) {
-    val keyboard = LocalSoftwareKeyboardController.current
-    var message by rememberSaveable(state.role) { mutableStateOf("") }
-    val listState = rememberLazyListState()
-    val parent = state.role == "guardian" || state.role == "parent"
-    val events = state.events.filter { it.kind == "chat" || (it.kind == "location" && it.payload.optString("source") == "manual") }
-    LaunchedEffect(events.lastOrNull()?.id) {
-        if (events.isNotEmpty()) listState.animateScrollToItem(events.lastIndex)
-    }
-    Column(Modifier.fillMaxSize().imePadding()) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(40.dp).background(Mint, CircleShape), contentAlignment = Alignment.Center) {
-                Icon(if (parent) Icons.Outlined.Face else Icons.Outlined.FavoriteBorder, null, tint = Forest)
-            }
-            Spacer(Modifier.width(10.dp))
-            Text(if (parent) "우리 아이" else "아빠", Modifier.weight(1f), fontSize = 18.sp, fontWeight = FontWeight.Bold)
-            if (!parent) FilledTonalButton(openStickers, Modifier.testTag("child-sticker-button"), contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)) {
-                Icon(Icons.Filled.Star, null, Modifier.size(18.dp), tint = Gold)
-                Spacer(Modifier.width(5.dp))
-                Text("칭찬판 ${state.stickerBalance}", fontSize = 13.sp)
-            }
-            if (state.overlayEnabled && state.overlayPermissionGranted) IconButton(
-                onClick = { keyboard?.hide(); actions.returnToStar() },
-                modifier = Modifier.testTag("return-to-star"),
-            ) { Icon(Icons.Outlined.Close, "별 아이콘으로 돌아가기", Modifier.size(21.dp), tint = Forest) }
-        }
-        HorizontalDivider(color = Color(0xFFE6E8DF))
-        LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("chat-list"), state = listState, contentPadding = PaddingValues(18.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-            if (events.isEmpty()) item { EmptyCard(Icons.AutoMirrored.Outlined.Chat, "첫 인사를 건네 볼까요?", "‘지금 출발해요’처럼 짧게 보내도 좋아요.") }
-            items(events, key = { it.id }) { event -> ChatBubble(event, state.role, state.demoMode) }
-        }
-        if (!parent) Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-            listOf("출발했어" to "지금 출발했어!", "도착했어" to "도착했어!", "전화해 줘" to "아빠, 전화해 줘").forEach { (label, text) ->
-                AssistChip(onClick = { actions.sendChat(text) }, label = { Text(label, fontSize = 12.sp) }, enabled = !state.loading)
-            }
-        }
-        if (!parent) OutlinedButton(actions.shareCurrentLocation, Modifier.fillMaxWidth().padding(horizontal = 18.dp).testTag("share-current-location"), enabled = !state.loading) {
-            Icon(Icons.Outlined.MyLocation, null, Modifier.size(18.dp))
-            Spacer(Modifier.width(7.dp))
-            Text("현재 위치 공유", fontSize = 14.sp)
-            Spacer(Modifier.width(10.dp))
-            Text(if (state.demoMode) "체험" else "한 번만 보내요", color = Muted, fontSize = 11.sp)
-        }
-        Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 12.dp), verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            OutlinedTextField(message, { message = it }, Modifier.weight(1f).testTag("chat-input"), placeholder = { Text("마음을 담아 보내요") }, maxLines = 4, shape = RoundedCornerShape(24.dp), isError = message.length > 1500, supportingText = if (message.length > 1500) { { Text("1,500자 이내로 적어 주세요.") } } else null, colors = OutlinedTextFieldDefaults.colors(unfocusedContainerColor = Color.White, focusedContainerColor = Color.White))
-            FilledIconButton(
-                onClick = {
-                    // Check the raw input before trimming. Only the child's exact command opens local settings.
-                    if (!parent && message == "설정") openSettings()
-                    else if (message.isNotBlank()) actions.sendChat(message)
-                    message = ""
-                },
-                modifier = Modifier.size(54.dp).testTag("chat-send"), enabled = message.isNotBlank() && message.length <= 1500 && !state.loading,
-            ) { Icon(Icons.AutoMirrored.Outlined.Send, "메시지 보내기") }
-        }
-    }
-}
-
-@Composable
-private fun ChatBubble(event: FamilyEvent, role: String, demo: Boolean) {
-    val mine = event.sender == role
-    Column(Modifier.fillMaxWidth(), horizontalAlignment = if (mine) Alignment.End else Alignment.Start) {
-        if (!mine) Text(if (role != "child") "우리 아이" else "보호자", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(start = 6.dp, bottom = 5.dp))
-        Surface(color = if (mine) Forest else Color.White, shape = RoundedCornerShape(22.dp, 22.dp, if (mine) 5.dp else 22.dp, if (mine) 22.dp else 5.dp), modifier = Modifier.widthIn(max = 290.dp)) {
-            Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                if (event.kind == "location") {
-                    Text("📍 ${locationMessageTitle(event.delivery, demo)}", fontWeight = FontWeight.Medium, color = if (mine) Color.White else Ink)
-                    val point = locationPoint(event)
-                    Text(point?.let { coordinateText(it.first, it.second) } ?: "좌표 확인 중", fontSize = 12.sp, color = if (mine) Color(0xFFD9EADD) else Muted)
-                    Text("측정 ${displayTime(eventTime(event))}", fontSize = 12.sp, color = if (mine) Color(0xFFD9EADD) else Muted)
-                } else Text(event.payload.optString("text", ""), color = if (mine) Color.White else Ink, fontSize = 16.sp, lineHeight = 24.sp)
-            }
-        }
-        Text("${displayTime(event.createdAt)} · ${deliveryLabel(event.delivery, demo)}", Modifier.padding(horizontal = 5.dp, vertical = 5.dp), fontSize = 10.sp, color = Muted)
     }
 }
 
@@ -811,9 +758,12 @@ private fun RewardConfirmation(state: UiState, rewardId: String?, request: () ->
 private fun SettingsMenu(state: UiState, select: (String) -> Unit) {
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("원하는 항목을 골라 주세요.", fontSize = 14.sp, color = Muted)
-        SettingsMenuItem("자동 위치 공유", "현재 ${if (state.sharingEnabled) "켜짐" else "꺼짐"} · 공유 켜기 / 끄기", Icons.Outlined.MyLocation, "settings-location-menu-item") { select("settings-location") }
-        SettingsMenuItem("공유 정보 안내", "공유하는 정보와 기록 보관", Icons.Outlined.Shield, "settings-info-menu-item") { select("settings-info") }
-        SettingsMenuItem("가족 연결", "연결 상태 · 처음 안내 다시 보기", Icons.Outlined.FavoriteBorder, "settings-family-menu-item") { select("settings-family") }
+        SettingsMenuItem("가족 단체방", state.room?.let { "${it.title} · ${it.members.size}명" } ?: "가족방 만들기 · 코드로 참여", Icons.Outlined.Groups, "settings-room-menu-item") { select("settings-room") }
+        if (state.paired || state.demoMode) {
+            SettingsMenuItem("자동 위치 공유", "현재 ${if (state.sharingEnabled) "켜짐" else "꺼짐"} · 공유 켜기 / 끄기", Icons.Outlined.MyLocation, "settings-location-menu-item") { select("settings-location") }
+            SettingsMenuItem("공유 정보 안내", "공유하는 정보와 기록 보관", Icons.Outlined.Shield, "settings-info-menu-item") { select("settings-info") }
+        }
+        SettingsMenuItem(if (state.paired || state.demoMode) "가족 연결" else "메시지 수신", "연결 상태 · 수신 설정", Icons.Outlined.FavoriteBorder, "settings-family-menu-item") { select("settings-family") }
         SettingsMenuItem("별 아이콘", when {
             state.overlayEnabled && state.overlayPermissionGranted -> "켜짐 · 다른 앱에서 대화 열기"
             state.overlaySavedEnabled -> "다시 표시 대기"
@@ -843,7 +793,7 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
     val child = state.role == "child"
     val context = LocalContext.current
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
-        if (section == "location") SectionCard {
+        if (section == "location" && (state.paired || state.demoMode)) SectionCard {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                     Text("자동 위치 공유", fontWeight = FontWeight.Medium)
@@ -889,7 +839,8 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
                 LabelValue("연결 상태", if (state.demoMode) "체험 모드 · 실제 전송 없음" else transportLabel(state.transport))
                 if (!state.demoMode) {
                     LabelValue("내 봇", "@${state.botUsername.removePrefix("@")}")
-                    LabelValue("상대 봇", "@${state.peerBotUsername.removePrefix("@")}")
+                    if (state.paired) LabelValue("상대 봇", "@${state.peerBotUsername.removePrefix("@")}")
+                    state.room?.let { LabelValue("가족 단체방", "${it.title} · ${it.members.size}명") }
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                             Text("메시지 수신", fontWeight = FontWeight.Medium)
@@ -897,16 +848,16 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
                         }
                         Switch(state.telegramReceiving, actions.setTelegramReceiving, enabled = !state.loading, modifier = Modifier.testTag("telegram-receiving-switch"))
                     }
-                    Text("두 휴대폰에서 수신을 켜 두면 대화와 위치를 계속 받을 수 있어요. 수신 중에는 배터리를 사용합니다. 절전·강제 종료·인터넷 끊김으로 수신이 멈출 수 있으니 앱을 다시 열어 확인해 주세요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
+                    Text("각 가족 휴대폰에서 수신을 켜 두면 메시지를 계속 받을 수 있어요. 수신 중에는 배터리를 사용합니다. 절전·강제 종료·인터넷 끊김으로 수신이 멈출 수 있으니 앱을 다시 열어 확인해 주세요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
                     Text("‘상대 기기 수신’은 상대 앱이 메시지를 받은 상태예요. 사람이 읽었다는 뜻은 아니에요. 상대 앱에서 받을 때까지 전송 대기로 표시될 수 있어요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
                 }
-                TextButton(firstGuide, Modifier.testTag("first-guide-button")) { Icon(Icons.Outlined.Info, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text("처음 안내 다시 보기") }
+                if (state.paired || state.demoMode) TextButton(firstGuide, Modifier.testTag("first-guide-button")) { Icon(Icons.Outlined.Info, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text("처음 안내 다시 보기") }
                 OutlinedButton(actions.refresh, Modifier.fillMaxWidth(), enabled = !state.loading) { Icon(Icons.Outlined.Refresh, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text("새로 고침") }
             }
             if (!state.demoMode) SectionCard {
                 Text("실행 알림 표시 설정", fontWeight = FontWeight.Bold)
                 Text("대화 메시지 알림은 유지하고, 아래 실행 알림만 따로 숨길 수 있어요. 열린 Android 설정에서 해당 알림의 허용을 꺼 주세요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
-                if (child) OutlinedButton({ ServiceNotificationSettings.open(context, ServiceNotificationSettings.Kind.LOCATION) }, Modifier.fillMaxWidth()) { Text("위치 공유 알림") }
+                if (child && state.paired) OutlinedButton({ ServiceNotificationSettings.open(context, ServiceNotificationSettings.Kind.LOCATION) }, Modifier.fillMaxWidth()) { Text("위치 공유 알림") }
                 OutlinedButton({ ServiceNotificationSettings.open(context, ServiceNotificationSettings.Kind.RECEIVING) }, Modifier.fillMaxWidth()) { Text("메시지 수신 대기 알림") }
                 OutlinedButton({ ServiceNotificationSettings.open(context, ServiceNotificationSettings.Kind.STAR) }, Modifier.fillMaxWidth()) { Text("별 아이콘 실행 알림") }
             }

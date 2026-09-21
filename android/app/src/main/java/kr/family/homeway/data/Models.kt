@@ -11,6 +11,12 @@ data class FamilyEvent(
     val createdAt: String,
     val delivery: String,
     val deliveryError: String? = null,
+    // Presentation fields supplied by the authenticated family-room store, never v2 wire fields.
+    val senderId: Long? = null,
+    val senderName: String? = null,
+    val roomId: String? = null,
+    val deliveredTo: Int? = null,
+    val recipientCount: Int? = null,
 ) {
     fun json() = JSONObject().put("id", id).put("kind", kind).put("payload", payload)
         .put("sender", sender).put("createdAt", createdAt).put("delivery", delivery)

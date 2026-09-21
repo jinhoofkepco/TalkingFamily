@@ -6,6 +6,10 @@ import androidx.lifecycle.viewModelScope
 import kr.family.homeway.data.AppRepository
 import kr.family.homeway.data.DemoStore
 import kr.family.homeway.data.FamilySnapshot
+import kr.family.homeway.data.FamilyEvent
+import kr.family.homeway.data.FamilyChatCursor
+import kr.family.homeway.data.FamilyChatMemberDraft
+import kr.family.homeway.data.ChatHistoryPaging
 import kr.family.homeway.data.MovementHistoryCursor
 import kr.family.homeway.data.MovementHistoryDates
 import kr.family.homeway.tracking.CurrentLocationProvider
@@ -36,21 +40,44 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
     private var historyDaySelected = false
     private var historyGeneration = 0
     private var historyContext: Triple<String, Boolean, String>? = null
+    private var privateChatJob: Job? = null
+    private var privateChatCursor: MovementHistoryCursor? = null
+    private var privateChatGeneration = 0
+    private var privateChatContext: List<String>? = null
+    private var privateChatEvents: List<FamilyEvent> = emptyList()
+    private var roomHistoryJob: Job? = null
+    private var roomHistoryCursor: FamilyChatCursor? = null
+    private var roomHistoryGeneration = 0
+    private var roomHistoryContext: String? = null
     init {
         val snapshot = if(repo.demoMode) demo.read() else repo.cached()
         render(snapshot)
     }
-    private fun render(snapshot: FamilySnapshot, error: String? = null) {
+    private fun render(snapshot: FamilySnapshot, error: String? = null, forcePrivateChat: Boolean = false, forceRoomChat: Boolean = false) {
+        val activeRoom = repo.room
+        val privateContext = listOf(repo.demoMode.toString(), repo.paired.toString(), repo.botUsername, repo.peerBotUsername)
+        if (privateChatContext != privateContext) {
+            resetPrivateChatHistory()
+            privateChatContext = privateContext
+        }
+        if (roomHistoryContext != activeRoom?.id) {
+            resetRoomHistory()
+            roomHistoryContext = activeRoom?.id
+        }
         mutableState.update { old -> old.copy(
             role=repo.role, configured=repo.configured, demoMode=repo.demoMode,
             needsOnboarding=!repo.configured && !repo.demoMode,
             botUsername=repo.botUsername, peerBotUsername=repo.peerBotUsername,
-            events=snapshot.events, stickerBalance=snapshot.stickerBalance, redemptions=snapshot.redemptions,
+            events=if (repo.demoMode) snapshot.events else chatChronology(snapshot.events.filter { it.kind != "chat" } + privateChatEvents),
+            stickerBalance=snapshot.stickerBalance, redemptions=snapshot.redemptions,
+            paired=repo.paired || repo.demoMode, room=activeRoom, selfBotId=repo.selfBotId,
             rewards=snapshot.rewards,
             sharingEnabled=if(repo.isChild && !repo.demoMode) repo.sharingEnabled else snapshot.sharingEnabled,
             trackingStatus=if(repo.demoMode) "체험 기록 · 실제 위치를 수집하지 않아요" else repo.trackingStatus,
             transport=snapshot.transport, error=error ?: repo.connectionError
         ) }
+        if (!repo.demoMode && repo.paired) refreshPrivateChatHistory(force = forcePrivateChat)
+        if (!repo.demoMode && activeRoom != null) refreshRoomHistory(force = forceRoomChat)
         val context = Triple(repo.role, repo.demoMode, ZoneId.systemDefault().id)
         if (historyContext != context) {
             resetHistorySelection()
@@ -72,6 +99,7 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
     fun configure(role: String, botToken: String, peerBotUsername: String) = perform {
         TrackingService.stopAndAwait(getApplication())
         val snapshot = repo.configure(role,botToken,peerBotUsername)
+        resetChatHistory()
         resetHistorySelection()
         render(snapshot)
         notice(if (role == "child") "텔레그램 봇을 연결했어요. 상대 휴대폰도 연결해 주세요. 자동 위치 공유는 대화에 '설정'을 보내 따로 켤 수 있어요."
@@ -80,7 +108,7 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
     fun startDemo(role: String) = perform {
         refreshJob?.cancel()
         TrackingService.stopAndAwait(getApplication())
-        repo.startDemo(role); demo.reset(); resetHistorySelection(); render(demo.read()); notice("체험 모드예요. 실제 위치 수집과 메시지 전송은 하지 않아요.")
+        repo.startDemo(role); demo.reset(); resetHistorySelection(); resetChatHistory(); render(demo.read()); notice("체험 모드예요. 실제 위치 수집과 메시지 전송은 하지 않아요.")
     }
     fun switchDemoRole(role:String) {
         if (!repo.demoMode) return
@@ -159,10 +187,137 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
     fun sendChat(text:String) {
+        if (!requirePaired()) return
         if(text.isBlank()) return
         if(text.length>1500) { showError("메시지는 1,500자 이내로 보내 주세요."); return }
         send("chat",JSONObject().put("text",text.trim()))
     }
+    fun sendRoomChat(text: String) {
+        if (text.isBlank()) return
+        if (text.length > 1500) { showError("메시지는 1,500자 이내로 보내 주세요."); return }
+        perform { repo.sendRoomChat(text.trim()); render(repo.cached(), forceRoomChat = true); refresh() }
+    }
+    fun createFamilyRoom(token: String, title: String, selfName: String, relationship: String, members: List<FamilyChatMemberDraft>) = perform {
+        // Adding chat never stops an existing student's consented location service or clears the pair.
+        repo.createFamilyRoom(token, title, selfName, relationship, members)
+        render(repo.cached())
+        refresh()
+    }
+    fun joinFamilyRoom(token: String, code: String) = perform {
+        repo.joinFamilyRoom(token, code)
+        render(repo.cached())
+        refresh()
+    }
+    fun leaveFamilyRoom() = perform {
+        repo.leaveFamilyRoom()
+        render(repo.cached())
+    }
+
+    fun loadMorePrivateChatHistory() {
+        if (!repo.paired || repo.demoMode || privateChatJob?.isActive == true || privateChatCursor == null) return
+        refreshPrivateChatHistory(append = true)
+    }
+    fun loadMoreRoomHistory() {
+        if (repo.room == null || repo.demoMode || roomHistoryJob?.isActive == true || roomHistoryCursor == null) return
+        refreshRoomHistory(append = true)
+    }
+    private fun resetPrivateChatHistory() {
+        privateChatJob?.cancel(); privateChatGeneration++; privateChatCursor = null; privateChatEvents = emptyList()
+        mutableState.update { it.copy(privateChatHasMore = false, privateChatLoading = false) }
+    }
+    private fun resetRoomHistory() {
+        roomHistoryJob?.cancel(); roomHistoryGeneration++; roomHistoryCursor = null
+        mutableState.update { it.copy(roomEvents = emptyList(), roomHasMore = false, roomLoading = false) }
+    }
+    private fun resetChatHistory() {
+        resetPrivateChatHistory(); resetRoomHistory(); privateChatContext = null; roomHistoryContext = null
+    }
+
+    private fun refreshPrivateChatHistory(append: Boolean = false, force: Boolean = false) {
+        if (privateChatJob?.isActive == true) {
+            if (!force) return
+            privateChatJob?.cancel()
+        }
+        val generation = ++privateChatGeneration
+        val context = privateChatContext
+        val previous = privateChatEvents
+        val oldestLoadedId = previous.firstOrNull()?.id
+        val before = if (append) privateChatCursor else null
+        mutableState.update { it.copy(privateChatLoading = true) }
+        privateChatJob = viewModelScope.launch {
+            try {
+                var page = repo.privateChatHistory(before)
+                val loaded = page.events.toMutableList()
+                if (force) {
+                    val immediate = withContext(Dispatchers.Default) { chatChronology(page.events + previous) }
+                    if (generation != privateChatGeneration || context != privateChatContext || !repo.paired || repo.demoMode) return@launch
+                    privateChatEvents = immediate
+                    mutableState.update { it.copy(events = chatChronology(it.events.filter { event -> event.kind != "chat" } + immediate)) }
+                }
+                // Re-read the already expanded range so delayed ACKs also update old visible bubbles.
+                // A fresh open reads just 200; only user-expanded history increases this range.
+                while (!append && oldestLoadedId != null && loaded.none { it.id == oldestLoadedId } && page.nextCursor != null) {
+                    page = repo.privateChatHistory(page.nextCursor)
+                    loaded.addAll(page.events)
+                }
+                if (generation != privateChatGeneration || context != privateChatContext || !repo.paired || repo.demoMode) return@launch
+                val window = withContext(Dispatchers.Default) { ChatHistoryPaging.merge(previous, loaded, append, page.nextCursor != null) }
+                if (generation != privateChatGeneration || context != privateChatContext || !repo.paired || repo.demoMode) return@launch
+                privateChatCursor = window.next?.let {
+                    MovementHistoryCursor(Instant.parse(it.createdAt).toEpochMilli(), it.id)
+                }
+                privateChatEvents = window.events
+                mutableState.update { old -> old.copy(events = chatChronology(old.events.filter { it.kind != "chat" } + privateChatEvents),
+                    privateChatHasMore = privateChatCursor != null, privateChatLoading = false) }
+            } catch (error: kotlinx.coroutines.CancellationException) { throw error }
+            catch (_: Exception) {
+                if (generation == privateChatGeneration) mutableState.update { it.copy(privateChatLoading = false,
+                    error = "이전 대화를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.") }
+            }
+        }
+    }
+
+    private fun refreshRoomHistory(append: Boolean = false, force: Boolean = false) {
+        if (roomHistoryJob?.isActive == true) {
+            if (!force) return
+            roomHistoryJob?.cancel()
+        }
+        val active = repo.room ?: return
+        val generation = ++roomHistoryGeneration
+        val previous = mutableState.value.roomEvents
+        val oldestLoadedId = previous.firstOrNull()?.id
+        val before = if (append) roomHistoryCursor else null
+        mutableState.update { it.copy(roomLoading = true) }
+        roomHistoryJob = viewModelScope.launch {
+            try {
+                var page = repo.roomHistory(before)
+                val loaded = page.messages.toMutableList()
+                if (force) {
+                    val immediate = withContext(Dispatchers.Default) { chatChronology(page.messages.map { repo.roomEvent(it, active) } + previous) }
+                    if (generation != roomHistoryGeneration || repo.room?.id != active.id || repo.demoMode) return@launch
+                    mutableState.update { it.copy(roomEvents = immediate) }
+                }
+                while (!append && oldestLoadedId != null && loaded.none { it.id == oldestLoadedId } && page.next != null) {
+                    page = repo.roomHistory(page.next)
+                    loaded.addAll(page.messages)
+                }
+                if (generation != roomHistoryGeneration || repo.room?.id != active.id || repo.demoMode) return@launch
+                val window = withContext(Dispatchers.Default) {
+                    ChatHistoryPaging.merge(previous, loaded.map { repo.roomEvent(it, active) }, append, page.next != null)
+                }
+                if (generation != roomHistoryGeneration || repo.room?.id != active.id || repo.demoMode) return@launch
+                roomHistoryCursor = window.next?.let { FamilyChatCursor(it.createdAt, it.id) }
+                mutableState.update { it.copy(roomEvents = window.events,
+                    roomHasMore = roomHistoryCursor != null, roomLoading = false) }
+            } catch (error: kotlinx.coroutines.CancellationException) { throw error }
+            catch (_: Exception) {
+                if (generation == roomHistoryGeneration) mutableState.update { it.copy(roomLoading = false,
+                    error = "가족방 대화를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.") }
+            }
+        }
+    }
+
+    private fun chatChronology(events: List<FamilyEvent>): List<FamilyEvent> = ChatHistoryPaging.ordered(events)
     fun awardSticker(reason:String) {
         if (!requireRole("guardian")) return
         send("sticker_award",JSONObject().put("count",1).put("reason",reason.trim().take(200).ifBlank { "참 잘했어요" }))
@@ -197,8 +352,14 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         send("sticker_redeem_approve",JSONObject().put("requestId",id).put("accepted",accepted))
     }
     private fun requireRole(role:String): Boolean {
+        if (!requirePaired()) return false
         if (repo.role == role) return true
         showError(if (role == "guardian") "보호자만 바꿀 수 있어요." else "자녀 화면에서 사용할 수 있어요.")
+        return false
+    }
+    private fun requirePaired(): Boolean {
+        if (repo.demoMode || repo.paired) return true
+        showError("위치와 칭찬판, 1:1 대화는 기존 가족 연결이 필요해요. 가족방 대화는 계속 사용할 수 있어요.")
         return false
     }
     private fun send(kind:String,payload:JSONObject) = perform {
@@ -206,7 +367,7 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         val id = UUID.randomUUID().toString()
         val accepted = repo.sendEvent(kind,payload,id)
         val snapshot = repo.cached()
-        render(snapshot)
+        render(snapshot, forcePrivateChat = kind == "chat")
         val sent = snapshot.events.firstOrNull { it.id == id }
         if (sent?.delivery == "failed") {
             showError(sent.deliveryError ?: "요청을 처리하지 못했어요. 최신 약속과 스티커 수를 확인한 뒤 다시 시도해 주세요.")
@@ -216,6 +377,7 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         refresh()
     }
     fun shareCurrentLocation() = perform {
+        if (!requirePaired()) return@perform
         check(repo.isChild) { "자녀 화면에서 위치를 공유할 수 있어요." }
         if(repo.demoMode) {
             render(demo.apply("location",JSONObject().put("latitude",37.5665).put("longitude",126.978)
@@ -258,7 +420,7 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         refreshJob?.cancel(); awaitedLocationId=null
         perform {
             TrackingService.stopAndAwait(getApplication())
-            repo.reset(); resetHistorySelection(); mutableState.value=UiState()
+            repo.reset(); resetHistorySelection(); resetChatHistory(); mutableState.value=UiState()
         }
     }
     fun clearNotice() { mutableState.update { it.copy(notice=null,error=null) } }
