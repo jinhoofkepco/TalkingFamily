@@ -151,10 +151,11 @@ class FamilyChatScreenTest {
     }
 
     @Test fun fourFamilyMembersHaveSeparateVisibleIdentitiesAndCapturePreview() {
-        compose.setContent { HomewayApp(state().copy(roomEvents = (0 until 12).map(::message)), actions()) }
-        compose.onNodeWithTag("chat-message-message-8").assertIsDisplayed().assert(hasAnyDescendant(hasText("엄마")))
+        compose.setContent { HomewayApp(state().copy(selfBotId = 101, roomEvents = (0 until 12).map(::message)), actions()) }
+        compose.onNodeWithTag("chat-message-message-8").assertIsDisplayed().assert(hasAnyDescendant(hasText("엄마 메시지 8")))
         compose.onNodeWithTag("chat-message-message-9").assertIsDisplayed().assert(hasAnyDescendant(hasText("아빠")))
         compose.onNodeWithTag("chat-message-message-10").assertIsDisplayed().assert(hasAnyDescendant(hasText("서인 메시지 10")))
+            .assert(hasAnyDescendant(hasContentDescription("서인 프로필")))
         compose.onNodeWithTag("chat-message-message-11").assertIsDisplayed().assert(hasAnyDescendant(hasText("서아")))
             .assert(hasAnyDescendant(hasContentDescription("서아 프로필")))
         val image = compose.onRoot().captureToImage().asAndroidBitmap()

@@ -2,6 +2,7 @@ package kr.family.homeway
 
 import android.app.ActivityManager
 import android.app.NotificationManager
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -10,6 +11,7 @@ import android.os.Handler
 import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
+import android.view.accessibility.AccessibilityNodeInfo
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -297,10 +299,32 @@ class FloatingOverlayTest {
     private fun awaitStarDisableDialogFocus() {
         compose.onNodeWithTag("overlay-disable-dialog").assertIsDisplayed()
         // Compose visibility can precede WindowManager focus; native Back must target this dialog.
-        compose.waitUntil(5000) {
-            instrumentation.uiAutomation.windows.any { window ->
-                window.isFocused && window.root?.findAccessibilityNodeInfosByText("별 아이콘을 끌까요?")?.isNotEmpty() == true
+        val automation = instrumentation.uiAutomation
+        val previousFlags = automation.serviceInfo.flags
+        automation.serviceInfo = automation.serviceInfo.apply {
+            flags = flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+        }
+        try {
+            compose.waitUntil(5000) {
+                automation.windows.any { window ->
+                    window.isFocused && containsStarDisableTitle(window.root)
+                }
             }
+        } finally {
+            automation.serviceInfo = automation.serviceInfo.apply { flags = previousFlags }
+        }
+    }
+
+    // Compose's virtual node provider does not implement findAccessibilityNodeInfosByText.
+    // Walk the exposed nodes while retaining the native window-focus requirement.
+    @Suppress("DEPRECATION")
+    private fun containsStarDisableTitle(node: AccessibilityNodeInfo?): Boolean {
+        if (node == null) return false
+        return try {
+            node.text?.contains("별 아이콘을 끌까요?") == true ||
+                (0 until node.childCount).any { containsStarDisableTitle(node.getChild(it)) }
+        } finally {
+            node.recycle()
         }
     }
 

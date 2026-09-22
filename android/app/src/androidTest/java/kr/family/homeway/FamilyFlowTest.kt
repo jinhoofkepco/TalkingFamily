@@ -119,8 +119,14 @@ class FamilyFlowTest {
         compose.onNodeWithText("자녀 위치").assertDoesNotExist()
         compose.onNodeWithText("우리집 칭찬톡", useUnmergedTree = true).assertDoesNotExist()
         screenshot("child-chat")
+        val previousLocationIds = snapshot().events.filter { it.kind == "location" }.map { it.id }.toSet()
         compose.onNodeWithTag("share-current-location").assertIsDisplayed().performClick()
-        compose.onNodeWithText("체험 위치를 대화에 표시했어요. 실제로 전송하지 않았어요.").assertExists()
+        compose.waitUntil(5000) {
+            snapshot().events.any { it.kind == "location" && it.id !in previousLocationIds }
+        }
+        val addedLocation = snapshot().events.single { it.kind == "location" && it.id !in previousLocationIds }
+        assertEquals("manual", addedLocation.payload.optString("source"))
+        compose.onNodeWithText("체험 위치를 대화에 표시했어요. 실제로 전송하지 않았어요.").assertDoesNotExist()
         dismissNotice()
         compose.onNodeWithTag("chat-input").performTextInput("아빠 기다려 줘")
         compose.onNodeWithTag("child-sticker-button").performClick()
