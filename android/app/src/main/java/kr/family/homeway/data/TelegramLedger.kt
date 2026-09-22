@@ -49,6 +49,11 @@ internal object TelegramLedger {
                 payload.put("phase", phase).put("confidence", "estimated")
                     .put("relativeMeters", number(p, "relativeMeters", -10_000.0, 10_000.0))
                     .put("measuredAt", timestamp(p.opt("measuredAt")))
+                if (p.has("evidence")) {
+                    val evidence = p.opt("evidence")
+                    require(evidence in setOf("barometer_steps", "barometer_motion")) { "높이 변화의 센서 근거를 확인해 주세요." }
+                    payload.put("evidence", evidence)
+                }
                 if (p.has("latitude") || p.has("longitude")) {
                     payload.put("latitude", number(p, "latitude", -90.0, 90.0))
                         .put("longitude", number(p, "longitude", -180.0, 180.0))
@@ -199,6 +204,8 @@ internal object TelegramLedger {
         // upgrade/retry; an already-applied event remains immutable (including its original estimates).
         event.payload.keys().asSequence()
             .filterNot { event.kind == "location" && it in LocationMotionMetadata.keys }
+            // Older versions omit optional sensor evidence; retain the same v2 retry identity.
+            .filterNot { event.kind == "vertical" && it == "evidence" }
             .sorted().forEach { key -> parts.put(key).put(event.payload.get(key)) }
         return MessageDigest.getInstance("SHA-256").digest(parts.toString().toByteArray(Charsets.UTF_8))
             .joinToString("") { "%02x".format(it) }

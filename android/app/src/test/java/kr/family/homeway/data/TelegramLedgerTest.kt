@@ -166,6 +166,32 @@ class TelegramLedgerTest {
         assertEquals(location.id, state.getJSONObject("latestLocation").getString("id"))
     }
 
+    @Test fun `vertical sensor evidence survives new receivers without asserting a staircase`() {
+        for (evidence in listOf("barometer_steps", "barometer_motion")) {
+            val input = event("vertical", JSONObject().put("phase", "ascent_finished").put("confidence", "estimated")
+                .put("relativeMeters", 3.2).put("measuredAt", at).put("evidence", evidence), "child")
+            val validated = TelegramLedger.validate(input)
+            assertEquals(evidence, validated.payload.getString("evidence"))
+            assertEquals("estimated", validated.payload.getString("confidence"))
+            assertThrows(IllegalArgumentException::class.java) {
+                TelegramLedger.validate(input.copy(payload = JSONObject(input.payload.toString()).put("evidence", "stairs_confirmed")))
+            }
+        }
+    }
+
+    @Test fun `adding vertical evidence after upgrade preserves old retry identity and stored original`() {
+        val original = event("vertical", JSONObject().put("phase", "ascent_finished").put("confidence", "estimated")
+            .put("relativeMeters", 3.2).put("measuredAt", at), "child")
+        val withEvidence = original.copy(payload = JSONObject(original.payload.toString()).put("evidence", "barometer_steps"))
+        val old = TelegramLedger.apply(TelegramLedger.emptyState(), original)
+        val replay = TelegramLedger.apply(JSONObject(old.toString()), withEvidence)
+        assertEquals(1, replay.getJSONArray("events").length())
+        assertFalse(replay.getJSONArray("events").getJSONObject(0).getJSONObject("payload").has("evidence"))
+        val fresh = TelegramLedger.apply(TelegramLedger.emptyState(), withEvidence)
+        val oldRetry = TelegramLedger.apply(JSONObject(fresh.toString()), original)
+        assertEquals("barometer_steps", oldRetry.getJSONArray("events").getJSONObject(0).getJSONObject("payload").getString("evidence"))
+    }
+
     @Test fun `trimming visible history does not erase financial replay protection or latest readings`() {
         val original = award()
         var state = TelegramLedger.apply(TelegramLedger.emptyState(), original)

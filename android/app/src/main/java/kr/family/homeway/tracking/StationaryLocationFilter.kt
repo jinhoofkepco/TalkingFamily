@@ -30,12 +30,14 @@ data class FilteredLocation(
  * Thresholds are conservative starting values, not a guarantee of room-level positioning.
  */
 class StationaryLocationFilter {
-    private data class MotionUpdate(val state: MotionState, val time: Long, val persistentUntilExit: Boolean)
+    private data class MotionUpdate(val state: MotionState, val time: Long, val persistentUntilExit: Boolean,
+        val physicalMovement: Boolean = false)
     private data class Candidate(val first: LocationFixSample, var confirmed: Boolean = false)
 
     private val pendingMotion = ArrayDeque<MotionUpdate>()
     private var motion = MotionState.UNKNOWN
     private var motionUpdatedAt: Long? = null
+    private var physicalMovementAt: Long? = null
     private var stillSince: Long? = null
     private var stillLatchedUntilExit = false
     private var lastNow: Long? = null
@@ -47,12 +49,23 @@ class StationaryLocationFilter {
     @Synchronized
     fun updateMotion(state: MotionState, atElapsedMillis: Long, persistentUntilExit: Boolean = false) {
         if (atElapsedMillis < 0) return
+        queueMotion(MotionUpdate(state, atElapsedMillis, persistentUntilExit))
+    }
+
+    /** A real step/significant-motion signal disproves an old rest anchor without inventing an activity. */
+    @Synchronized
+    fun notePhysicalMovement(atElapsedMillis: Long) {
+        if (atElapsedMillis < 0) return
+        queueMotion(MotionUpdate(MotionState.UNKNOWN, atElapsedMillis, false, physicalMovement = true))
+    }
+
+    private fun queueMotion(update: MotionUpdate) {
         // Bound even a faulty event source. Lost transitions cannot support a continuous dwell.
         if (pendingMotion.size >= MAX_PENDING_EVENTS) {
             pendingMotion.clear()
             forgetMotion()
         }
-        pendingMotion.addLast(MotionUpdate(state, atElapsedMillis, persistentUntilExit))
+        pendingMotion.addLast(update)
     }
 
     /** Call once per accepted automatic fix, before persisting its raw and display coordinates. */
@@ -129,6 +142,17 @@ class StationaryLocationFilter {
             // dwell, but a stale positive STILL observation cannot start or revive one.
             if (event.time > now || (event.state == MotionState.STILL && now - event.time > MAX_ACTIVITY_AGE_MS) ||
                 motionUpdatedAt?.let { event.time < it } == true) continue
+            if (event.physicalMovement) {
+                physicalMovementAt = maxOf(physicalMovementAt ?: event.time, event.time)
+                if (motion == MotionState.STILL || motion == MotionState.UNKNOWN) {
+                    forgetMotion()
+                    // Advance even UNKNOWN so an older delayed STILL cannot establish a new anchor.
+                    motionUpdatedAt = event.time
+                }
+                // Preserve an actual walking/driving classification and its original expiry time.
+                continue
+            }
+            if (event.state == MotionState.STILL && physicalMovementAt?.let { event.time <= it } == true) continue
             if (event.time == motionUpdatedAt) {
                 if (event.state == MotionState.STILL) {
                     // A transition may share a timestamp with a snapshot or EXIT(old). Honor

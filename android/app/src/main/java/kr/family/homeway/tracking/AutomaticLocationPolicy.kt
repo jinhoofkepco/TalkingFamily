@@ -25,12 +25,17 @@ object LocationFixValidation {
 /** FLP supplies fixes, independent of motion. This only limits duplicates, overlap and catch-up bursts. */
 class AutomaticLocationPolicy(
     private val startedAtMillis: Long,
-    private val intervalMillis: Long = 5 * 60_000L,
+    intervalMillis: Long = 5 * 60_000L,
     private val toleranceMillis: Long = 30_000L,
 ) {
     init { require(intervalMillis > 0 && toleranceMillis in 0 until intervalMillis) }
 
-    private data class Reservation(val sample: LocationFixSample, val receivedAt: Long)
+    var intervalMillis: Long = intervalMillis
+        private set
+    private val tolerance get() = minOf(toleranceMillis, intervalMillis / 10)
+    private var generation = 0L
+    private var motionFixDue = false
+    private data class Reservation(val sample: LocationFixSample, val receivedAt: Long, val generation: Long)
     private var pending: Reservation? = null
     private var lastFixMillis: Long? = null
     private var lastReceivedAt: Long? = null
@@ -38,14 +43,29 @@ class AutomaticLocationPolicy(
     var nextScheduledAtMillis: Long = startedAtMillis
         private set
 
+    /** Sensor evidence changes cadence; an outstanding durable write keeps its reservation. */
+    fun updateInterval(newIntervalMillis: Long, nowMillis: Long): Boolean {
+        require(newIntervalMillis > 0)
+        if (newIntervalMillis == intervalMillis) return false
+        val faster = newIntervalMillis < intervalMillis
+        intervalMillis = newIntervalMillis
+        generation++
+        motionFixDue = faster
+        lastWatchdogAt = null
+        nextScheduledAtMillis = if (faster) nowMillis else
+            (pending?.receivedAt ?: lastReceivedAt)?.plus(newIntervalMillis) ?: nowMillis
+        return true
+    }
+
     /** A reservation remains pending until SQLite commits, so a failed write cannot claim a record. */
     fun reserve(sample: LocationFixSample, receivedAtMillis: Long): Boolean {
         if (LocationFixValidation.error(sample, receivedAtMillis) != null || pending != null) return false
         if (lastFixMillis?.let { sample.elapsedRealtimeMillis <= it } == true) return false
-        if (receivedAtMillis < nextScheduledAtMillis - toleranceMillis) return false
+        if (receivedAtMillis < nextScheduledAtMillis - tolerance) return false
         // A late recovery must not suppress the next normal slot. Half an interval still prevents bursts.
-        if (lastReceivedAt?.let { receivedAtMillis - it < intervalMillis / 2 } == true) return false
-        pending = Reservation(sample, receivedAtMillis)
+        val spacing = if (motionFixDue) minOf(5_000L, intervalMillis / 2) else intervalMillis / 2
+        if (lastReceivedAt?.let { receivedAtMillis - it < spacing } == true) return false
+        pending = Reservation(sample, receivedAtMillis, generation)
         return true
     }
 
@@ -54,20 +74,25 @@ class AutomaticLocationPolicy(
         lastFixMillis = saved.sample.elapsedRealtimeMillis
         lastReceivedAt = saved.receivedAt
         // Retain the original schedule, skip missed slots, and never manufacture catch-up records.
-        val slots = ((saved.receivedAt + toleranceMillis - nextScheduledAtMillis) / intervalMillis) + 1
-        nextScheduledAtMillis += slots * intervalMillis
+        if (saved.generation == generation) {
+            val slots = ((saved.receivedAt + tolerance - nextScheduledAtMillis) / intervalMillis) + 1
+            nextScheduledAtMillis += slots.coerceAtLeast(1) * intervalMillis
+            motionFixDue = false
+        } // An old-cadence write must not consume a new-cadence slot.
         pending = null
     }
 
     fun cancelReservation() { pending = null }
 
-    fun awaitingFreshFix(nowMillis: Long): Boolean = pending == null && nowMillis >= nextScheduledAtMillis + 60_000L
+    fun awaitingFreshFix(nowMillis: Long): Boolean = pending == null &&
+        nowMillis >= nextScheduledAtMillis + if (motionFixDue) 0 else minOf(60_000L, intervalMillis)
 
-    /** Awake-only recovery, at most one fresh request per five minutes; failure consumes no slot. */
+    /** Fresh fix on motion entry, then bounded awake-only recovery; failure consumes no slot. */
     fun beginWatchdog(nowMillis: Long): Boolean {
         if (!awaitingFreshFix(nowMillis)) return false
         if (lastWatchdogAt?.let { nowMillis - it < intervalMillis } == true) return false
-        if (lastReceivedAt?.let { nowMillis - it < intervalMillis / 2 } == true) return false
+        val spacing = if (motionFixDue) minOf(5_000L, intervalMillis / 2) else intervalMillis / 2
+        if (lastReceivedAt?.let { nowMillis - it < spacing } == true) return false
         lastWatchdogAt = nowMillis
         return true
     }

@@ -115,6 +115,50 @@ class StationaryLocationFilterTest {
         }
     }
 
+    @Test fun physicalMovementReleasesStillAnchorAndUpdatesUnknownBarrierAgainstDelayedStill() {
+        val filter = established()
+        filter.notePhysicalMovement(350_000)
+        val moving = filter.filter(fix(360_000, 20.0), 360_000)
+        assertEquals(MotionState.UNKNOWN, moving.motionState)
+        assertFalse(moving.adjusted)
+        assertNull(moving.stationarySinceElapsedMillis)
+        filter.notePhysicalMovement(400_000) // Already UNKNOWN: this newer step must still set a barrier.
+        filter.updateMotion(MotionState.STILL, 375_000, persistentUntilExit = true)
+        filter.updateMotion(MotionState.STILL, 400_000, persistentUntilExit = true)
+        assertEquals(MotionState.UNKNOWN, filter.filter(fix(420_000, 30.0), 420_000).motionState)
+        filter.updateMotion(MotionState.STILL, 450_000, persistentUntilExit = true)
+        assertNull(filter.filter(fix(450_000, 30.0), 450_000).stationarySinceElapsedMillis)
+        assertEquals(450_000L, filter.filter(fix(570_000, 35.0), 570_000).stationarySinceElapsedMillis)
+    }
+
+    @Test fun physicalSignalsPreserveMovingActivityButDoNotRenewItsAge() {
+        for (state in listOf(MotionState.WALKING, MotionState.RUNNING, MotionState.BICYCLE, MotionState.VEHICLE)) {
+            val filter = StationaryLocationFilter()
+            filter.updateMotion(state, 0, persistentUntilExit = true)
+            filter.filter(fix(0), 0)
+            for (at in listOf(300_000L, 600_000L)) {
+                filter.notePhysicalMovement(at)
+                assertEquals(state, filter.filter(fix(at, 20.0), at).motionState)
+            }
+            filter.notePhysicalMovement(900_001)
+            assertEquals(MotionState.UNKNOWN, filter.filter(fix(900_001, 30.0), 900_001).motionState)
+        }
+    }
+
+    @Test fun futureAndOlderPhysicalEventsCannotEraseNewerStillEvidenceOrPoisonItsTimestamp() {
+        val filter = established()
+        filter.updateMotion(MotionState.STILL, 400_000, persistentUntilExit = true)
+        filter.notePhysicalMovement(350_000)
+        filter.notePhysicalMovement(Long.MAX_VALUE)
+        val held = filter.filter(fix(600_000, 15.0), 600_000)
+        assertEquals(MotionState.STILL, held.motionState)
+        assertEquals(0L, held.stationarySinceElapsedMillis)
+        filter.notePhysicalMovement(700_000)
+        val released = filter.filter(fix(900_000, 20.0), 900_000)
+        assertEquals(MotionState.UNKNOWN, released.motionState)
+        assertNull(released.stationarySinceElapsedMillis)
+    }
+
     @Test fun staleActivityReleasesAnchorButPeriodicStillRefreshKeepsOriginalDwell() {
         val stale = established()
         stale.filter(fix(600_000), 600_000)

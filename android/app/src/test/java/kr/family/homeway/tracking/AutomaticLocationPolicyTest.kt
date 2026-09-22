@@ -10,6 +10,75 @@ class AutomaticLocationPolicyTest {
         policy.committed()
     }
 
+    @Test fun motionEntryRebasesFiveMinuteSlotAndAcceptsThirtySecondFixes() {
+        val policy = AutomaticLocationPolicy(0)
+        save(policy, 0)
+        assertTrue(policy.updateInterval(30_000, 10_000))
+        assertTrue(policy.beginWatchdog(10_000))
+        save(policy, 11_000)
+        save(policy, 40_000)
+        save(policy, 69_000)
+        assertEquals(100_000L, policy.nextScheduledAtMillis)
+        assertFalse(policy.updateInterval(30_000, 75_000))
+        assertEquals(100_000L, policy.nextScheduledAtMillis)
+    }
+
+    @Test fun idleReturnSchedulesFromLastWriteWithoutImmediateBurst() {
+        val policy = AutomaticLocationPolicy(0, 30_000, 3_000)
+        save(policy, 0)
+        save(policy, 30_000)
+        policy.updateInterval(300_000, 60_000)
+        assertEquals(330_000L, policy.nextScheduledAtMillis)
+        assertFalse(policy.reserve(fix(60_000), 60_000))
+        assertFalse(policy.beginWatchdog(120_000))
+        save(policy, 330_000)
+    }
+
+    @Test fun pendingIdleWriteCannotConsumeNewMovingSlot() {
+        val policy = AutomaticLocationPolicy(0)
+        assertTrue(policy.reserve(fix(0), 0))
+        policy.updateInterval(30_000, 10_000)
+        assertFalse(policy.beginWatchdog(10_000))
+        policy.committed()
+        assertEquals(10_000L, policy.nextScheduledAtMillis)
+        assertTrue(policy.beginWatchdog(10_000))
+        save(policy, 11_000)
+        assertEquals(40_000L, policy.nextScheduledAtMillis)
+    }
+
+    @Test fun pendingMovingWriteCannotAdvanceIdleSlotByFiveMinutesTwice() {
+        val policy = AutomaticLocationPolicy(0)
+        policy.updateInterval(30_000, 0)
+        assertTrue(policy.reserve(fix(0), 0))
+        policy.updateInterval(300_000, 10_000)
+        policy.committed()
+        assertEquals(300_000L, policy.nextScheduledAtMillis)
+        save(policy, 300_000)
+    }
+
+    @Test fun freshMotionRequestDoesNotBurstAfterJustCommittedLocation() {
+        val policy = AutomaticLocationPolicy(0)
+        save(policy, 0)
+        policy.updateInterval(30_000, 1_000)
+        assertFalse(policy.beginWatchdog(1_000))
+        assertFalse(policy.reserve(fix(1_000), 1_000))
+        assertTrue(policy.beginWatchdog(5_000))
+        assertFalse(policy.beginWatchdog(10_000))
+        assertFalse(policy.beginWatchdog(34_999))
+        assertTrue(policy.beginWatchdog(35_000))
+        save(policy, 36_000)
+        assertFalse(policy.reserve(fix(36_000), 36_001))
+    }
+
+    @Test fun cancelledWriteAfterCadenceChangeLeavesMotionSlotAvailable() {
+        val policy = AutomaticLocationPolicy(0)
+        assertTrue(policy.reserve(fix(0), 0))
+        policy.updateInterval(30_000, 10_000)
+        policy.cancelReservation()
+        save(policy, 10_000)
+        assertEquals(40_000L, policy.nextScheduledAtMillis)
+    }
+
     @Test fun stationaryInitialFixAndEveryFiveMinuteFixAreAccepted() {
         val policy = AutomaticLocationPolicy(0)
         save(policy, 0)

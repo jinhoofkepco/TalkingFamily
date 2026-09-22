@@ -64,6 +64,7 @@ class TrackingService : Service(), SensorEventListener {
     private lateinit var policy: AutomaticLocationPolicy
     private lateinit var activityMotionMonitor: ActivityMotionMonitor
     private val stationaryFilter = StationaryLocationFilter()
+    private val cadence = AdaptiveTrackingCadence()
     private var lastFilteredDisplay: FilteredLocation? = null
     private var lastFilteredAtElapsedMillis: Long? = null
     private var lastRawAccuracyMeters: Double? = null
@@ -83,12 +84,8 @@ class TrackingService : Service(), SensorEventListener {
     private var subscriptionActive = false
     private var subscriptionStarting = false
     private var lastSubscriptionAttemptAt: Long? = null
-    private val locationCallback = object : LocationCallback() {
-        override fun onLocationResult(result: LocationResult) {
-            // With batching disabled, prefer the newest fresh fix if a provider still returns several.
-            result.locations.maxByOrNull { it.elapsedRealtimeNanos }?.let(::acceptLocation)
-        }
-    }
+    private var subscriptionIntervalMillis: Long? = null
+    private var locationCallback: LocationCallback? = null
     private var significantMotion: Sensor? = null
     private var lastMotionMillis = Long.MIN_VALUE
     private var accelerationCount = 0
@@ -98,7 +95,11 @@ class TrackingService : Service(), SensorEventListener {
         override fun onTrigger(event: TriggerEvent?) {
             handler.post {
                 if (!started) return@post
-                noteMovement(event?.timestamp?.div(1_000_000L) ?: SystemClock.elapsedRealtime())
+                val now = SystemClock.elapsedRealtime()
+                val at = event?.timestamp?.div(1_000_000L) ?: now
+                cadence.onSignificantMotion(at, now)
+                notePhysicalMovement(at, now)
+                noteMovement(at)
                 handler.postDelayed({ if (started) armSignificantMotion() }, 1_000L)
             }
         }
@@ -109,6 +110,12 @@ class TrackingService : Service(), SensorEventListener {
         repository = AppRepository(applicationContext)
         activityMotionMonitor = ActivityMotionMonitor(this) { state, at, persistentUntilExit ->
             stationaryFilter.updateMotion(state, at, persistentUntilExit)
+            val now = SystemClock.elapsedRealtime()
+            cadence.onActivity(state, at, persistentUntilExit, now)
+            if (started) {
+                refreshCadence(now)
+                requestFreshFixIfDue(now)
+            }
         }
         runningInstance = this
         sensors = getSystemService(SENSOR_SERVICE) as SensorManager
@@ -175,7 +182,7 @@ class TrackingService : Service(), SensorEventListener {
         val now = SystemClock.elapsedRealtime()
         policy = AutomaticLocationPolicy(now)
         lastHeartbeatMillis = now
-        repository.noteTrackingStatus("자동 공유 중 · 5분마다 새 위치 확인 · 첫 위치를 기다리고 있어요")
+        repository.noteTrackingStatus("자동 공유 중 · 이동 중 약 30초, 정지 중 약 5분 · 첫 위치를 기다리고 있어요")
         registerSensors()
         activityMotionMonitor.refresh()
         startLocationUpdates()
@@ -184,7 +191,7 @@ class TrackingService : Service(), SensorEventListener {
         enqueueHeartbeat()
         ticker = scope.launch {
             while (started) {
-                delay(30_000L)
+                delay(5_000L)
                 if (startDecision(repository, this@TrackingService) != TrackingStartPolicy.Decision.START) {
                     stopSharing()
                     break
@@ -226,7 +233,13 @@ class TrackingService : Service(), SensorEventListener {
         if (!started || !repository.sharingEnabled || event.values.isEmpty()) return
         val at = event.timestamp / 1_000_000L
         when (event.sensor.type) {
-            Sensor.TYPE_STEP_DETECTOR -> noteMovement(at)
+            Sensor.TYPE_STEP_DETECTOR -> {
+                detector.noteStep(at)
+                val now = SystemClock.elapsedRealtime()
+                cadence.onStep(at, now)
+                notePhysicalMovement(at, now)
+                noteMovement(at)
+            }
             Sensor.TYPE_ACCELEROMETER -> {
                 if (event.values.size < 3) return
                 val magnitude = sqrt(event.values.take(3).sumOf { it.toDouble() * it })
@@ -236,19 +249,23 @@ class TrackingService : Service(), SensorEventListener {
                         accelerationCount = 0
                     }
                     accelerationCount++
-                    if (accelerationCount >= 3) noteMovement(at)
+                    if (accelerationCount >= 3) {
+                        cadence.onAccelerationMotion(at, SystemClock.elapsedRealtime())
+                        noteMovement(at)
+                    }
                 }
             }
             Sensor.TYPE_PRESSURE -> {
                 if (!pressureReliable) return
-                val recentMotion = lastMotionMillis != Long.MIN_VALUE && at - lastMotionMillis in 0..30_000L
+                val recentMotion = lastMotionMillis != Long.MIN_VALUE && at - lastMotionMillis in 0..5_000L
                 detector.addPressure(event.values[0].toDouble(), at, recentMotion).forEach { movement ->
                     outgoing.trySend("vertical" to JSONObject()
                         .put("phase", movement.phase)
                         .put("relativeMeters", movement.relativeMeters)
                         .put("measuredAt", sensorInstant(movement.measuredAtMillis))
                         .put("detectedAt", Instant.now().toString())
-                        .put("confidence", "estimated"))
+                        .put("confidence", "estimated")
+                        .put("evidence", movement.evidence))
                 }
             }
         }
@@ -256,31 +273,61 @@ class TrackingService : Service(), SensorEventListener {
 
     private fun noteMovement(at: Long) {
         lastMotionMillis = maxOf(lastMotionMillis, at)
-        checkDeadlines()
+        val now = SystemClock.elapsedRealtime()
+        refreshCadence(now)
+        requestFreshFixIfDue(now)
     }
 
-    /** The provider owns the five-minute schedule, including delivery while the screen is off. */
+    private fun notePhysicalMovement(at: Long, now: Long) {
+        if (at >= 0 && now - at in 0..AdaptiveTrackingCadence.MAX_SENSOR_AGE_MILLIS) {
+            stationaryFilter.notePhysicalMovement(at)
+        }
+    }
+
+    private fun refreshCadence(now: Long) {
+        if (!started || !repository.sharingEnabled) return
+        if (policy.updateInterval(cadence.intervalMillis(now), now)) startLocationUpdates()
+    }
+
+    /** FLP owns periodic delivery; replace its subscription when sensor evidence changes cadence. */
     @SuppressLint("MissingPermission")
     private fun startLocationUpdates() {
-        if (!started || subscriptionActive || subscriptionStarting) return
+        if (!started) return
+        val interval = policy.intervalMillis
+        if ((subscriptionActive || subscriptionStarting) && subscriptionIntervalMillis == interval) return
+        removeLocationSubscription()
+        val callback = object : LocationCallback() {
+            override fun onLocationResult(result: LocationResult) {
+                // Late callbacks from a replaced request must not consume a current slot.
+                if (locationCallback === this && started) {
+                    result.locations.maxByOrNull { it.elapsedRealtimeNanos }?.let(::acceptLocation)
+                }
+            }
+        }
+        locationCallback = callback
+        subscriptionIntervalMillis = interval
         subscriptionStarting = true
         lastSubscriptionAttemptAt = SystemClock.elapsedRealtime()
-        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, INTERVAL_MILLIS)
-            .setMinUpdateIntervalMillis(INTERVAL_MILLIS)
+        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, interval)
+            .setMinUpdateIntervalMillis(interval)
             .setMaxUpdateDelayMillis(0)
             .setMaxUpdateAgeMillis(0)
             .setMinUpdateDistanceMeters(0f)
             .build()
         try {
-            fusedLocation.requestLocationUpdates(request, locationCallback, Looper.getMainLooper())
+            fusedLocation.requestLocationUpdates(request, callback, Looper.getMainLooper())
                 .addOnSuccessListener {
-                    subscriptionStarting = false
-                    if (started) subscriptionActive = true else stopLocationUpdates()
+                    if (started && locationCallback === callback) {
+                        subscriptionStarting = false
+                        subscriptionActive = true
+                    } else runCatching { fusedLocation.removeLocationUpdates(callback) }
                 }
                 .addOnFailureListener {
-                    subscriptionStarting = false
-                    subscriptionActive = false
-                    if (started) repository.noteTrackingStatus("위치 자동 확인을 연결하지 못했어요. 권한과 위치 설정을 확인해 주세요.")
+                    if (locationCallback === callback) {
+                        subscriptionStarting = false
+                        subscriptionActive = false
+                        if (started) repository.noteTrackingStatus("위치 자동 확인을 연결하지 못했어요. 권한과 위치 설정을 확인해 주세요.")
+                    }
                 }
         } catch (_: SecurityException) {
             subscriptionStarting = false
@@ -288,17 +335,25 @@ class TrackingService : Service(), SensorEventListener {
         }
     }
 
-    private fun stopLocationUpdates() {
-        outboxRelay?.cancel()
+    private fun removeLocationSubscription() {
+        val previous = locationCallback
+        locationCallback = null
         subscriptionActive = false
         subscriptionStarting = false
-        runCatching { fusedLocation.removeLocationUpdates(locationCallback) }
+        subscriptionIntervalMillis = null
+        previous?.let { runCatching { fusedLocation.removeLocationUpdates(it) } }
+    }
+
+    private fun stopLocationUpdates() {
+        outboxRelay?.cancel()
+        removeLocationSubscription()
     }
 
     private fun acceptLocation(location: Location) {
         if (!started || !repository.sharingEnabled) return
         val sample = location.toFixSample()
         val now = SystemClock.elapsedRealtime()
+        refreshCadence(now)
         LocationFixValidation.error(sample, now)?.let {
             repository.noteTrackingStatus(it)
             return
@@ -333,12 +388,18 @@ class TrackingService : Service(), SensorEventListener {
         if (!started || !repository.sharingEnabled) return
         activityMotionMonitor.refresh()
         val now = SystemClock.elapsedRealtime()
-        if (now - lastHeartbeatMillis >= INTERVAL_MILLIS) {
+        refreshCadence(now)
+        if (now - lastHeartbeatMillis >= HEARTBEAT_INTERVAL_MILLIS) {
             lastHeartbeatMillis = now
             enqueueHeartbeat()
         }
         if (!subscriptionActive && !subscriptionStarting &&
-            lastSubscriptionAttemptAt?.let { now - it >= INTERVAL_MILLIS } != false) startLocationUpdates()
+            lastSubscriptionAttemptAt?.let { now - it >= policy.intervalMillis } != false) startLocationUpdates()
+        requestFreshFixIfDue(now)
+    }
+
+    private fun requestFreshFixIfDue(now: Long) {
+        if (!started || !repository.sharingEnabled) return
         // This awake-only watchdog is recovery, not the authoritative GPS timer.
         if (locationJob?.isActive != true && policy.beginWatchdog(now)) {
             locationJob = scope.launch {
@@ -380,8 +441,8 @@ class TrackingService : Service(), SensorEventListener {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
-            .setContentTitle("아빠에게 위치 공유 중")
-            .setContentText("5분마다 새 위치를 확인해요. 높이 변화는 추정해요.")
+            .setContentTitle("부모님께 위치 공유 중")
+            .setContentText("이동 중 약 30초, 정지 중 약 5분 · 높이 변화 추정")
             .setOngoing(true).setOnlyAlertOnce(true).setSilent(true).setCategory(NotificationCompat.CATEGORY_SERVICE)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "공유 종료", stop)
         // Notification entry opens the app; only an explicit launcher entry starts collapsed.
@@ -444,6 +505,7 @@ class TrackingService : Service(), SensorEventListener {
 
     override fun dump(fd: FileDescriptor, writer: PrintWriter, args: Array<out String>?) {
         writer.println("sharingRunning=$started sharingStopping=$stopping")
+        writer.println("requestedLocationIntervalMillis=${if (::policy.isInitialized) policy.intervalMillis else "none"} subscriptionIntervalMillis=${subscriptionIntervalMillis ?: "none"} subscriptionActive=$subscriptionActive")
         activityMotionMonitor.dump(writer)
         val display = lastFilteredDisplay
         val duration = display?.stationarySinceElapsedMillis?.let { since ->
@@ -464,7 +526,7 @@ class TrackingService : Service(), SensorEventListener {
         private const val NOTIFICATION_ID = 4001
         private const val ACTION_START = "kr.family.homeway.START_LOCATION_SHARING"
         private const val ACTION_STOP = "kr.family.homeway.STOP_LOCATION_SHARING"
-        private const val INTERVAL_MILLIS = 5 * 60_000L
+        private const val HEARTBEAT_INTERVAL_MILLIS = 5 * 60_000L
 
         /** Call only from a visible activity after the child's explicit sharing consent. */
         fun start(context: Context): Boolean {

@@ -163,7 +163,7 @@ private fun Onboarding(state: UiState, actions: UiActions) {
                 lineHeight = 23.sp,
             )
             Text(
-                "자동 공유를 켜면 움직임이 없어도 약 5분마다 새 위치를 요청합니다. 위도·경도, 측정 시각, 정확도와 움직임 상태를 공유합니다. 기압계가 있는 기기는 기압에 따른 상대 높이 변화로 올라가기·내려가기의 시작과 종료를 추정해 공유합니다. 정확한 층수는 알 수 없습니다.",
+                "자동 공유를 켜면 이동 중 약 30초, 정지 중 약 5분마다 새 위치를 요청합니다. 위도·경도, 측정 시각, 정확도와 움직임 상태를 공유합니다. 기압계가 있는 기기는 기압에 따른 상대 높이 변화로 올라가기·내려가기의 시작과 종료를 추정해 공유합니다. 정확한 층수는 알 수 없습니다.",
                 lineHeight = 23.sp,
             )
             Text(
@@ -382,17 +382,15 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
     val careScope = careScopeKey(state)
     var selectedRecordId by rememberSaveable(careScope, state.historyDay) { mutableStateOf<String?>(null) }
     var focusRequest by rememberSaveable(careScope, state.historyDay) { mutableIntStateOf(0) }
-    val locations = remember(readings) {
-        readings.filter { it.toEmbeddedMapHistoryPoint() != null }
-            .sortedWith(compareBy<FamilyEvent> { Instant.parse(eventTime(it)) }.thenBy { it.id })
-    }
-    val historyPoints = remember(locations) {
-        locations.map { it.toEmbeddedMapHistoryPoint()!! }
-    }
-    val selectedIndex = locations.indexOfFirst { it.id == selectedRecordId }.takeIf { it >= 0 } ?: locations.lastIndex
-    val selected = locations.getOrNull(selectedIndex)
-    val point = selected?.let(::locationPoint)
-    val selectedMapPoint = historyPoints.getOrNull(selectedIndex)?.let(EmbeddedMapPolicy::historyPoint)
+    val timeline = remember(readings) { EmbeddedMapTimeline.from(readings) }
+    val records = timeline.records
+    val historyPoints = timeline.locations
+    val selectedIndex = records.indexOfFirst { it.event.id == selectedRecordId }.takeIf { it >= 0 } ?: records.lastIndex
+    val selectedRecord = records.getOrNull(selectedIndex)
+    val selected = selectedRecord?.event
+    val selectedMapIndex = selectedRecord?.locationIndex ?: -1
+    val selectedMapPoint = historyPoints.getOrNull(selectedMapIndex)?.let(EmbeddedMapPolicy::historyPoint)
+    val vertical = selectedRecord?.vertical
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     var dateMenu by remember { mutableStateOf(false) }
@@ -400,7 +398,7 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
     val density = LocalDensity.current
     var timelineInset by remember { mutableIntStateOf(132) }
     val selectPoint: (Int) -> Unit = { index ->
-        locations.getOrNull(index)?.let { event ->
+        records.getOrNull(index)?.event?.let { event ->
             if (selectedRecordId != event.id) { selectedRecordId = event.id; focusRequest++ }
         }
     }
@@ -426,17 +424,24 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
             if (state.historyLoading) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Forest)
         }
         item {
-            if (point == null || selectedMapPoint == null) EmptyCard(Icons.Outlined.LocationOn,
+            if (selected == null) EmptyCard(Icons.Outlined.LocationOn,
                 if (state.historyLoading) "기록을 불러오고 있어요" else if (state.historyHasMore) "불러온 기록에는 위치가 없어요" else "이 날짜의 위치 기록이 없어요",
                 if (state.historyHasMore) "아래의 ‘이전 기록 더 보기’에서 앞선 위치를 찾아볼 수 있어요." else "자녀가 공유한 위치를 날짜별로 모아 보여 드려요.")
             else Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Surface(shape = RoundedCornerShape(22.dp), modifier = Modifier.fillMaxWidth().height(500.dp).testTag("embedded-location-map")) {
                     Box(Modifier.fillMaxSize()) {
-                        key(careScope, state.historyDay) {
+                        if (selectedMapPoint != null) key(careScope, state.historyDay) {
                             EmbeddedLocationMap(selectedMapPoint.location.latitude, selectedMapPoint.location.longitude,
                                 selectedMapPoint.location.accuracy ?: Double.NaN, Modifier.fillMaxSize(),
                                 focusToken = "$careScope/${state.historyDay}/${selectedRecordId?.takeIf { it == selected.id } ?: "latest"}/$focusRequest",
-                                history = historyPoints, selectedHistoryIndex = selectedIndex, timelineInsetDp = timelineInset)
+                                history = historyPoints, selectedHistoryIndex = selectedMapIndex, timelineInsetDp = timelineInset)
+                        } else Column(Modifier.fillMaxWidth().align(Alignment.TopCenter).padding(horizontal = 24.dp, vertical = 68.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Icon(Icons.Outlined.Height, null, Modifier.size(40.dp), tint = Gold)
+                            Text("상하 이동 추정 기록", fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                            Text("불러온 기록에 이 시각 근처 GPS가 없어 지도 위치를 표시하지 않아요.",
+                                color = Muted, fontSize = 13.sp, textAlign = TextAlign.Center, lineHeight = 21.sp,
+                                modifier = Modifier.testTag("map-vertical-no-location"))
                         }
                         Surface(shape = RoundedCornerShape(18.dp), color = Color.White.copy(alpha = .97f), shadowElevation = 3.dp,
                             modifier = Modifier.align(Alignment.BottomCenter).padding(12.dp).fillMaxWidth()
@@ -449,12 +454,16 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
                                     }
                                     Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
                                         Text(historyClock(eventTime(selected)), fontWeight = FontWeight.Bold, fontSize = 18.sp, modifier = Modifier.testTag("map-selected-time"))
-                                        selectedMapPoint.activityLabel()?.let { label ->
+                                        if (vertical != null) {
+                                            Text(vertical.label, fontSize = 12.sp, color = Forest, modifier = Modifier.testTag("map-selected-vertical"))
+                                            Text("상대 높이 ${if (vertical.relativeMeters >= 0) "+" else ""}${String.format(Locale.KOREA, "%.1f", vertical.relativeMeters)}m",
+                                                fontSize = 11.sp, color = Muted, modifier = Modifier.testTag("map-selected-height"))
+                                        } else selectedMapPoint?.activityLabel()?.let { label ->
                                             Text(label, fontSize = 11.sp, color = Forest, modifier = Modifier.testTag("map-selected-activity"))
                                         }
-                                        Text("${selectedIndex + 1} / ${locations.size}${if (state.historyHasMore) "+" else ""} 위치", fontSize = 11.sp, color = Muted)
+                                        Text("${selectedIndex + 1} / ${records.size}${if (state.historyHasMore) "+" else ""} ${if (records.any { it.vertical != null }) "기록" else "위치"}", fontSize = 11.sp, color = Muted)
                                     }
-                                    IconButton({ selectPoint(selectedIndex + 1) }, enabled = selectedIndex < locations.lastIndex, modifier = Modifier.size(40.dp)) {
+                                    IconButton({ selectPoint(selectedIndex + 1) }, enabled = selectedIndex < records.lastIndex, modifier = Modifier.size(40.dp)) {
                                         Icon(Icons.Outlined.ChevronRight, "다음 시각의 위치")
                                     }
                                     TextButton({
@@ -463,21 +472,25 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
                                         if (latestDay != null && latestDay != state.historyDay) actions.selectHistoryDay(latestDay)
                                     }, contentPadding = PaddingValues(horizontal = 4.dp)) { Text("최신") }
                                 }
-                                if (selectedMapPoint.positionAdjusted) {
+                                if (vertical != null && selectedMapPoint != null) {
+                                    Text("참고 GPS ${historyClock(Instant.ofEpochMilli(selectedMapPoint.measuredAtMillis).toString())} · 상하 이동 위치는 미확인",
+                                        fontSize = 10.sp, color = Muted, modifier = Modifier.testTag("map-vertical-reference"))
+                                }
+                                if (vertical == null && selectedMapPoint?.positionAdjusted == true) {
                                     Text("GPS 흔들림 보정", fontSize = 10.sp, color = Muted,
                                         modifier = Modifier.align(Alignment.CenterHorizontally).testTag("map-position-adjusted"))
                                 }
                                 Slider(value = selectedIndex.coerceAtLeast(0).toFloat(), onValueChange = { selectPoint(it.roundToInt()) },
-                                    valueRange = 0f..locations.lastIndex.coerceAtLeast(1).toFloat(),
-                                    steps = if (locations.size in 3..102) locations.size - 2 else 0, enabled = locations.size > 1,
+                                    valueRange = 0f..records.lastIndex.coerceAtLeast(1).toFloat(),
+                                    steps = if (records.size in 3..102) records.size - 2 else 0, enabled = records.size > 1,
                                     modifier = Modifier.fillMaxWidth().height(32.dp).semantics {
                                         contentDescription = "위치 기록 시간"
                                         stateDescription = historyClock(eventTime(selected))
                                     }.testTag("map-time-slider"))
                                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                    Text(displayTime(eventTime(locations.first())), fontSize = 11.sp, color = Muted)
-                                    Text("시간 막대로 위치 보기", fontSize = 11.sp, color = Forest)
-                                    Text(displayTime(eventTime(locations.last())), fontSize = 11.sp, color = Muted)
+                                    Text(displayTime(eventTime(records.first().event)), fontSize = 11.sp, color = Muted)
+                                    Text(if (records.any { it.vertical != null }) "위치·상하 이동 기록" else "시간 막대로 위치 보기", fontSize = 11.sp, color = Forest)
+                                    Text(displayTime(eventTime(records.last().event)), fontSize = 11.sp, color = Muted)
                                 }
                             }
                         }
@@ -485,16 +498,20 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
                 }
                 Text("점선은 기록된 위치를 이은 선이며 실제 이동 경로와 다를 수 있어요.", fontSize = 11.sp, color = Muted, lineHeight = 17.sp)
                 if (state.historyHasMore) Text("이 날짜의 이전 기록은 ‘이전 기록 더 보기’로 지도에 추가할 수 있어요.", fontSize = 12.sp, color = Muted, lineHeight = 18.sp)
-                val displayed = selectedMapPoint.location
-                Text(coordinateText(displayed.latitude, displayed.longitude), fontSize = 12.sp, color = Muted)
-                val rawAccuracy = historyPoints[selectedIndex].accuracy.takeIf { it.isFinite() && it >= 0.0 }
+                if (vertical != null) {
+                    vertical.evidenceLabel?.let { Text(it, fontSize = 12.sp, color = Forest, modifier = Modifier.testTag("map-vertical-evidence")) }
+                    Text("기압과 움직임으로 추정한 상하 이동이에요. 계단·엘리베이터 여부와 정확한 층수는 알 수 없어요.", fontSize = 12.sp, color = Muted, lineHeight = 19.sp)
+                }
+                val displayed = selectedMapPoint?.location
+                if (displayed != null) Text(coordinateText(displayed.latitude, displayed.longitude), fontSize = 12.sp, color = Muted)
+                val rawAccuracy = historyPoints.getOrNull(selectedMapIndex)?.accuracy?.takeIf { it.isFinite() && it >= 0.0 }
                 rawAccuracy?.let { accuracy ->
                     Text("GPS 측정 오차 약 ${accuracy.roundToInt()}m", fontSize = 12.sp, color = Muted)
                 }
-                if (selectedMapPoint.stationarySinceMillis != null && displayed.accuracy != null) {
+                if (vertical == null && selectedMapPoint?.stationarySinceMillis != null && displayed?.accuracy != null) {
                     Text("보정 표시 범위 약 ${displayed.accuracy.roundToInt()}m · 정지 기준점과의 차이 포함", fontSize = 12.sp, color = Muted)
                 }
-                val locationAge = elapsedMinutes(eventTime(selected), now)
+                val locationAge = selectedMapPoint?.let { elapsedMinutes(Instant.ofEpochMilli(it.measuredAtMillis).toString(), now) }
                 if (!state.demoMode && locationAge != null && locationAge >= 10) {
                     Text("저장된 과거 위치입니다. 현재 위치와 다를 수 있어요.", fontSize = 12.sp, color = Gold, lineHeight = 19.sp)
                 }
@@ -511,7 +528,7 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
         if (detailsExpanded) readings.groupBy { historyHour(eventTime(it)) }.forEach { (hour, events) ->
             item(key = "hour-$hour") { Text(hour, fontWeight = FontWeight.Bold, color = Forest, modifier = Modifier.padding(top = 8.dp)) }
             items(events, key = { it.id }) { event ->
-                TimelineCard(event, selected = event.id == selected?.id, onSelect = if (event.kind == "location" && locationPoint(event) != null) ({
+                TimelineCard(event, selected = event.id == selected?.id, onSelect = if (records.any { it.event.id == event.id }) ({
                     selectedRecordId = event.id
                     focusRequest++
                     scope.launch { listState.animateScrollToItem(if (state.careEnabled) 2 else 1) }
@@ -551,12 +568,13 @@ private fun TimelineCard(event: FamilyEvent, selected: Boolean = false, onSelect
                 if (vertical) {
                     val delta = event.payload.optDouble("relativeMeters", Double.NaN)
                     if (delta.isFinite()) Text("상대 높이 변화 ${if (delta >= 0) "+" else ""}${String.format(Locale.KOREA, "%.1f", delta)}m", fontSize = 12.sp, color = Muted)
+                    event.verticalMapActivity()?.evidenceLabel?.let { Text(it, fontSize = 11.sp, color = Muted) }
                 } else {
                     locationPoint(event)?.let { Text(coordinateText(it.first, it.second), fontSize = 12.sp, color = Muted) }
                     val accuracy = event.payload.optDouble("accuracy", Double.NaN)
                     if (accuracy.isFinite()) Text("위치 오차 약 ${accuracy.toInt()}m", fontSize = 12.sp, color = Muted)
                 }
-                Text(if (selected) "지도에 표시 중" else if (onSelect != null) "눌러서 지도 보기" else "높이 변화 추정", fontSize = 11.sp, color = if (selected) Forest else Muted)
+                Text(if (selected) { if (vertical) "시간 막대에서 선택됨" else "지도에 표시 중" } else if (onSelect != null) "눌러서 시각 보기" else "높이 변화 추정", fontSize = 11.sp, color = if (selected) Forest else Muted)
             }
         }
     }
@@ -881,7 +899,7 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                     Text("자동 위치 공유", fontWeight = FontWeight.Medium)
-                    Text(if (child) "가만히 있어도 약 5분마다 위치를 확인해요." else "자녀 휴대폰에서 직접 켜고 끌 수 있어요.", fontSize = 12.sp, color = Muted, lineHeight = 19.sp)
+                    Text(if (child) "이동 중 약 30초, 정지 중 약 5분마다 위치를 확인해요." else "자녀 휴대폰에서 직접 켜고 끌 수 있어요.", fontSize = 12.sp, color = Muted, lineHeight = 19.sp)
                 }
                 Switch(state.sharingEnabled, onCheckedChange = { enabled -> if (enabled) consentDialog = true else actions.setSharing(false) }, enabled = child && !state.loading, modifier = Modifier.testTag("sharing-switch"))
             }
@@ -908,7 +926,7 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
             }
             HorizontalDivider(color = Cream)
             Text("언제든 이 설정에서 위치 공유를 끌 수 있어요. 공유를 끄면 새 자동 수집을 멈춥니다.", color = Muted, fontSize = 13.sp, lineHeight = 21.sp)
-            if (child) Text("공유 설정을 켜 두면 앱을 다시 열 때 이어서 공유해요. 5분은 요청 간격이며 위치 신호·절전·통신 상태에 따라 기록과 전달이 늦어질 수 있어요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
+            if (child) Text("공유 설정을 켜 두면 앱을 다시 열 때 이어서 공유해요. 이동 중 약 30초, 정지 중 약 5분은 요청 간격이며 위치 신호·절전·통신 상태에 따라 기록과 전달이 늦어질 수 있어요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
             if (!state.demoMode && child) {
                 OutlinedButton({ ServiceNotificationSettings.open(context, ServiceNotificationSettings.Kind.LOCATION) }, Modifier.fillMaxWidth().testTag("location-notification-settings")) { Text("위치 공유 알림 표시 설정") }
                 Text("열린 Android 설정에서 이 알림의 허용을 끄면 실행 알림을 숨길 수 있어요. 대화 알림과 위치 공유는 계속 유지됩니다.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
@@ -962,7 +980,7 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
         title = { Text("자동 위치를 공유할까요?") },
         text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             if (state.careEnabled) Text("수신하는 부모님: ${state.room?.members?.filter { it.relationship in setOf("mother", "father") }?.joinToString { it.displayName }.orEmpty()}", fontWeight = FontWeight.Medium)
-            Text("움직임이 없어도 약 5분마다 새 위치를 요청해 좌표·측정 시각·정확도와 움직임 상태를 보호자에게 보냅니다. 기압계가 있으면 상대 높이 변화로 오르내림 시작과 종료도 추정해 보냅니다.", lineHeight = 22.sp)
+            Text("이동 중 약 30초, 정지 중 약 5분마다 새 위치를 요청해 좌표·측정 시각·정확도와 움직임 상태를 보호자에게 보냅니다. 기압계가 있으면 상대 높이 변화로 오르내림 시작과 종료도 추정해 보냅니다.", lineHeight = 22.sp)
             Text("화면이 꺼져 있어도 공유를 이어가며, 켠 설정은 직접 끄기 전까지 기억해 앱을 다시 열면 이어서 공유합니다. 위치 신호·절전·통신 상태에 따라 기록과 전달이 늦어질 수 있어요.", lineHeight = 22.sp)
             Text("텔레그램 봇을 통해 보호자의 앱으로 전달되며 공유 중에는 휴대폰 알림이 표시됩니다. 언제든 이 설정에서 끌 수 있어요. 보호자 휴대폰에서 메시지 수신을 켜 두어야 빠르게 받을 수 있어요.", lineHeight = 22.sp)
             if (state.demoMode) Text("지금은 체험 모드여서 실제로 수집하거나 공유하지 않아요.", color = Gold, fontWeight = FontWeight.Medium)
@@ -1053,7 +1071,7 @@ private fun FirstGuide() {
             Text("대화하면서 위치를 보낼 수 있어요", fontWeight = FontWeight.Medium)
             Text("대화의 ‘현재 위치 공유’를 누르면 그때의 위치를 한 번 부모님에게 보내요.", fontSize = 14.sp, lineHeight = 22.sp)
             Text("자동 공유는 따로 켜요", fontWeight = FontWeight.Medium)
-            Text("자녀 대화에 정확히 ‘설정’을 보내고 자동 위치 공유를 고르세요. 동의하고 켜면 움직임이 없어도 약 5분마다 새 위치를 요청해요. 화면이 꺼져 있어도 공유를 이어가고, 앱을 다시 열면 켜 둔 공유 설정을 이어가요. 필요한 위치·신체 활동·알림 권한을 요청해요.", fontSize = 14.sp, lineHeight = 22.sp)
+            Text("자녀 대화에 정확히 ‘설정’을 보내고 자동 위치 공유를 고르세요. 동의하고 켜면 이동 중 약 30초, 정지 중 약 5분마다 새 위치를 요청해요. 화면이 꺼져 있어도 공유를 이어가고, 앱을 다시 열면 켜 둔 공유 설정을 이어가요. 필요한 위치·신체 활동·알림 권한을 요청해요.", fontSize = 14.sp, lineHeight = 22.sp)
             Text("위치 신호·절전·통신 상태에 따라 기록과 전달이 늦어질 수 있어요. 자동 위치 공유 설정에서 최근 측정 시각과 전달 상태를 확인할 수 있어요.", fontSize = 13.sp, color = Muted, lineHeight = 21.sp)
             Text("공유 중임을 항상 알려요", fontWeight = FontWeight.Medium)
             Text("휴대폰 알림에서 공유 상태를 확인하고, 언제든 설정이나 알림에서 자동 공유를 끌 수 있어요.", fontSize = 14.sp, lineHeight = 22.sp)

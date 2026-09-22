@@ -173,6 +173,30 @@ class FamilyCareEngineTest {
         assertTrue(f.stores.getValue(303).pendingPackets(f.room.id).isEmpty())
     }
 
+    @Test fun `vertical step evidence survives the care wire and both parent archives without inventing GPS`() {
+        val f = Family(); f.drain()
+        val vertical = FamilyEvent(UUID.randomUUID().toString(), "vertical", JSONObject()
+            .put("phase", "ascent_finished").put("relativeMeters", 3.2)
+            .put("measuredAt", "2026-09-22T12:00:00Z").put("confidence", "estimated")
+            .put("evidence", "barometer_steps"), "child", "2026-09-22T12:00:05Z", "pending")
+        f.engine(303).emitChildEvent(vertical)
+        f.drain()
+        for (parent in listOf(101L, 202L)) {
+            val received = f.engine(parent).currentSnapshot(303)!!.snapshot.events.single { it.id == vertical.id }
+            val archived = f.stores.getValue(parent).archived.single { it.first == 303L && it.second.id == vertical.id }.second
+            for (record in listOf(received, archived)) {
+                assertEquals("barometer_steps", record.payload.getString("evidence"))
+                assertEquals("estimated", record.payload.getString("confidence"))
+                assertEquals("2026-09-22T12:00:00Z", record.measuredAt)
+                assertEquals(3.2, record.payload.getDouble("relativeMeters"), 0.0)
+                assertFalse(record.payload.has("latitude"))
+                assertFalse(record.payload.has("longitude"))
+            }
+        }
+        assertTrue(f.stores.getValue(404).archived.none { it.second.id == vertical.id })
+        assertTrue(f.stores.getValue(303).pendingPackets(f.room.id).isEmpty())
+    }
+
     @Test fun `room fingerprint roles and real Telegram sender are enforced`() {
         val f = Family(); f.drain()
         val command = FamilyCareCommand(UUID.randomUUID().toString(), f.room.id, 303, 101,

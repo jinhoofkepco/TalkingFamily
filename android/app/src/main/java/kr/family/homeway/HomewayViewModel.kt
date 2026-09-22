@@ -452,7 +452,7 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
             if(enabled) {
                 repo.sharingEnabled=true
                 TrackingService.start(getApplication())
-                notice("자동 공유를 켰어요. 움직임이 없어도 약 5분마다 새 위치를 요청해요.")
+                notice("자동 공유를 켰어요. 이동 중 약 30초, 정지 중 약 5분마다 새 위치를 요청해요.")
             } else {
                 TrackingService.stop(getApplication())
                 repo.sharingEnabled=false
