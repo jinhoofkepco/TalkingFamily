@@ -32,6 +32,8 @@ import kr.family.homeway.ui.HomewayApp
 import kr.family.homeway.ui.UiActions
 import kr.family.homeway.overlay.FloatingStarService
 import kr.family.homeway.data.TelegramReceiveService
+import kr.family.homeway.data.AppDiagnostics
+import kr.family.homeway.data.FamilyNotifications
 import kr.family.homeway.data.TelegramChatPresence
 import kr.family.homeway.data.isTelegramChatVisible
 import kr.family.homeway.tracking.TrackingService
@@ -201,6 +203,7 @@ class MainActivity : ComponentActivity() {
                 enableOverlay=::enableOverlay,
                 disableOverlay=::disableOverlay,
                 dismissOverlayPrompt={ overlayPromptVisible = false },
+                setMessageNotificationSoundEnabled=model::setMessageNotificationSoundEnabled,
                 setTelegramReceiving={ enabled ->
                     if (enabled) {
                         getSharedPreferences("homeway_receiver", MODE_PRIVATE).edit().putBoolean("enabled", true).apply()
@@ -223,12 +226,16 @@ class MainActivity : ComponentActivity() {
         }
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.RESUMED) {
-                TrackingService.runtime.collect { handleReadyState() }
+                TrackingService.runtime.collect {
+                    AppDiagnostics.record(this@MainActivity, "tracking.runtime", it.error)
+                    handleReadyState()
+                }
             }
         }
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.RESUMED) {
                 FloatingStarService.runtime.collect {
+                    AppDiagnostics.record(this@MainActivity, "overlay.runtime", it.error)
                     overlaySavedEnabled = FloatingStarService.wantsOverlay(this@MainActivity)
                     handleReadyState()
                 }
@@ -301,6 +308,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun updateChatPresence() {
+        val wasVisible = TelegramChatPresence.visible.value
         TelegramChatPresence.setVisible(chatPresenceOwner, isTelegramChatVisible(
             chatScreen = chatScreenVisible,
             resumed = chatPresenceResumed,
@@ -308,6 +316,7 @@ class MainActivity : ComponentActivity() {
             keyguardLocked = getSystemService(KeyguardManager::class.java).isKeyguardLocked,
             closing = collapsing || waitingForOverlayPermission,
         ))
+        if (!wasVisible && TelegramChatPresence.visible.value) FamilyNotifications.onChatOpened(this)
     }
 
     override fun onStop() {
@@ -372,6 +381,10 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun dump(prefix: String, fd: FileDescriptor?, writer: PrintWriter, args: Array<out String>?) {
+        if (args?.contains("--diagnostics") == true) {
+            AppDiagnostics.dump(this, writer)
+            return
+        }
         if (args?.contains("--overlay") == true) {
             FloatingStarService.dumpDiagnostics(this, writer)
             return

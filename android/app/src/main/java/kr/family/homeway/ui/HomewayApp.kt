@@ -265,15 +265,6 @@ private fun FamilyHome(state: UiState, actions: UiActions, onChatVisibilityChang
                     Text("체험 모드 · 실제 전송과 위치 공유는 하지 않아요", Modifier.fillMaxWidth().background(WarmGold).padding(horizontal = 20.dp, vertical = 8.dp), color = Ink, fontSize = 11.sp)
                 }
                 if (state.loading) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Forest)
-                if (state.error != null) {
-                    Row(
-                        Modifier.fillMaxWidth().background(Color(0xFFFCE9E4)).padding(start = 20.dp, end = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(state.error, Modifier.weight(1f).padding(vertical = 10.dp), fontSize = 13.sp, lineHeight = 19.sp)
-                        IconButton(actions.clearNotice) { Icon(Icons.Outlined.Close, "안내 닫기", Modifier.size(18.dp)) }
-                    }
-                }
             }
         },
         bottomBar = {
@@ -300,7 +291,7 @@ private fun FamilyHome(state: UiState, actions: UiActions, onChatVisibilityChang
     }
     if (popup.isNotEmpty()) {
         val back = when (popup) {
-            "settings-location", "settings-info", "settings-family", "settings-overlay", "settings-room" -> "settings-menu"
+            "settings-location", "settings-info", "settings-family", "settings-overlay", "settings-room", "settings-notifications" -> "settings-menu"
             "first-guide" -> "settings-family"
             "reward-editor" -> "reward-manager"
             "reward-select", "reward-confirm" -> "stickers"
@@ -313,6 +304,7 @@ private fun FamilyHome(state: UiState, actions: UiActions, onChatVisibilityChang
             "settings-info" -> "공유 정보 안내"
             "settings-family" -> "가족 연결"
             "settings-overlay" -> "별 아이콘"
+            "settings-notifications" -> "메시지 알림"
             "settings-room" -> "가족 단체방"
             "first-guide" -> "처음 함께 읽기"
             "reward-manager" -> "우리의 약속"
@@ -337,7 +329,9 @@ private fun FamilyHome(state: UiState, actions: UiActions, onChatVisibilityChang
                 }
                 HorizontalDivider(color = Color(0xFFE6E8DF))
                 if (state.loading) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Forest)
-                state.error?.let { Text(it, Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), color = MaterialTheme.colorScheme.error, fontSize = 13.sp) }
+                if (popup in setOf("settings-family", "settings-room", "settings-location", "settings-overlay")) {
+                    state.error?.let { Text(it, Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), color = MaterialTheme.colorScheme.error, fontSize = 13.sp) }
+                }
                 Box(Modifier.weight(1f)) {
                     when (popup) {
                         "stickers" -> StickerScreen(state, actions, popup = true,
@@ -350,7 +344,7 @@ private fun FamilyHome(state: UiState, actions: UiActions, onChatVisibilityChang
                             openReceiveSettings = { popup = "settings-family" },
                             openOverlaySettings = { popup = "settings-overlay" },
                         )
-                        "settings-location", "settings-info", "settings-family", "settings-overlay" -> SettingsScreen(state, actions, popup.removePrefix("settings-")) { popup = "first-guide" }
+                        "settings-location", "settings-info", "settings-family", "settings-overlay", "settings-notifications" -> SettingsScreen(state, actions, popup.removePrefix("settings-")) { popup = "first-guide" }
                         "first-guide" -> FirstGuide()
                         "reward-manager" -> RewardManager(state,
                             add = { selectedRewardId = null; popup = "reward-editor" },
@@ -873,6 +867,7 @@ private fun SettingsMenu(state: UiState, select: (String) -> Unit) {
             SettingsMenuItem("공유 정보 안내", "공유하는 정보와 기록 보관", Icons.Outlined.Shield, "settings-info-menu-item") { select("settings-info") }
         }
         SettingsMenuItem(if (state.paired || state.demoMode || state.careEnabled) "가족 연결" else "메시지 수신", "연결 상태 · 수신 설정", Icons.Outlined.FavoriteBorder, "settings-family-menu-item") { select("settings-family") }
+        SettingsMenuItem("메시지 알림", if (state.messageNotificationSoundEnabled) "소리 켜짐" else "무음", Icons.Outlined.NotificationsNone, "settings-notifications-menu-item") { select("settings-notifications") }
         SettingsMenuItem("별 아이콘", when {
             state.overlayEnabled && state.overlayPermissionGranted -> "켜짐 · 다른 앱에서 대화 열기"
             state.overlaySavedEnabled -> "다시 표시 대기"
@@ -902,6 +897,18 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
     val child = state.role == "child"
     val context = LocalContext.current
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+        if (section == "notifications") SectionCard {
+            Text("대화 화면에서는 알리지 않아요. 밖에서는 알림 하나를 갱신해요.", fontSize = 14.sp, lineHeight = 22.sp)
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    Text("메시지 알림 소리", fontWeight = FontWeight.Medium)
+                    Text(if (state.messageNotificationSoundEnabled) "새 메시지를 소리로 알려요." else "소리 없이 조용히 알려요.", fontSize = 12.sp, color = Muted)
+                }
+                Switch(state.messageNotificationSoundEnabled, actions.setMessageNotificationSoundEnabled,
+                    modifier = Modifier.testTag("message-notification-sound-switch").semantics { contentDescription = "메시지 알림 소리" })
+            }
+            Text("기본은 무음이에요. 이 설정을 바꿔도 메시지 수신과 위치 공유는 그대로 유지돼요.", fontSize = 12.sp, color = Muted, lineHeight = 19.sp)
+        }
         if (section == "location" && (state.paired || state.demoMode || state.careEnabled)) SectionCard {
             if (state.careEnabled) {
                 state.careChildren.firstOrNull { it.botId == state.selectedChildBotId }?.let { Text("${it.displayName}의 위치 공유", fontWeight = FontWeight.Medium) }

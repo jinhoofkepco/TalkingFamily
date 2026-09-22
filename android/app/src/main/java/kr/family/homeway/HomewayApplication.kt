@@ -1,16 +1,13 @@
 package kr.family.homeway
 
 import android.app.Application
-import android.app.NotificationChannel
-import android.app.NotificationManager
 import kr.family.homeway.data.AppRepository
+import kr.family.homeway.data.FamilyNotifications
 
 class HomewayApplication : Application() {
     override fun onCreate() {
         super.onCreate()
-        getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel("family_messages", "가족 대화와 위치 알림", NotificationManager.IMPORTANCE_HIGH)
-        )
+        FamilyNotifications.initialize(this)
         val repo = AppRepository(this)
         // Preserve the child's saved choice. Only a system sticky-service restart or a
         // visible Activity can resume it; Application never launches location work.

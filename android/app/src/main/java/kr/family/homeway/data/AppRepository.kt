@@ -129,7 +129,11 @@ class AppRepository internal constructor(context: Context, private val clientFac
         get() = prefs.getBoolean("sharingEnabled", false)
         set(value) { prefs.edit().putBoolean("sharingEnabled", value).commit() }
     val trackingStatus: String get() = prefs.getString("trackingStatus", "자동 위치 공유 꺼짐")!!
-    fun noteTrackingStatus(message: String) { prefs.edit().putString("trackingStatus", message).apply() }
+    fun noteTrackingStatus(message: String) {
+        prefs.edit().putString("trackingStatus", message).apply()
+        // Per-fix timestamps already belong to movement history, not diagnostics.
+        if (!message.startsWith("자동 공유 중 · 마지막 위치 저장")) AppDiagnostics.record(app, "tracking.status", message)
+    }
 
     suspend fun configure(role: String, botToken: String, peerUsername: String): FamilySnapshot = withContext(Dispatchers.IO) {
         require(role in listOf("child", "guardian")) { "사용자를 선택해 주세요." }
@@ -228,7 +232,10 @@ class AppRepository internal constructor(context: Context, private val clientFac
         val familyChat = room?.let { active -> FamilyChatExchange(client, store.familyChat, active, selfBotId,
             lock = dataLock, checkActive = { coroutineContext.ensureActive() },
             onReceived = { FamilyNotifications.received(app, roomEvent(it, active)) },
-            onPeerFailure = { id, failure -> prefs.edit().putString("roomDeliveryError_${active.id}_$id", failure.message).commit() }) }
+            onPeerFailure = { id, failure ->
+                prefs.edit().putString("roomDeliveryError_${active.id}_$id", failure.message).commit()
+                AppDiagnostics.record(app, "telegram.room_delivery", failure.message)
+            }) }
         try {
             val exchange = TelegramExchange(client, store, peerId, peerRole, lock = dataLock,
                 checkActive = { coroutineContext.ensureActive() },
@@ -241,7 +248,10 @@ class AppRepository internal constructor(context: Context, private val clientFac
                 onPollCompleted = { poll?.let(TelegramChatReceiveCadence::onPollCompleted) },
                 pollAllowed = { !scheduled || (poll != null && TelegramChatReceiveCadence.isCurrent(poll)) },
                 familyCare = if (careEnabled) careEngine(client = client, checkActive = { coroutineContext.ensureActive() }) else null,
-                onLegacyFailure = { prefs.edit().putString("legacyDeliveryError", it.message).commit() })
+                onLegacyFailure = {
+                    prefs.edit().putString("legacyDeliveryError", it.message).commit()
+                    AppDiagnostics.record(app, "telegram.private_delivery", it.message)
+                })
             val exchanged = if (poll == null) exchange.flushOutgoing() else exchange.synchronize(
                 if (!scheduled) timeout else if (poll.visible) timeout.coerceIn(0, TelegramChatReceiveSchedule.FOREGROUND_POLL_SECONDS) else 0)
             if (exchanged) prefs.edit().apply {
@@ -250,9 +260,11 @@ class AppRepository internal constructor(context: Context, private val clientFac
             }.apply()
         } catch (e: TelegramException) {
             prefs.edit().putString("connectionError", e.message).apply()
+            AppDiagnostics.record(app, "telegram.connection", e.message)
             throw e
         } catch (e: TelegramSyncException) {
             prefs.edit().putString("connectionError", e.message).apply()
+            AppDiagnostics.record(app, "telegram.sync", e.message)
             throw e
         } finally {
             publishChanges()

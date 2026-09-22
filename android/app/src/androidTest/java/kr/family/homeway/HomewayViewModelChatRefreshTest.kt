@@ -36,6 +36,7 @@ class HomewayViewModelChatRefreshTest {
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
     private val context get() = instrumentation.targetContext
     private val prefs get() = context.getSharedPreferences("homeway_settings", Context.MODE_PRIVATE)
+    private val notificationPrefs get() = context.getSharedPreferences("family_notifications", Context.MODE_PRIVATE)
     private val store get() = LocalStore.get(context)
     private val models = ViewModelStore()
     private lateinit var fake: PausedTelegram
@@ -55,6 +56,7 @@ class HomewayViewModelChatRefreshTest {
         WorkManager.getInstance(context).cancelAllWork().result.get(10, TimeUnit.SECONDS)
         store.transaction { store.clear() }
         prefs.edit().clear().commit()
+        notificationPrefs.edit().clear().commit()
         TokenVault(context).clear()
         context.getSharedPreferences("homeway_receiver", Context.MODE_PRIVATE).edit().putBoolean("enabled", false).commit()
         prepared = true
@@ -83,6 +85,7 @@ class HomewayViewModelChatRefreshTest {
         WorkManager.getInstance(context).cancelAllWork().result.get(10, TimeUnit.SECONDS)
         store.transaction { store.clear() }
         prefs.edit().clear().commit()
+        notificationPrefs.edit().clear().commit()
         TokenVault(context).clear()
     }
 
@@ -152,6 +155,34 @@ class HomewayViewModelChatRefreshTest {
         assertEquals(1, fake.sentChats.get())
         assertEquals(0L, store.meta("offset"))
         assertTrue("Only elapsed time may change the receive deadline", after in 1..before)
+    }
+
+    @Test fun notificationSoundDefaultsOffAndBothChoicesSurviveViewModelRecreation() {
+        assertFalse(model.state.value.messageNotificationSoundEnabled)
+        assertFalse(FamilyNotifications.soundEnabled(context))
+
+        instrumentation.runOnMainSync { model.setMessageNotificationSoundEnabled(true) }
+        assertTrue(model.state.value.messageNotificationSoundEnabled)
+        assertTrue(notificationPrefs.getBoolean("sound_enabled", false))
+        recreateModel()
+        assertTrue("A new ViewModel must reload the saved ON choice", model.state.value.messageNotificationSoundEnabled)
+
+        instrumentation.runOnMainSync { model.setMessageNotificationSoundEnabled(false) }
+        assertFalse(model.state.value.messageNotificationSoundEnabled)
+        assertFalse(notificationPrefs.getBoolean("sound_enabled", true))
+        recreateModel()
+        assertFalse("A new ViewModel must reload the saved OFF choice", model.state.value.messageNotificationSoundEnabled)
+        assertEquals("Changing notification sound must not poll Telegram", 0, fake.pollRequests.get())
+        assertEquals("Changing notification sound must not send a message", 0, fake.sentChats.get())
+    }
+
+    private fun recreateModel() {
+        instrumentation.runOnMainSync {
+            models.clear()
+            val reopened = AppRepository(context) { token -> TelegramClient(token, fake) }
+            model = HomewayViewModel(context.applicationContext as Application, reopened)
+            models.put("chat-refresh", model)
+        }
     }
 
     private suspend fun awaitState(predicate: () -> Boolean) = withTimeout(5_000) {

@@ -4,6 +4,8 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kr.family.homeway.data.AppRepository
+import kr.family.homeway.data.AppDiagnostics
+import kr.family.homeway.data.FamilyNotifications
 import kr.family.homeway.data.DemoStore
 import kr.family.homeway.data.FamilySnapshot
 import kr.family.homeway.data.FamilyEvent
@@ -20,6 +22,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -55,6 +59,13 @@ class HomewayViewModel internal constructor(app: Application, private val repo: 
     init {
         val snapshot = if(repo.demoMode) demo.read() else repo.cached()
         render(snapshot)
+        viewModelScope.launch {
+            state.map { it.error }.distinctUntilChanged().collect {
+                // Errors may include a family display name or an arbitrary exception payload.
+                // Detailed, authored transport diagnostics are recorded at their safe call sites.
+                if (it != null) AppDiagnostics.record(getApplication(), "ui.error", "화면 동작 오류가 발생했어요.")
+            }
+        }
         viewModelScope.launch {
             // The receive service commits locally before notifying. Rendering those rows must
             // never wait for its remaining ACKs, outgoing requests, or next long poll.
@@ -92,7 +103,8 @@ class HomewayViewModel internal constructor(app: Application, private val repo: 
             careReady=care != null, carePending=repo.carePending(selectedChild), careStatus=repo.careStatus(selectedChild),
             sharingEnabled=if(repo.isChild && !repo.demoMode) repo.sharingEnabled else visible.sharingEnabled,
             trackingStatus=if(repo.demoMode) "체험 기록 · 실제 위치를 수집하지 않아요" else repo.trackingStatus,
-            transport=snapshot.transport, error=error ?: repo.connectionError
+            transport=snapshot.transport, error=error ?: repo.connectionError,
+            messageNotificationSoundEnabled=FamilyNotifications.soundEnabled(getApplication())
         ) }
         if (!repo.demoMode && repo.paired) refreshPrivateChatHistory(force = forcePrivateChat)
         if (!repo.demoMode && activeRoom != null) refreshRoomHistory(force = forceRoomChat)
@@ -509,7 +521,12 @@ class HomewayViewModel internal constructor(app: Application, private val repo: 
     }
     fun clearNotice() { mutableState.update { it.copy(notice=null,error=null) } }
     fun showError(message:String) { mutableState.update { it.copy(error=message,loading=false,notice=null) } }
-    private fun notice(message:String) { mutableState.update { it.copy(notice=message) } }
+    private fun notice(message:String) { AppDiagnostics.record(getApplication(), "ui.notice", message) }
+    fun setMessageNotificationSoundEnabled(enabled: Boolean) {
+        FamilyNotifications.setSoundEnabled(getApplication(), enabled)
+        mutableState.update { it.copy(messageNotificationSoundEnabled = FamilyNotifications.soundEnabled(getApplication())) }
+        AppDiagnostics.record(getApplication(), "notification.preference", if (enabled) "메시지 알림 소리 켜짐" else "메시지 알림 소리 꺼짐")
+    }
     private fun perform(block:suspend () -> Unit) {
         if(mutableState.value.loading) return
         mutableState.update { it.copy(loading=true,error=null) }

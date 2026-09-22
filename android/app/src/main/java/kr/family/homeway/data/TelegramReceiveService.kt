@@ -79,6 +79,7 @@ class TelegramReceiveService : Service() {
                             (SystemClock.elapsedRealtime() - startedAt)).coerceAtLeast(0)
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (_: Exception) {
+                    AppDiagnostics.record(this@TelegramReceiveService, "telegram.receiver", "인터넷과 봇 설정을 확인해 주세요. 연결을 다시 시도하고 있어요.")
                     state.value = ReceiveState(true, "인터넷과 봇 설정을 확인해 주세요. 연결을 다시 시도하고 있어요.")
                     waitMillis = repo.synchronizationRetryDelayMillis().takeIf { it > 0 }
                         ?: TelegramChatReceiveSchedule.ERROR_RETRY_MILLIS
