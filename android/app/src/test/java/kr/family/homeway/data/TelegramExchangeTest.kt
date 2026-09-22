@@ -15,6 +15,82 @@ class TelegramExchangeTest {
     private fun award() = event("sticker_award", JSONObject().put("count", 1).put("reason", "잘했어요"))
     private fun chat(text: String, role: String) = event("chat", JSONObject().put("text", text), role)
 
+    @Test fun `new local message interrupts idle poll and sends without error backoff`() {
+        val store = MemoryStore()
+        val message = chat("바로 전송", "child")
+        val methods = mutableListOf<String>()
+        val client = TelegramClient("101:${"a".repeat(32)}") { _, method, raw, timeout ->
+            methods += method
+            if (method == "getUpdates") {
+                assertEquals(10, timeout)
+                store.enqueue(message)
+                TelegramPollWakeup.signal()
+                throw TelegramPollInterruptedException()
+            }
+            assertEquals("sendMessage", method)
+            assertEquals(message.id, JSONObject(JSONObject(raw).getString("text")).getJSONObject("event").getString("id"))
+            TelegramHttpResponse(200, """{"ok":true,"result":{}}""")
+        }
+        assertTrue(TelegramExchange(client, store, 202, "guardian").synchronize(10))
+        assertEquals(listOf("getUpdates", "sendMessage"), methods)
+        assertEquals(0L, store.meta("retryAfter"))
+        assertEquals(0L, store.meta("offset"))
+        assertTrue(store.meta("sentAt") > 0)
+    }
+
+    @Test fun `ready send skips long wait but unacknowledged head keeps idle long polling`() {
+        val store = MemoryStore()
+        store.enqueue(chat("첫 대화", "child"))
+        val timeouts = mutableListOf<Int>()
+        val client = TelegramClient("101:${"a".repeat(32)}") { _, method, _, timeout ->
+            if (method == "getUpdates") {
+                timeouts += timeout
+                TelegramHttpResponse(200, """{"ok":true,"result":[]}""")
+            } else TelegramHttpResponse(200, """{"ok":true,"result":{}}""")
+        }
+        var time = 1_000_000L
+        val exchange = TelegramExchange(client, store, 202, "guardian", now = { time })
+        exchange.synchronize(10)
+        exchange.synchronize(10)
+        time += 30_001
+        exchange.synchronize(10)
+        assertEquals(listOf(0, 10, 0), timeouts)
+    }
+
+    @Test fun `committed state reaches UI before notification and failing receipt HTTP`() {
+        val store = MemoryStore()
+        val message = chat("수신 즉시 표시", "guardian")
+        val order = mutableListOf<String>()
+        val update = JSONObject().put("update_id", 1).put("message", JSONObject()
+            .put("from", JSONObject().put("id", 202).put("is_bot", true))
+            .put("chat", JSONObject().put("id", 202).put("type", "private"))
+            .put("text", TelegramProtocol.event(message)))
+        val client = TelegramClient("101:${"a".repeat(32)}") { _, method, _, _ ->
+            if (method == "getUpdates") TelegramHttpResponse(200,
+                JSONObject().put("ok", true).put("result", JSONArray().put(update)).toString())
+            else {
+                order += "receipt HTTP"
+                TelegramHttpResponse(403, """{"ok":false,"error_code":403}""")
+            }
+        }
+        val exchange = TelegramExchange(client, store, 202, "guardian",
+            onCommitted = {
+                assertEquals(2L, store.meta("offset"))
+                assertEquals(message.id, FamilySnapshot.parse(store.cached()).events.single().id)
+                order += "UI"
+            }, onReceived = { order += "notification" })
+        assertThrows(TelegramException::class.java) { exchange.synchronize() }
+        assertEquals(listOf("UI", "notification", "receipt HTTP"), order)
+    }
+
+    @Test fun `legacy receipt replay has bounded work per exchange`() {
+        val family = Family()
+        repeat(10) { family.child.queueReceipt(UUID.randomUUID().toString()) }
+        family.syncChild()
+        assertEquals(6, family.child.receipts().size)
+        assertEquals(4, family.telegram.sent.count { it.type == "ack" })
+    }
+
     @Test fun `ACK keeps retained location and heartbeat received after timeline truncation and restart`() {
         val measuredAt = "2026-09-21T06:00:00Z"
         val samples = listOf(

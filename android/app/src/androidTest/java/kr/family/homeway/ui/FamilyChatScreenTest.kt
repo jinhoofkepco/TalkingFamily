@@ -111,6 +111,34 @@ class FamilyChatScreenTest {
         compose.onNodeWithTag("chat-new-messages").assertDoesNotExist()
     }
 
+    @Test fun incomingBatchAtLatestAppearsWithoutAnExtraTap() {
+        val current = mutableStateOf(state().copy(roomEvents = (0 until 40).map(::message)))
+        compose.setContent {
+            MaterialTheme { FamilyChatScreen(current.value, actions(), {}, {}, {}) }
+        }
+        compose.onNodeWithTag("chat-message-message-39").assertIsDisplayed()
+        compose.runOnIdle {
+            current.value = current.value.copy(roomEvents = current.value.roomEvents + (40 until 45).map(::message))
+        }
+        compose.onNodeWithTag("chat-message-message-44").assertIsDisplayed()
+        compose.onNodeWithTag("chat-new-messages").assertDoesNotExist()
+    }
+
+    @Test fun deliveryAcknowledgementUpdatesExistingBubbleWithoutANewMessage() {
+        val sent = message(2).copy(delivery = "pending", deliveredTo = 0, recipientCount = 3)
+        val current = mutableStateOf(state().copy(roomEvents = listOf(sent)))
+        compose.setContent {
+            MaterialTheme { FamilyChatScreen(current.value, actions(), {}, {}, {}) }
+        }
+        compose.onNodeWithText("0/3 전달").assertIsDisplayed()
+        compose.runOnIdle {
+            current.value = current.value.copy(roomEvents = listOf(sent.copy(delivery = "relayed", deliveredTo = 3)))
+        }
+        compose.onNodeWithText("3/3 전달").assertIsDisplayed()
+        compose.onNodeWithText("0/3 전달").assertDoesNotExist()
+        compose.onNodeWithTag("chat-new-messages").assertDoesNotExist()
+    }
+
     @Test fun roomOnlyMemberCannotAccidentallySendPrivateLocationOrOpenPraise() {
         compose.setContent {
             MaterialTheme { FamilyChatScreen(state().copy(paired = false), actions(), {}, {}, {}) }

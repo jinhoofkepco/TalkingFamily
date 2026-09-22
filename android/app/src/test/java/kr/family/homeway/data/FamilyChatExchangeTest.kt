@@ -23,6 +23,87 @@ class FamilyChatExchangeTest {
         assertEquals(12, family.notifications.size)
     }
 
+    @Test fun `four phones resolve unknown siblings after only the father created their chats`() {
+        val family = Family()
+        family.startWithOnlyCreatorConnected()
+        val messages = family.ids.map { family.enqueue(it, "처음 보내는 가족 메시지 $it") }
+
+        // The creator's existing chats do not make the son's numeric daughter ID usable.
+        assertFalse(303L to 404L in family.telegram.knownPeers)
+        family.sync(303)
+        family.drain()
+
+        assertTrue(303L to "@member404_bot" in family.telegram.resolutionRequests)
+        assertTrue(family.telegram.resolutionRequests.none { it.first == 202L })
+        assertTrue(family.telegram.sendRequests.all { it.target is Number })
+        for (id in family.ids) {
+            val rows = family.stores.getValue(id).chatHistory(family.room.id).messages
+            assertEquals(messages.map { it.id }.toSet(), rows.map { it.id }.toSet())
+            assertEquals(3, rows.single { it.senderId == id }.deliveredCount)
+            assertTrue(family.stores.getValue(id).pendingChatDeliveries(family.room.id).isEmpty())
+            assertTrue(family.stores.getValue(id).chatReceipts(family.room.id).isEmpty())
+        }
+        assertEquals(12, family.notifications.size)
+        assertEquals(12, family.notifications.distinct().size)
+    }
+
+    @Test fun `unresolvable first family member does not block later recipients and recovers`() {
+        val family = Family()
+        family.startWithOnlyCreatorConnected()
+        family.telegram.unresolvableUsernames += "@member101_bot"
+        val first = family.enqueue(303, "엄마 연결을 기다려도")
+        val second = family.enqueue(303, "아빠와 딸에게 계속 전달")
+        family.drain()
+
+        assertTrue(303L to "@member101_bot" in family.telegram.resolutionRequests)
+        for (id in listOf(202L, 404L)) {
+            assertEquals(setOf(first.id, second.id),
+                family.stores.getValue(id).chatHistory(family.room.id).messages.map { it.id }.toSet())
+        }
+        val sender = family.stores.getValue(303)
+        assertEquals(2, sender.chatMessage(family.room.id, first.id)?.deliveredCount)
+        assertEquals(2, sender.chatMessage(family.room.id, second.id)?.deliveredCount)
+        assertEquals(2, sender.pendingChatDeliveries(family.room.id).size)
+        assertTrue(sender.pendingChatDeliveries(family.room.id).all { it.peerId == 101L })
+        assertTrue(family.stores.getValue(101).chatHistory(family.room.id).messages.isEmpty())
+
+        family.telegram.unresolvableUsernames.clear()
+        family.time += 31_000
+        family.drain()
+
+        assertTrue(sender.pendingChatDeliveries(family.room.id).isEmpty())
+        assertEquals(3, sender.chatMessage(family.room.id, first.id)?.deliveredCount)
+        assertEquals(3, sender.chatMessage(family.room.id, second.id)?.deliveredCount)
+        assertEquals(6, family.notifications.size)
+        assertEquals(6, family.notifications.distinct().size)
+    }
+
+    @Test fun `reassigned daughter username cannot receive family text or complete delivery`() {
+        val family = Family()
+        family.startWithOnlyCreatorConnected()
+        family.telegram.usernameIds["@member404_bot"] = 999L
+        val message = family.enqueue(303, "가족에게만 보내는 원문")
+        family.drain()
+
+        assertTrue(303L to "@member404_bot" in family.telegram.resolutionRequests)
+        assertTrue(family.telegram.sendRequests.all { it.target is Number })
+        assertFalse(999L in family.telegram.destinations)
+        assertTrue(303L to 999L in family.telegram.knownPeers)
+        assertEquals(1, family.telegram.sendRequests.count {
+            it.sender == 303L && (it.target as? Number)?.toLong() == 404L
+        })
+        assertFalse(303L to 404L in family.telegram.knownPeers)
+        for (id in listOf(101L, 202L)) {
+            assertEquals(message.text, family.stores.getValue(id).chatMessage(family.room.id, message.id)?.text)
+        }
+        val sender = family.stores.getValue(303)
+        assertEquals(message.text, sender.chatMessage(family.room.id, message.id)?.text)
+        assertEquals(2, sender.chatMessage(family.room.id, message.id)?.deliveredCount)
+        assertEquals(listOf(404L), sender.pendingChatDeliveries(family.room.id).map { it.peerId })
+        assertNull(family.stores.getValue(404).chatMessage(family.room.id, message.id))
+        assertTrue(family.notifications.none { it.first == 404L || it.first == 999L })
+    }
+
     @Test fun `one blocked recipient cannot block later messages to other people or legacy location`() {
         val family = Family()
         family.telegram.blockedRecipient = 404
@@ -188,6 +269,13 @@ class FamilyChatExchangeTest {
             if (id == 101L) "guardian" else "child", now = { time }, familyChat = channel(id)).synchronize()
         fun drain() { repeat(12) { ids.forEach { sync(it) }; time += 1001 } }
         fun restart(id: Long) { stores[id] = MemoryStore(stores.getValue(id).saved()) }
+        fun startWithOnlyCreatorConnected() {
+            telegram.requireKnownRecipients = true
+            ids.filter { it != 202L }.forEach { peer ->
+                telegram.knownPeers += 202L to peer
+                telegram.knownPeers += peer to 202L
+            }
+        }
     }
 
     private class MemoryStore(saved: String? = null) : TelegramExchangeStore, FamilyChatStore {
@@ -250,15 +338,24 @@ class FamilyChatExchangeTest {
     }
 
     private class FakeTelegram : TelegramHttpTransport {
+        data class SendRequest(val sender: Long, val target: Any, val text: String)
         var calls = 0
         var blockedRecipient: Long? = null
         var loseChatResponseFrom: Long? = null
         var dropAckFrom: Long? = null
         var rateLimitSendFrom: Long? = null
+        var requireKnownRecipients = false
+        val knownPeers = mutableSetOf<Pair<Long, Long>>()
+        val usernameIds = listOf(101L, 202L, 303L, 404L).associateBy { "@member${it}_bot" }.toMutableMap()
+        val unresolvableUsernames = mutableSetOf<String>()
+        val resolutionRequests = mutableListOf<Pair<Long, String>>()
+        val sendRequests = mutableListOf<SendRequest>()
         val destinations = mutableListOf<Long>()
         private val inbox = mutableMapOf<Long, MutableList<JSONObject>>()
         private val nextUpdate = mutableMapOf<Long, Long>()
         fun inject(from: Long, to: Long, text: String) {
+            // Receiving a private message also establishes the recipient's chat with its sender.
+            knownPeers += to to from
             val id = nextUpdate.getOrDefault(to, 1L)
             nextUpdate[to] = id + 1
             inbox.getOrPut(to) { mutableListOf() }.add(JSONObject().put("update_id", id).put("message", JSONObject().put("text", text)
@@ -274,12 +371,23 @@ class FamilyChatExchangeTest {
                     queue.removeAll { it.getLong("update_id") < body.getLong("offset") }
                     ok(JSONArray(queue.take(100)))
                 }
+                "getChat" -> {
+                    val username = body.getString("chat_id")
+                    resolutionRequests += from to username
+                    val resolvedId = usernameIds[username]
+                    if (username in unresolvableUsernames || resolvedId == null) return chatNotFound()
+                    knownPeers += from to resolvedId
+                    ok(JSONObject().put("id", resolvedId).put("type", "private")
+                        .put("username", username.removePrefix("@")))
+                }
                 "sendMessage" -> {
+                    sendRequests += SendRequest(from, body.get("chat_id"), body.getString("text"))
                     val to = body.getLong("chat_id")
                     destinations += to
                     if (rateLimitSendFrom == from) { rateLimitSendFrom = null; return TelegramHttpResponse(429,
                         JSONObject().put("ok", false).put("error_code", 429).put("parameters", JSONObject().put("retry_after", 30)).toString()) }
                     if (blockedRecipient == to) return TelegramHttpResponse(403, "{\"ok\":false,\"error_code\":403}")
+                    if (requireKnownRecipients && (from to to) !in knownPeers) return chatNotFound()
                     val text = body.getString("text")
                     val type = JSONObject(text).getString("type")
                     if (type == "chat_ack" && dropAckFrom == from) dropAckFrom = null else inject(from, to, text)
@@ -289,6 +397,8 @@ class FamilyChatExchangeTest {
                 else -> error("Unexpected method $method")
             }
         }
+        private fun chatNotFound() = TelegramHttpResponse(400, JSONObject().put("ok", false).put("error_code", 400)
+            .put("description", "Bad Request: chat not found").toString())
         private fun ok(result: Any) = TelegramHttpResponse(200, JSONObject().put("ok", true).put("result", result).toString())
     }
 }

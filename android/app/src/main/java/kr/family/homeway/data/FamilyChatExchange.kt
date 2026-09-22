@@ -55,6 +55,16 @@ class FamilyChatExchange(
     /** Must run only after the receiving transaction has committed successfully. */
     fun notifyReceived(message: FamilyChatMessage) { onReceived(message) }
 
+    fun hasReadyWork(): Boolean = synchronized(lock) {
+        room.members.any { member ->
+            member.botId != ownBotId && store.chatPeerRetryAfter(room.id, member.botId) <= now() &&
+                (store.chatReceipts(room.id).any { it.peerId == member.botId } ||
+                    store.pendingChatDeliveries(room.id).firstOrNull { it.peerId == member.botId }?.let {
+                        it.sentAt == 0L || now() - it.sentAt >= 30_000
+                    } == true)
+        }
+    }
+
     /** Each recipient has an independent FIFO and retry deadline; no offline family member blocks another. */
     fun flush() {
         for (member in room.members.filter { it.botId != ownBotId }) {
@@ -66,7 +76,7 @@ class FamilyChatExchange(
                 val receipt = synchronized(lock) { store.chatReceipts(room.id).firstOrNull { it.peerId == peer } }
                 if (receipt != null) {
                     checkActive()
-                    client.send(peer.toString(), FamilyChatProtocol.receipt(receipt))
+                    client.sendToFamilyMember(member, FamilyChatProtocol.receipt(receipt), checkActive)
                     synchronized(lock) { store.transaction { store.removeChatReceipt(receipt) } }
                 }
                 val delivery = synchronized(lock) { store.pendingChatDeliveries(room.id).firstOrNull { it.peerId == peer } }
@@ -78,7 +88,7 @@ class FamilyChatExchange(
                         store.markChatSent(room.id, delivery.messageId, peer, now().coerceAtLeast(1))
                     } }
                     // Persist before HTTP: a lost response must still permit the later authenticated ACK.
-                    client.send(peer.toString(), FamilyChatProtocol.message(message))
+                    client.sendToFamilyMember(member, FamilyChatProtocol.message(message), checkActive)
                 }
             } catch (error: TelegramException) {
                 // Rate limits and bot credential/consumer failures are global, handled by TelegramExchange.

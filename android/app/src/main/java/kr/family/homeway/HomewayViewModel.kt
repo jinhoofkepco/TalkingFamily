@@ -19,6 +19,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -28,8 +29,8 @@ import java.time.LocalDate
 import java.time.ZoneId
 import java.util.UUID
 
-class HomewayViewModel(app: Application) : AndroidViewModel(app) {
-    private val repo = AppRepository(app)
+class HomewayViewModel internal constructor(app: Application, private val repo: AppRepository) : AndroidViewModel(app) {
+    constructor(app: Application) : this(app, AppRepository(app))
     private val demo = DemoStore(app)
     private val mutableState = MutableStateFlow(UiState())
     val state = mutableState.asStateFlow()
@@ -45,13 +46,20 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
     private var privateChatGeneration = 0
     private var privateChatContext: List<String>? = null
     private var privateChatEvents: List<FamilyEvent> = emptyList()
+    private var privateChatRefreshPending = false
     private var roomHistoryJob: Job? = null
     private var roomHistoryCursor: FamilyChatCursor? = null
     private var roomHistoryGeneration = 0
     private var roomHistoryContext: String? = null
+    private var roomHistoryRefreshPending = false
     init {
         val snapshot = if(repo.demoMode) demo.read() else repo.cached()
         render(snapshot)
+        viewModelScope.launch {
+            // The receive service commits locally before notifying. Rendering those rows must
+            // never wait for its remaining ACKs, outgoing requests, or next long poll.
+            repo.changes.collect { refreshCached() }
+        }
         viewModelScope.launch {
             runCatching { repo.prepareCare() }.onFailure { showError(it.message ?: "가족 기록을 준비하지 못했어요.") }
             render(if (repo.demoMode) demo.read() else repo.cached())
@@ -124,9 +132,13 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         if (!repo.demoMode) return
         perform { repo.startDemo(role); render(demo.read()) }
     }
+    fun refreshCached() {
+        render(if (repo.demoMode) demo.read() else repo.cached())
+    }
     fun refresh() {
+        refreshCached()
         if(refreshJob?.isActive==true) return
-        if(repo.demoMode) { render(demo.read()); return }
+        if(repo.demoMode) return
         if(!repo.configured) return
         refreshJob=viewModelScope.launch {
             try { render(repo.refresh()) }
@@ -251,10 +263,12 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
     }
     private fun resetPrivateChatHistory() {
         privateChatJob?.cancel(); privateChatGeneration++; privateChatCursor = null; privateChatEvents = emptyList()
+        privateChatRefreshPending = false
         mutableState.update { it.copy(privateChatHasMore = false, privateChatLoading = false) }
     }
     private fun resetRoomHistory() {
         roomHistoryJob?.cancel(); roomHistoryGeneration++; roomHistoryCursor = null
+        roomHistoryRefreshPending = false
         mutableState.update { it.copy(roomEvents = emptyList(), roomHasMore = false, roomLoading = false) }
     }
     private fun resetChatHistory() {
@@ -263,9 +277,13 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun refreshPrivateChatHistory(append: Boolean = false, force: Boolean = false) {
         if (privateChatJob?.isActive == true) {
-            if (!force) return
+            if (!force) {
+                if (!append) privateChatRefreshPending = true
+                return
+            }
             privateChatJob?.cancel()
         }
+        privateChatRefreshPending = false
         val generation = ++privateChatGeneration
         val context = privateChatContext
         val previous = privateChatEvents
@@ -276,7 +294,8 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 var page = repo.privateChatHistory(before)
                 val loaded = page.events.toMutableList()
-                if (force) {
+                if (!append) {
+                    // Show the latest page before rereading a user-expanded history for ACKs.
                     val immediate = withContext(Dispatchers.Default) { chatChronology(page.events + previous) }
                     if (generation != privateChatGeneration || context != privateChatContext || !repo.paired || repo.demoMode) return@launch
                     privateChatEvents = immediate
@@ -301,15 +320,24 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
             catch (_: Exception) {
                 if (generation == privateChatGeneration) mutableState.update { it.copy(privateChatLoading = false,
                     error = "이전 대화를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.") }
+            } finally {
+                if (generation == privateChatGeneration) {
+                    privateChatJob = null
+                    if (privateChatRefreshPending && repo.paired && !repo.demoMode) refreshPrivateChatHistory()
+                }
             }
         }
     }
 
     private fun refreshRoomHistory(append: Boolean = false, force: Boolean = false) {
         if (roomHistoryJob?.isActive == true) {
-            if (!force) return
+            if (!force) {
+                if (!append) roomHistoryRefreshPending = true
+                return
+            }
             roomHistoryJob?.cancel()
         }
+        roomHistoryRefreshPending = false
         val active = repo.room ?: return
         val generation = ++roomHistoryGeneration
         val previous = mutableState.value.roomEvents
@@ -320,7 +348,7 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 var page = repo.roomHistory(before)
                 val loaded = page.messages.toMutableList()
-                if (force) {
+                if (!append) {
                     val immediate = withContext(Dispatchers.Default) { chatChronology(page.messages.map { repo.roomEvent(it, active) } + previous) }
                     if (generation != roomHistoryGeneration || repo.room?.id != active.id || repo.demoMode) return@launch
                     mutableState.update { it.copy(roomEvents = immediate) }
@@ -341,6 +369,11 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
             catch (_: Exception) {
                 if (generation == roomHistoryGeneration) mutableState.update { it.copy(roomLoading = false,
                     error = "가족방 대화를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.") }
+            } finally {
+                if (generation == roomHistoryGeneration) {
+                    roomHistoryJob = null
+                    if (roomHistoryRefreshPending && repo.room?.id == active.id && !repo.demoMode) refreshRoomHistory()
+                }
             }
         }
     }

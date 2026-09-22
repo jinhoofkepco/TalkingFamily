@@ -9,6 +9,9 @@ import androidx.work.WorkManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -22,6 +25,8 @@ class AppRepository internal constructor(context: Context, private val clientFac
     private val prefs = app.getSharedPreferences("homeway_settings", Context.MODE_PRIVATE)
     private val vault = TokenVault(app)
     private val store = LocalStore.get(app)
+    val changes = changeRevision.asStateFlow()
+    private fun publishChanges() { changeRevision.update { it + 1 } }
     val role: String get() = prefs.getString("role", "child")!!
     val botUsername: String get() = prefs.getString("botUsername", "")!!
     val peerBotUsername: String get() = prefs.getString("peerBotUsername", "")!!
@@ -151,6 +156,7 @@ class AppRepository internal constructor(context: Context, private val clientFac
                     .putString("transport", "telegram_direct").putBoolean("demoMode", false)
                     .putBoolean("sharingEnabled", false).commit()
             }
+            publishChanges()
             cached()
         }
     }
@@ -161,10 +167,12 @@ class AppRepository internal constructor(context: Context, private val clientFac
             prefs.edit().clear().putString("role", role).putBoolean("demoMode", true).commit()
         }
         WorkManager.getInstance(app).cancelUniqueWork("homeway_outbox")
+        publishChanges()
     } }
     suspend fun reset() = withContext(Dispatchers.IO) { networkMutex.withLock {
         synchronized(dataLock) { vault.clear(); store.transaction { store.clear() }; prefs.edit().clear().commit() }
         WorkManager.getInstance(app).cancelUniqueWork("homeway_outbox")
+        publishChanges()
     } }
     suspend fun sendEvent(kind: String, payload: JSONObject, id: String = UUID.randomUUID().toString()): Boolean {
         enqueueEventOnly(kind, payload, id)
@@ -210,6 +218,7 @@ class AppRepository internal constructor(context: Context, private val clientFac
             val exchanged = TelegramExchange(client, store, peerId, peerRole, lock = dataLock,
                 checkActive = { coroutineContext.ensureActive() },
                 onReceived = { FamilyNotifications.received(app, it) }, familyChat = familyChat,
+                onCommitted = ::publishChanges,
                 familyCare = if (careEnabled) careEngine(client = client, checkActive = { coroutineContext.ensureActive() }) else null,
                 onLegacyFailure = { prefs.edit().putString("legacyDeliveryError", it.message).commit() }).synchronize(timeout)
             if (exchanged) prefs.edit().apply {
@@ -222,6 +231,8 @@ class AppRepository internal constructor(context: Context, private val clientFac
         } catch (e: TelegramSyncException) {
             prefs.edit().putString("connectionError", e.message).apply()
             throw e
+        } finally {
+            publishChanges()
         }
     } }
     fun cached(): FamilySnapshot = synchronized(dataLock) {
@@ -317,11 +328,13 @@ class AppRepository internal constructor(context: Context, private val clientFac
         store.transaction { store.familyChat.setActiveRoom(active) }
         prefs.edit().apply { if (!existingPair) putString("role", if (own.relationship in setOf("mother", "father")) "guardian" else "child") }
             .remove("connectionError").commit()
+        publishChanges()
     }
     suspend fun leaveFamilyRoom() = withContext(Dispatchers.IO) { networkMutex.withLock {
         synchronized(dataLock) {
             store.transaction { store.familyChat.setActiveRoom(null) }
             prefs.edit().remove("connectionError").commit()
+            publishChanges()
         }
     } }
     fun hasPending(): Boolean = synchronized(dataLock) {
@@ -329,6 +342,9 @@ class AppRepository internal constructor(context: Context, private val clientFac
             store.familyChat.pendingChatDeliveries(it.id).isNotEmpty() || store.familyChat.chatReceipts(it.id).isNotEmpty() ||
                 store.familyCare.pendingPackets(it.id).isNotEmpty() || store.familyCare.receipts(it.id).isNotEmpty()
         } == true || (careEnabled && careChildren.any { careEngine().hasPending(it.botId) })
+    }
+    fun synchronizationRetryDelayMillis(): Long = synchronized(dataLock) {
+        (store.meta("retryAfter") - System.currentTimeMillis()).coerceAtLeast(0)
     }
     private fun pendingDeliveryError(): String? = synchronized(dataLock) {
         val failures = mutableListOf<String>()
@@ -347,11 +363,16 @@ class AppRepository internal constructor(context: Context, private val clientFac
         failures.firstOrNull()
     }
     private fun scheduleOutbox() {
-        WorkManager.getInstance(app).enqueueUniqueWork("homeway_outbox", ExistingWorkPolicy.KEEP,
+        publishChanges()
+        TelegramPollWakeup.signal()
+        // A successor is needed even if the running worker just observed an empty outbox.
+        // KEEP could discard this enqueue before that worker reports success and strands it.
+        WorkManager.getInstance(app).enqueueUniqueWork("homeway_outbox", ExistingWorkPolicy.APPEND_OR_REPLACE,
             OneTimeWorkRequestBuilder<OutboxWorker>().setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()).build())
     }
     companion object {
         private val networkMutex = Mutex()
         private val dataLock = Any()
+        private val changeRevision = MutableStateFlow(0L)
     }
 }

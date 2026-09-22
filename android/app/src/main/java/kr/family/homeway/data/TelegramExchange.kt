@@ -1,6 +1,7 @@
 package kr.family.homeway.data
 
 import org.json.JSONObject
+import org.json.JSONArray
 
 /** The same transactional boundary is implemented by SQLite on phones and an in-memory store in tests. */
 interface TelegramExchangeStore {
@@ -31,13 +32,26 @@ internal class TelegramExchange(
     private val familyChat: FamilyChatExchange? = null,
     private val onLegacyFailure: (TelegramException) -> Unit = {},
     private val familyCare: FamilyCareEngine? = null,
+    private val onCommitted: () -> Unit = {},
 ) {
     /** Caller serializes network runs; returns false when the persisted Telegram backoff is still active. */
     fun synchronize(timeout: Int = 0): Boolean {
         if (synchronized(lock) { store.meta("retryAfter") > now() }) return false
         try {
             checkActive()
-            val updates = client.getUpdates(synchronized(lock) { store.meta("offset") }, timeout)
+            val pollRevision = TelegramPollWakeup.revision
+            val ready = synchronized(lock) {
+                (peerId > 0 && store.meta("legacyRetryAfter") <= now() &&
+                    (store.receipts().isNotEmpty() || (store.pending().isNotEmpty() &&
+                        (store.meta("sentAt") == 0L || now() - store.meta("sentAt") >= 30_000)))) ||
+                    familyChat?.hasReadyWork() == true || familyCare?.hasReadyWork() == true
+            }
+            val updates = try {
+                client.getUpdates(synchronized(lock) { store.meta("offset") }, if (ready) 0 else timeout, pollRevision)
+            } catch (_: TelegramPollInterruptedException) {
+                // A local enqueue woke only getUpdates. Keep the offset and flush its durable outbox now.
+                JSONArray()
+            }
             checkActive()
             for (i in 0 until updates.length()) {
                 checkActive()
@@ -45,6 +59,7 @@ internal class TelegramExchange(
                 val updateId = update.optLong("update_id", -1)
                 var received: FamilyEvent? = null
                 var chatReceived: FamilyChatMessage? = null
+                var committed = false
                 synchronized(lock) {
                     if (updateId >= store.meta("offset")) store.transaction {
                         chatReceived = familyChat?.processUpdate(update)
@@ -92,11 +107,14 @@ internal class TelegramExchange(
                         }
                         // Persist state, dedup identities, receipt and offset as one atomic write.
                         store.setMeta("offset", updateId + 1)
+                        committed = true
                     }
                 }
+                if (committed) onCommitted()
                 received?.let(onReceived)
                 chatReceived?.let { familyChat?.notifyReceived(it) }
             }
+            familyChat?.flush()
             if (synchronized(lock) { store.meta("legacyRetryAfter") <= now() }) {
                 try { flushLegacy() }
                 catch (error: TelegramException) {
@@ -107,7 +125,6 @@ internal class TelegramExchange(
                     onLegacyFailure(error)
                 }
             }
-            familyChat?.flush()
             familyCare?.flush()
             if (synchronized(lock) { store.meta("ledgerConflict") != 0L }) throw TelegramSyncException()
             return true
@@ -122,7 +139,7 @@ internal class TelegramExchange(
     private fun flushLegacy() {
         if (peerId <= 0) return
         // Receipts never create receipts, including after retries of an ambiguous send.
-        val receipts = synchronized(lock) { store.receipts().take(100) }
+        val receipts = synchronized(lock) { store.receipts().take(4) }
         for (id in receipts) {
             checkActive()
             client.send(peerId.toString(), TelegramProtocol.envelope("ack").put("id", id).toString())

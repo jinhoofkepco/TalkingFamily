@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -21,11 +22,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** User-visible remote messaging session. No location access, boot receiver, or silent restart. */
 class TelegramReceiveService : Service() {
@@ -54,23 +56,47 @@ class TelegramReceiveService : Service() {
         state.value = ReceiveState(true)
         if (polling?.isActive != true) polling = scope.launch {
             val repo = AppRepository(this@TelegramReceiveService)
+            val schedule = TelegramReceiveSchedule()
             while (isActive && repo.configured) {
+                // Capture before inspecting the queue: a send during the exchange or subsequent
+                // pause must remain visible, even if the HTTP poll already returned.
+                val revision = TelegramPollWakeup.revision
+                val retryDelay = repo.synchronizationRetryDelayMillis()
+                if (retryDelay > 0) {
+                    awaitWake(revision, retryDelay)
+                    continue
+                }
+                val startedAt = SystemClock.elapsedRealtime()
+                var waitMillis: Long
                 try {
-                    repo.synchronize(10)
+                    repo.synchronize(schedule.nextTimeoutSeconds(repo.hasPending(), revision))
                     state.value = ReceiveState(true)
-                    delay(1000)
+                    // Long polling already waited. Only fast returns need pacing, including
+                    // empty replies and a repository exchange skipped by a racing backoff.
+                    waitMillis = (TelegramReceiveSchedule.MIN_CYCLE_MILLIS -
+                        (SystemClock.elapsedRealtime() - startedAt)).coerceAtLeast(0)
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (_: Exception) {
                     state.value = ReceiveState(true, "인터넷과 봇 설정을 확인해 주세요. 연결을 다시 시도하고 있어요.")
-                    delay(15_000)
+                    waitMillis = repo.synchronizationRetryDelayMillis().takeIf { it > 0 }
+                        ?: TelegramReceiveSchedule.ERROR_RETRY_MILLIS
                 }
+                awaitWake(revision, waitMillis)
             }
             stopSelf()
         }
         return START_NOT_STICKY
     }
+    private suspend fun awaitWake(revision: Long, waitMillis: Long) {
+        if (waitMillis <= 0) return
+        withTimeoutOrNull(waitMillis) { TelegramPollWakeup.changes.first { it != revision } }
+    }
     override fun onDestroy() {
-        scope.cancel(); state.value = ReceiveState(false)
+        scope.cancel()
+        // Release a blocking idle poll after cancellation, so the next authorized worker or
+        // session does not wait for this stopped service's remaining HTTP timeout.
+        TelegramPollWakeup.signal()
+        state.value = ReceiveState(false)
         super.onDestroy()
     }
     companion object {
@@ -91,5 +117,31 @@ class TelegramReceiveService : Service() {
             context.stopService(Intent(context, TelegramReceiveService::class.java))
             state.value = ReceiveState(false)
         }
+    }
+}
+
+/** Short bursts advance ACK-dependent queues; an offline peer cannot keep fast polling alive. */
+internal class TelegramReceiveSchedule {
+    private var previousRevision: Long? = null
+    private var previouslyPending = false
+    private var fastRoundsLeft = 0
+
+    fun nextTimeoutSeconds(hasPending: Boolean, revision: Long): Int {
+        val awakened = previousRevision != revision
+        if (awakened || (hasPending && !previouslyPending)) fastRoundsLeft = MAX_FAST_ROUNDS
+        previousRevision = revision
+        previouslyPending = hasPending
+        if (awakened || (hasPending && fastRoundsLeft > 0)) {
+            fastRoundsLeft--
+            return 0
+        }
+        return IDLE_POLL_SECONDS
+    }
+
+    companion object {
+        const val MAX_FAST_ROUNDS = 8
+        const val IDLE_POLL_SECONDS = 10
+        const val MIN_CYCLE_MILLIS = 1_000L
+        const val ERROR_RETRY_MILLIS = 15_000L
     }
 }

@@ -363,16 +363,27 @@ class FamilyCareEngine(
         return state
     }
 
+    fun hasReadyWork(): Boolean = synchronized(lock) {
+        val peers = (store.pendingPackets(room.id).map { it.peerId } + store.receipts(room.id).map { it.peerId }).distinct()
+        peers.any { peer -> store.retryAfter(room.id, peer) <= now() &&
+            (store.receipts(room.id).any { it.peerId == peer } ||
+                store.pendingPackets(room.id).firstOrNull { it.peerId == peer }?.let {
+                    it.sentAt == 0L || now() - it.sentAt >= 30_000
+                } == true)
+        }
+    }
+
     /** A slow family member cannot block the other parent, another child, or the v2/v3 lanes. */
     fun flush() {
         val peers = synchronized(lock) { (store.pendingPackets(room.id).map { it.peerId } + store.receipts(room.id).map { it.peerId }).distinct() }
         for (peer in peers) {
             checkActive()
+            val member = room.members.firstOrNull { it.botId == peer } ?: continue
             if (synchronized(lock) { store.retryAfter(room.id, peer) > now() }) continue
             try {
                 val receipt = synchronized(lock) { store.receipts(room.id).firstOrNull { it.peerId == peer } }
                 if (receipt != null) {
-                    client.send(peer.toString(), FamilyCareProtocol.receipt(room, ownBotId, receipt))
+                    client.sendToFamilyMember(member, FamilyCareProtocol.receipt(room, ownBotId, receipt), checkActive)
                     synchronized(lock) { store.transaction { store.removeReceipt(receipt) } }
                     continue
                 }
@@ -380,7 +391,7 @@ class FamilyCareEngine(
                 if (packet != null && (packet.sentAt == 0L || now() - packet.sentAt >= 30_000)) {
                     synchronized(lock) { store.transaction { store.markSent(room.id, packet.packetId, peer, now().coerceAtLeast(1)) } }
                     checkActive()
-                    client.send(peer.toString(), packet.text)
+                    client.sendToFamilyMember(member, packet.text, checkActive)
                 }
             } catch (error: TelegramException) {
                 if (error.errorCode in setOf(401, 404, 409, 429)) throw error
