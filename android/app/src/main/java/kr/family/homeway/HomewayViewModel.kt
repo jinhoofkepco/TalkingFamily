@@ -39,7 +39,7 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
     private var historyCursor: MovementHistoryCursor? = null
     private var historyDaySelected = false
     private var historyGeneration = 0
-    private var historyContext: Triple<String, Boolean, String>? = null
+    private var historyContext: List<String>? = null
     private var privateChatJob: Job? = null
     private var privateChatCursor: MovementHistoryCursor? = null
     private var privateChatGeneration = 0
@@ -52,9 +52,17 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
     init {
         val snapshot = if(repo.demoMode) demo.read() else repo.cached()
         render(snapshot)
+        viewModelScope.launch {
+            runCatching { repo.prepareCare() }.onFailure { showError(it.message ?: "가족 기록을 준비하지 못했어요.") }
+            render(if (repo.demoMode) demo.read() else repo.cached())
+        }
     }
     private fun render(snapshot: FamilySnapshot, error: String? = null, forcePrivateChat: Boolean = false, forceRoomChat: Boolean = false) {
         val activeRoom = repo.room
+        val careEnabled = repo.careEnabled
+        val selectedChild = repo.selectedCareChildId
+        val care = if (careEnabled) repo.careSnapshot(selectedChild) else null
+        val visible = if (careEnabled) care ?: FamilySnapshot.parse(kr.family.homeway.data.TelegramLedger.emptyState()) else snapshot
         val privateContext = listOf(repo.demoMode.toString(), repo.paired.toString(), repo.botUsername, repo.peerBotUsername)
         if (privateChatContext != privateContext) {
             resetPrivateChatHistory()
@@ -65,25 +73,27 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
             roomHistoryContext = activeRoom?.id
         }
         mutableState.update { old -> old.copy(
-            role=repo.role, configured=repo.configured, demoMode=repo.demoMode,
+            role=repo.effectiveRole, configured=repo.configured, demoMode=repo.demoMode,
             needsOnboarding=!repo.configured && !repo.demoMode,
             botUsername=repo.botUsername, peerBotUsername=repo.peerBotUsername,
-            events=if (repo.demoMode) snapshot.events else chatChronology(snapshot.events.filter { it.kind != "chat" } + privateChatEvents),
-            stickerBalance=snapshot.stickerBalance, redemptions=snapshot.redemptions,
+            events=if (repo.demoMode) visible.events else chatChronology(visible.events.filter { it.kind != "chat" } + privateChatEvents),
+            stickerBalance=visible.stickerBalance, redemptions=visible.redemptions,
             paired=repo.paired || repo.demoMode, room=activeRoom, selfBotId=repo.selfBotId,
-            rewards=snapshot.rewards,
-            sharingEnabled=if(repo.isChild && !repo.demoMode) repo.sharingEnabled else snapshot.sharingEnabled,
+            rewards=visible.rewards,
+            careEnabled=careEnabled, privateRole=repo.role, careChildren=repo.careChildren, selectedChildBotId=selectedChild,
+            careReady=care != null, carePending=repo.carePending(selectedChild), careStatus=repo.careStatus(selectedChild),
+            sharingEnabled=if(repo.isChild && !repo.demoMode) repo.sharingEnabled else visible.sharingEnabled,
             trackingStatus=if(repo.demoMode) "체험 기록 · 실제 위치를 수집하지 않아요" else repo.trackingStatus,
             transport=snapshot.transport, error=error ?: repo.connectionError
         ) }
         if (!repo.demoMode && repo.paired) refreshPrivateChatHistory(force = forcePrivateChat)
         if (!repo.demoMode && activeRoom != null) refreshRoomHistory(force = forceRoomChat)
-        val context = Triple(repo.role, repo.demoMode, ZoneId.systemDefault().id)
+        val context = locationContext()
         if (historyContext != context) {
             resetHistorySelection()
             historyContext = context
         }
-        if (repo.role == "guardian") refreshHistory(snapshot)
+        if (repo.effectiveRole == "guardian") refreshHistory(visible)
         else mutableState.update { it.copy(locationHistory = emptyList(), historyDays = emptyList(), historyHasMore = false, historyLoading = false) }
         awaitedLocationId?.let { id ->
             val event = snapshot.events.firstOrNull { it.id == id }
@@ -124,8 +134,16 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
             catch(_: Exception) { render(repo.cached(), repo.connectionError ?: "연결이 원활하지 않아요. 마지막 받은 기록을 표시하고 있어요.") }
         }
     }
+    private fun locationContext() = listOf(repo.effectiveRole, repo.demoMode.toString(), ZoneId.systemDefault().id,
+        if (repo.careEnabled) repo.room?.id.orEmpty() else "", repo.selectedCareChildId?.toString().orEmpty())
+    fun selectCareChild(childId: Long) {
+        if (!repo.careEnabled || repo.careRole != "guardian" || childId == repo.selectedCareChildId) return
+        repo.selectCareChild(childId)
+        resetHistorySelection()
+        render(repo.cached())
+    }
     fun selectHistoryDay(day: String) {
-        if (repo.role != "guardian" || runCatching { LocalDate.parse(day) }.isFailure) return
+        if (repo.effectiveRole != "guardian" || runCatching { LocalDate.parse(day) }.isFailure) return
         historyJob?.cancel()
         historyGeneration++
         historyCursor = null
@@ -134,7 +152,7 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         refreshHistory(if (repo.demoMode) demo.read() else null, force = true)
     }
     fun loadMoreHistory() {
-        if (repo.role != "guardian" || historyJob?.isActive == true || historyCursor == null) return
+        if (repo.effectiveRole != "guardian" || historyJob?.isActive == true || historyCursor == null) return
         refreshHistory(if (repo.demoMode) demo.read() else null, append = true)
     }
     private fun resetHistorySelection() {
@@ -149,6 +167,9 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         if (historyJob?.isActive == true && !force) return
         val generation = ++historyGeneration
         val isDemo = repo.demoMode
+        val context = locationContext()
+        val careRoomId = repo.room?.id.takeIf { repo.careEnabled }
+        val childId = repo.selectedCareChildId
         val requested = mutableState.value.historyDay.takeIf { historyDaySelected }
         val cursor = if (append) historyCursor else null
         mutableState.update { it.copy(historyLoading = true) }
@@ -156,8 +177,8 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val page = if (isDemo) withContext(Dispatchers.Default) {
                     MovementHistoryDates.demoPage((snapshot ?: demo.read()).events, requested, cursor)
-                } else repo.movementHistory(requested, cursor)
-                if (generation != historyGeneration || repo.role != "guardian" || repo.demoMode != isDemo) return@launch
+                } else repo.movementHistory(requested, cursor, careRoomId, childId)
+                if (generation != historyGeneration || context != locationContext()) return@launch
                 val oldHistory = mutableState.value
                 val (preserve, events) = withContext(Dispatchers.Default) {
                     val old = oldHistory
@@ -172,7 +193,7 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
                         else page.events
                     preserve to events
                 }
-                if (generation != historyGeneration || repo.role != "guardian" || repo.demoMode != isDemo) return@launch
+                if (generation != historyGeneration || context != locationContext()) return@launch
                 historyDaySelected = historyDaySelected || page.days.isNotEmpty()
                 if (append || !preserve) historyCursor = page.next
                 mutableState.update { old ->
@@ -198,17 +219,24 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         perform { repo.sendRoomChat(text.trim()); render(repo.cached(), forceRoomChat = true); refresh() }
     }
     fun createFamilyRoom(token: String, title: String, selfName: String, relationship: String, members: List<FamilyChatMemberDraft>) = perform {
-        // Adding chat never stops an existing student's consented location service or clears the pair.
         repo.createFamilyRoom(token, title, selfName, relationship, members)
+        repo.prepareCare()
+        if (!repo.canShareLocation && repo.sharingEnabled) TrackingService.stopAndAwait(getApplication())
         render(repo.cached())
         refresh()
     }
     fun joinFamilyRoom(token: String, code: String) = perform {
         repo.joinFamilyRoom(token, code)
+        repo.prepareCare()
+        if (!repo.canShareLocation && repo.sharingEnabled) TrackingService.stopAndAwait(getApplication())
         render(repo.cached())
         refresh()
     }
     fun leaveFamilyRoom() = perform {
+        if (repo.sharingEnabled && (!repo.paired || repo.role != "child")) {
+            TrackingService.stopAndAwait(getApplication())
+            repo.sharingEnabled = false
+        }
         repo.leaveFamilyRoom()
         render(repo.cached())
     }
@@ -322,7 +350,9 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         if (!requireRole("guardian")) return
         send("sticker_award",JSONObject().put("count",1).put("reason",reason.trim().take(200).ifBlank { "참 잘했어요" }))
     }
-    fun saveReward(id:String?, name:String, cost:Int) {
+    fun saveReward(id:String?, name:String, cost:Int) = saveRewardInternal(id, name, cost, null)
+    fun saveRewardVersioned(id:String?, name:String, cost:Int, version:Long) = saveRewardInternal(id, name, cost, version)
+    private fun saveRewardInternal(id:String?, name:String, cost:Int, version:Long?) {
         if (!requireRole("guardian")) return
         val cleanedName = name.trim()
         if (cleanedName.isEmpty() || cleanedName.length > 60 || cost !in 1..999) {
@@ -331,14 +361,16 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         if (id != null && mutableState.value.rewards.none { it.id == id }) {
             showError("이 약속은 삭제되었어요. 새로고침 후 확인해 주세요."); return
         }
-        send("reward_upsert",JSONObject().put("rewardId",id ?: UUID.randomUUID().toString()).put("name",cleanedName).put("cost",cost))
+        send("reward_upsert",JSONObject().put("rewardId",id ?: UUID.randomUUID().toString()).put("name",cleanedName).put("cost",cost), version)
     }
-    fun deleteReward(id:String) {
+    fun deleteReward(id:String) = deleteRewardInternal(id, null)
+    fun deleteRewardVersioned(id:String, version:Long) = deleteRewardInternal(id, version)
+    private fun deleteRewardInternal(id:String, version:Long?) {
         if (!requireRole("guardian")) return
         if (mutableState.value.rewards.none { it.id == id }) {
             showError("이 약속은 이미 삭제되었어요."); return
         }
-        send("reward_delete",JSONObject().put("rewardId",id))
+        send("reward_delete",JSONObject().put("rewardId",id), version)
     }
     fun requestRedemption(rewardId:String) {
         if (!requireRole("child")) return
@@ -352,19 +384,35 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         send("sticker_redeem_approve",JSONObject().put("requestId",id).put("accepted",accepted))
     }
     private fun requireRole(role:String): Boolean {
-        if (!requirePaired()) return false
-        if (repo.role == role) return true
+        if (!repo.careEnabled && !requirePaired()) return false
+        if (repo.effectiveRole == role) return true
         showError(if (role == "guardian") "보호자만 바꿀 수 있어요." else "자녀 화면에서 사용할 수 있어요.")
         return false
     }
     private fun requirePaired(): Boolean {
         if (repo.demoMode || repo.paired) return true
-        showError("위치와 칭찬판, 1:1 대화는 기존 가족 연결이 필요해요. 가족방 대화는 계속 사용할 수 있어요.")
+        showError("1:1 가족 연결이 필요해요. 가족방에서는 대화와 자녀의 위치·칭찬판을 함께 사용할 수 있어요.")
         return false
     }
-    private fun send(kind:String,payload:JSONObject) = perform {
+    private fun send(kind:String,payload:JSONObject, expectedVersion:Long? = null) {
+        // Capture the displayed child and reward revision before any coroutine can switch screens.
+        val roomId = repo.room?.id.takeIf { repo.careEnabled && kind != "chat" }
+        val childId = repo.selectedCareChildId
+        val rewardId = payload.optString("rewardId")
+        val rewardVersion = if (kind in setOf("reward_upsert", "reward_delete", "sticker_redeem_request"))
+            expectedVersion ?: mutableState.value.rewards.firstOrNull { it.id == rewardId }?.version ?: 0L else null
+        if (roomId != null && (!mutableState.value.careReady || mutableState.value.carePending)) {
+            showError("자녀 휴대폰의 최신 칭찬판과 처리 결과를 기다려 주세요."); return
+        }
+        perform {
         if(repo.demoMode) { render(demo.apply(kind,payload,repo.role)); return@perform }
         val id = UUID.randomUUID().toString()
+        if (roomId != null && childId != null) {
+            repo.sendCareAction(roomId, childId, kind, payload, id, rewardVersion)
+            render(repo.cached())
+            refresh()
+            return@perform
+        }
         val accepted = repo.sendEvent(kind,payload,id)
         val snapshot = repo.cached()
         render(snapshot, forcePrivateChat = kind == "chat")
@@ -375,9 +423,10 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         }
         if(!accepted) notice("상대 기기의 수신을 기다리고 있어요. 두 휴대폰의 인터넷 연결과 메시지 수신 설정을 확인해 주세요.")
         refresh()
+        }
     }
     fun shareCurrentLocation() = perform {
-        if (!requirePaired()) return@perform
+        if (!repo.careEnabled && !requirePaired()) return@perform
         check(repo.isChild) { "자녀 화면에서 위치를 공유할 수 있어요." }
         if(repo.demoMode) {
             render(demo.apply("location",JSONObject().put("latitude",37.5665).put("longitude",126.978)
@@ -388,7 +437,7 @@ class HomewayViewModel(app: Application) : AndroidViewModel(app) {
         notice("현재 위치를 확인하고 있어요…")
         val location = CurrentLocationProvider.capture(getApplication())
         val id = UUID.randomUUID().toString()
-        awaitedLocationId=id
+        awaitedLocationId=if (repo.careEnabled) null else id
         val accepted=repo.sendEvent("location",JSONObject().put("latitude",location.latitude).put("longitude",location.longitude)
             .put("accuracy",location.accuracy.toDouble()).put("capturedAt",Instant.ofEpochMilli(location.time).toString()).put("source","manual"),id)
         render(repo.cached())

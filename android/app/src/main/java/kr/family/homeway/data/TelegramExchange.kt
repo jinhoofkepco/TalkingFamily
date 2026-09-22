@@ -30,6 +30,7 @@ internal class TelegramExchange(
     private val onReceived: (FamilyEvent) -> Unit = {},
     private val familyChat: FamilyChatExchange? = null,
     private val onLegacyFailure: (TelegramException) -> Unit = {},
+    private val familyCare: FamilyCareEngine? = null,
 ) {
     /** Caller serializes network runs; returns false when the persisted Telegram backoff is still active. */
     fun synchronize(timeout: Int = 0): Boolean {
@@ -47,6 +48,7 @@ internal class TelegramExchange(
                 synchronized(lock) {
                     if (updateId >= store.meta("offset")) store.transaction {
                         chatReceived = familyChat?.processUpdate(update)
+                        familyCare?.processUpdate(update)
                         val packet = TelegramProtocol.receive(update, peerId, peerRole)
                         if (packet != null) when (packet.type) {
                             "event" -> {
@@ -57,9 +59,15 @@ internal class TelegramExchange(
                                 val next = try { TelegramLedger.apply(state, event) }
                                 catch (_: IllegalArgumentException) { store.setMeta("ledgerConflict", 1); null }
                                 if (next != null) {
-                                    if (!TelegramLedger.contains(state, event.id)) received = event
-                                    store.cache(next)
-                                    store.queueReceipt(event.id)
+                                    if (familyCare?.processLegacy(event, peerId) == false) {
+                                        // An old parent's optimistic v2 cache must not acknowledge a
+                                        // decision rejected by this child's authoritative family board.
+                                        store.setMeta("ledgerConflict", 1)
+                                    } else {
+                                        if (!TelegramLedger.contains(state, event.id)) received = event
+                                        store.cache(next)
+                                        store.queueReceipt(event.id)
+                                    }
                                 }
                             }
                             "ack" -> {
@@ -94,12 +102,13 @@ internal class TelegramExchange(
                 catch (error: TelegramException) {
                     // A paired phone's failure must not freeze an otherwise healthy family room.
                     // Keep the original two-phone behavior when no room is active.
-                    if (familyChat == null || error.errorCode in setOf(401, 404, 409, 429)) throw error
+                    if ((familyChat == null && familyCare == null) || error.errorCode in setOf(401, 404, 409, 429)) throw error
                     synchronized(lock) { store.setMeta("legacyRetryAfter", now() + 15_000) }
                     onLegacyFailure(error)
                 }
             }
             familyChat?.flush()
+            familyCare?.flush()
             if (synchronized(lock) { store.meta("ledgerConflict") != 0L }) throw TelegramSyncException()
             return true
         } catch (error: TelegramException) {

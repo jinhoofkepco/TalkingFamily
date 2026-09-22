@@ -5,6 +5,7 @@ import kr.family.homeway.data.Redemption
 import kr.family.homeway.data.Reward
 import kr.family.homeway.data.FamilyChatRoom
 import kr.family.homeway.data.FamilyChatMemberDraft
+import kr.family.homeway.data.FamilyChatMember
 import java.time.LocalDate
 
 data class UiState(
@@ -44,6 +45,13 @@ data class UiState(
     val roomLoading: Boolean = false,
     val privateChatHasMore: Boolean = false,
     val privateChatLoading: Boolean = false,
+    val careEnabled: Boolean = false,
+    val privateRole: String? = null,
+    val careChildren: List<FamilyChatMember> = emptyList(),
+    val selectedChildBotId: Long? = null,
+    val careReady: Boolean = false,
+    val carePending: Boolean = false,
+    val careStatus: String? = null,
 )
 
 data class UiActions(
@@ -75,4 +83,7 @@ data class UiActions(
     val createFamilyRoom: (token: String, title: String, selfName: String, relationship: String, members: List<FamilyChatMemberDraft>) -> Unit = { _, _, _, _, _ -> },
     val joinFamilyRoom: (token: String, code: String) -> Unit = { _, _ -> },
     val leaveFamilyRoom: () -> Unit = {},
+    val selectCareChild: (Long) -> Unit = {},
+    val saveRewardVersioned: ((String?, String, Int, Long) -> Unit)? = null,
+    val deleteRewardVersioned: ((String, Long) -> Unit)? = null,
 )

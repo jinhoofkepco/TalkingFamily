@@ -138,20 +138,23 @@ class MainActivity : ComponentActivity() {
                 },
                 leaveFamilyRoom=model::leaveFamilyRoom,
                 shareCurrentLocation={
-                    if (!state.demoMode && !state.paired) model.showError("위치 공유는 기존 1:1 가족 연결이 필요해요.")
+                    if (!state.demoMode && !state.paired && !state.careEnabled) model.showError("위치 공유는 가족 연결이 필요해요.")
                     else if(state.demoMode) model.shareCurrentLocation() else requestLocation(false,model::shareCurrentLocation)
                 },
                 awardSticker=model::awardSticker,
                 requestRedemption=model::requestRedemption,
                 saveReward=model::saveReward,
+                saveRewardVersioned=model::saveRewardVersioned,
+                deleteRewardVersioned=model::deleteRewardVersioned,
                 deleteReward=model::deleteReward,
                 approveRedemption=model::approveRedemption,
                 setSharing={ enabled ->
-                    if (!state.demoMode && !state.paired) model.showError("위치 공유는 기존 1:1 가족 연결이 필요해요.")
+                    if (!state.demoMode && !state.paired && !state.careEnabled) model.showError("위치 공유는 가족 연결이 필요해요.")
                     else if(enabled && !state.demoMode) requestLocation(true) { model.setSharing(true) } else model.setSharing(enabled)
                 },
                 refresh=model::refresh,
                 selectHistoryDay=model::selectHistoryDay,
+                selectCareChild=model::selectCareChild,
                 loadMoreHistory=model::loadMoreHistory,
                 requestMotionRecognition={
                     if (Build.VERSION.SDK_INT >= 29) motionPermissionLauncher.launch(Manifest.permission.ACTIVITY_RECOGNITION)

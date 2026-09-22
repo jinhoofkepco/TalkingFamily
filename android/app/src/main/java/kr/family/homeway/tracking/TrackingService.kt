@@ -407,7 +407,7 @@ class TrackingService : Service(), SensorEventListener {
         repository.noteTrackingStatus("자동 위치 공유 종료")
         // Stop collection immediately, then let the repository durably save queued metadata.
         scope.launch {
-            if (repository.paired && repository.isChild && !repository.demoMode) {
+            if (repository.canShareLocation && !repository.demoMode) {
                 outgoing.send("sharing_status" to JSONObject().put("enabled", false))
             }
             outgoing.close()
@@ -520,7 +520,7 @@ class TrackingService : Service(), SensorEventListener {
         }
 
         private fun startDecision(repo: AppRepository, context: Context) = TrackingStartPolicy.decide(
-            repo.sharingEnabled, repo.paired, repo.isChild, repo.demoMode, hasRequiredPermissions(context))
+            repo.sharingEnabled, repo.canShareLocation, repo.isChild, repo.demoMode, hasRequiredPermissions(context))
 
         fun stop(context: Context) {
             // Do not create a service for demo/reset flows, and stop collection before returning.

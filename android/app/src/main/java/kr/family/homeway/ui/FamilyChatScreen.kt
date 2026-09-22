@@ -47,7 +47,7 @@ private val ChatMuted = Color(0xFF64736A)
 private val ChatYellow = Color(0xFFFFE394)
 private val ChatGreen = Color(0xFF245B46)
 
-/** The room contains chat only; locations and praise remain in the existing private connection. */
+/** Chat stays in the room; child location and praise use the authenticated parent/child care lane. */
 @Composable
 internal fun FamilyChatScreen(
     state: UiState,
@@ -67,17 +67,18 @@ internal fun FamilyChatScreen(
     var roomMenu by remember { mutableStateOf(false) }
     val parent = state.role == "guardian" || state.role == "parent"
     val canUsePrivateConnection = state.paired || state.demoMode
+    val canUseCare = canUsePrivateConnection || state.careEnabled
     val keyboard = LocalSoftwareKeyboardController.current
     val events = remember(state.events, state.roomEvents, inRoom) {
         if (inRoom) state.roomEvents.filter { it.kind == "chat" }
-        else state.events.filter { it.kind == "chat" || (it.kind == "location" && it.payload.optString("source") == "manual") }
+        else state.events.filter { it.roomId == null && (it.kind == "chat" || (it.kind == "location" && it.payload.optString("source") == "manual")) }
     }
     val newestFirst = remember(events) { events.asReversed() }
     val memberNames = remember(room) { room?.members?.associate { it.botId to it.displayName }.orEmpty() }
     val title = if (inRoom) room!!.title else if (room != null) "기존 1:1 대화" else "우리 가족 대화"
     val participantCount = if (inRoom) room!!.members.size else if (state.configured || state.demoMode) 2 else 0
 
-    fun isMine(event: FamilyEvent) = if (inRoom) event.senderId != null && event.senderId == state.selfBotId else event.sender == state.role
+    fun isMine(event: FamilyEvent) = if (inRoom) event.senderId != null && event.senderId == state.selfBotId else event.sender == (state.privateRole ?: state.role)
     fun author(event: FamilyEvent): String = if (inRoom) {
         event.senderId?.let(memberNames::get) ?: event.senderName?.takeIf(String::isNotBlank) ?: "가족"
     } else if (event.sender == "child") "자녀" else "보호자"
@@ -138,12 +139,12 @@ internal fun FamilyChatScreen(
                     Text(title, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = ChatInk, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text(if (participantCount > 0) "${participantCount}명 · ${if (inRoom) "가족 단체방" else "개인 대화"}" else "가족을 연결해 주세요", fontSize = 10.sp, color = ChatMuted)
                 }
-                if (!parent && canUsePrivateConnection) TextButton(
+                if (!parent && canUseCare) TextButton(
                     openStickers, Modifier.testTag("child-sticker-button"), contentPadding = PaddingValues(horizontal = 7.dp, vertical = 4.dp),
                 ) {
                     Icon(Icons.Filled.Star, null, Modifier.size(16.dp), tint = Color(0xFFB67918))
                     Spacer(Modifier.width(3.dp))
-                    Text("칭찬 ${state.stickerBalance}", fontSize = 12.sp)
+                    Text(if (state.careEnabled && !state.careReady) "칭찬판" else "칭찬 ${state.stickerBalance}", fontSize = 12.sp)
                 }
                 Box {
                     IconButton({ roomMenu = true }, Modifier.testTag("chat-room-menu")) {
@@ -251,9 +252,9 @@ internal fun FamilyChatScreen(
                 IconButton({ toolsExpanded = !toolsExpanded }, Modifier.testTag("chat-tools-toggle")) {
                     Icon(if (toolsExpanded) Icons.Outlined.Close else Icons.Outlined.Add, if (toolsExpanded) "빠른 답장 닫기" else "빠른 답장", Modifier.size(23.dp), tint = ChatMuted)
                 }
-                if (!parent && !inRoom && canUsePrivateConnection) IconButton(
+                if (!parent && (state.careEnabled || (!inRoom && canUsePrivateConnection))) IconButton(
                     actions.shareCurrentLocation, Modifier.testTag("share-current-location"), enabled = !state.loading,
-                ) { Icon(Icons.Outlined.MyLocation, "현재 위치 공유 · 한 번만 보내요", Modifier.size(20.dp), tint = ChatGreen) }
+                ) { Icon(Icons.Outlined.MyLocation, if (state.careEnabled) "현재 위치 공유 · 부모님에게만 한 번 보내요" else "현재 위치 공유 · 한 번만 보내요", Modifier.size(20.dp), tint = ChatGreen) }
                 BasicTextField(
                     message, { message = it },
                     Modifier.weight(1f).heightIn(min = 44.dp).padding(vertical = 3.dp)

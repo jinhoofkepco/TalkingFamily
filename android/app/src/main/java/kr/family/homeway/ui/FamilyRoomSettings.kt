@@ -60,7 +60,7 @@ internal fun FamilyRoomSettings(
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         Text("엄마·아빠·아들·딸, 한 방에서 함께 대화해요.", fontSize = 18.sp, fontWeight = FontWeight.Bold)
-        Text("가족방에는 대화만 공유해요. 위치와 칭찬판은 기존 1:1 연결에서 이용해요.", fontSize = 13.sp, lineHeight = 20.sp)
+        Text("엄마·아빠는 각 자녀의 위치와 칭찬판을 함께 관리해요. 자녀의 위치·칭찬 기록은 부모님과 해당 자녀에게만 공유해요.", fontSize = 13.sp, lineHeight = 20.sp)
         if (state.demoMode) {
             RoomCard {
                 Text("가족방 연결은 체험을 마친 뒤 할 수 있어요.", fontWeight = FontWeight.Medium)
@@ -72,6 +72,8 @@ internal fun FamilyRoomSettings(
                 Text(active.title, fontSize = 21.sp, fontWeight = FontWeight.Bold)
                 Text("가족 ${active.members.size}명", fontSize = 13.sp)
                 RoomRoster(active, state.selfBotId)
+                Text("엄마·아빠로 등록된 가족은 자녀별 위치를 확인하고 칭찬·약속을 수정하거나 사용 요청을 승인할 수 있어요. ‘가족’으로 등록한 사람은 대화만 이용해요.", fontSize = 12.sp, lineHeight = 19.sp)
+                Text("위치·칭찬판을 함께 쓰려면 부모님과 자녀 모두 0.6.0 이상으로 업데이트해 주세요. 자동 위치 공유는 각 자녀 휴대폰에서 켜고 끌 수 있어요.", fontSize = 12.sp, lineHeight = 19.sp)
                 Button(
                     {
                         clipboard.setText(AnnotatedString(active.toCode()))
@@ -150,7 +152,7 @@ internal fun FamilyRoomSettings(
                     Text("참여할 가족방", fontSize = 12.sp)
                     Text(preview.title, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                     RoomRoster(preview, state.selfBotId)
-                    Text("이 명단에 등록된 내 봇으로 참여해요. 모르는 명단이면 가족에게 코드를 다시 확인해 주세요.", fontSize = 12.sp, lineHeight = 19.sp)
+                    Text("이 명단에 등록된 내 봇으로 참여해요. 엄마·아빠로 표시된 봇이 자녀의 위치를 받고 칭찬판을 관리하므로 이름·관계·봇을 확인해 주세요.", fontSize = 12.sp, lineHeight = 19.sp)
                 } else if (joinCode.isNotBlank()) Text("가족방 코드를 확인해 주세요.", color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
                 RoomConsent(acknowledged, { acknowledged = it })
                 state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, fontSize = 13.sp) }
@@ -165,7 +167,7 @@ internal fun FamilyRoomSettings(
     if (leaveDialog) AlertDialog(
         onDismissRequest = { leaveDialog = false }, modifier = Modifier.testTag("room-leave-dialog"),
         title = { Text("이 휴대폰에서 가족방을 나갈까요?") },
-        text = { Text("새 가족방 메시지의 송수신을 멈춥니다. 기존 1:1 연결과 이 휴대폰의 대화 기록은 유지돼요. 다른 가족은 계속 대화할 수 있어요.") },
+        text = { Text("가족방의 대화·위치·칭찬판 송수신을 멈춥니다. 기존 1:1 연결과 이 휴대폰의 기록은 유지돼요. 다른 가족은 계속 이용할 수 있어요.") },
         confirmButton = { TextButton({ leaveDialog = false; actions.leaveFamilyRoom() }, Modifier.testTag("room-leave-confirm")) { Text("가족방 나가기") } },
         dismissButton = { TextButton({ leaveDialog = false }) { Text("계속 참여") } },
     )
@@ -202,7 +204,7 @@ private fun RelationshipPicker(value: String, choose: (String) -> Unit, tag: Str
 private fun RoomConsent(checked: Boolean, change: (Boolean) -> Unit) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Checkbox(checked, change, Modifier.testTag("room-consent"))
-        Text("이 명단의 가족과 대화 내용을 공유하는 데 동의해요.", fontSize = 13.sp, lineHeight = 19.sp)
+        Text("이 명단과 대화를 공유하고, 엄마·아빠가 각 자녀의 위치·칭찬판을 함께 관리하는 데 동의해요. 자동 위치 공유는 자녀 휴대폰에서 따로 켜요.", fontSize = 13.sp, lineHeight = 19.sp)
     }
 }
 

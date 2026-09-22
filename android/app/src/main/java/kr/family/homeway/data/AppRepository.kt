@@ -32,7 +32,89 @@ class AppRepository internal constructor(context: Context, private val clientFac
     val selfBotId: Long get() = prefs.getLong("ownBotId", 0)
     val room: FamilyChatRoom? get() = synchronized(dataLock) { store.familyChat.activeRoom() }
     val configured: Boolean get() = credentialsReady && (prefs.getLong("peerBotId", 0) > 0 || room?.members?.any { it.botId == selfBotId } == true)
-    val isChild: Boolean get() = role == "child"
+    val careRole: String? get() = room?.let { active ->
+        if (active.members.none { it.relationship in FamilyCareValidation.parentRelationships } ||
+            active.members.none { it.relationship in FamilyCareValidation.childRelationships }) return@let null
+        when (active.members.firstOrNull { it.botId == selfBotId }?.relationship) {
+            "mother", "father" -> "guardian"
+            "son", "daughter" -> "child"
+            else -> null
+        }
+    }
+    val careEnabled: Boolean get() = credentialsReady && careRole != null
+    val effectiveRole: String get() = if (careEnabled) careRole!! else role
+    val isChild: Boolean get() = effectiveRole == "child"
+    val canShareLocation: Boolean get() = isChild && (careEnabled || paired)
+    val careChildren: List<FamilyChatMember> get() = if (careEnabled) room!!.members.filter {
+        it.relationship in FamilyCareValidation.childRelationships
+    } else emptyList()
+    val selectedCareChildId: Long? get() {
+        if (!careEnabled) return null
+        if (careRole == "child") return selfBotId
+        val saved = prefs.getLong("careChild_${room!!.id}", 0)
+        return careChildren.firstOrNull { it.botId == saved }?.botId ?: careChildren.firstOrNull()?.botId
+    }
+    fun selectCareChild(id: Long) = synchronized(dataLock) {
+        require(careEnabled && careRole == "guardian" && careChildren.any { it.botId == id }) { "자녀를 확인해 주세요." }
+        prefs.edit().putLong("careChild_${room!!.id}", id).commit()
+    }
+    private fun careEngine(active: FamilyChatRoom = checkNotNull(room), client: TelegramClient = clientFactory(vault.get()),
+        checkActive: () -> Unit = {}) =
+        FamilyCareEngine(client, store.familyCare, active, selfBotId, lock = dataLock, checkActive = checkActive)
+    fun careSnapshot(childId: Long? = selectedCareChildId): FamilySnapshot? = synchronized(dataLock) {
+        val active = room ?: return@synchronized null
+        if (!careEnabled || childId == null) return@synchronized null
+        val state = store.familyCare.state(active.id, childId) ?: return@synchronized null
+        val member = active.members.firstOrNull { it.botId == childId }
+        state.snapshot.copy(events = state.snapshot.events.map {
+            it.copy(roomId = active.id, senderId = if (it.sender == "child") childId else null,
+                senderName = if (it.sender == "child") member?.displayName else "부모")
+        }, rewards = state.snapshot.rewards.map { it.copy(version = state.rewardVersion(it.id)) })
+    }
+    fun carePending(childId: Long? = selectedCareChildId): Boolean = synchronized(dataLock) {
+        careEnabled && childId != null && careEngine().hasPending(childId)
+    }
+    fun careStatus(childId: Long? = selectedCareChildId): String? = synchronized(dataLock) {
+        if (!careEnabled || childId == null) return@synchronized null
+        careEngine().status(childId)
+    }
+    suspend fun prepareCare() = withContext(Dispatchers.IO) { synchronized(dataLock) { prepareCareLocked() } }
+    private fun prepareCareLocked() {
+        if (!careEnabled) return
+        val active = room!!
+        val engine = careEngine(active)
+        store.transaction {
+            if (careRole == "child") {
+                val previousRoom = prefs.getString("lastCareRoom_$selfBotId", null)
+                val previous = previousRoom?.let { store.familyCare.state(it, selfBotId) }?.takeIf { it.authoritative }
+                engine.ensureAuthority(previous?.state ?: if (role == "child") store.cached() else null)
+                prefs.edit().putString("lastCareRoom_$selfBotId", active.id).commit()
+            }
+            else {
+                val oldChild = prefs.getLong("peerBotId", 0)
+                if (role == "guardian" && careChildren.any { it.botId == oldChild }) store.familyCare.importLegacyMovement(active.id, oldChild)
+                val now = System.currentTimeMillis()
+                careChildren.forEach { child ->
+                    val key = "careSync_${active.id}_${child.botId}"
+                    val previous = prefs.getLong(key, 0)
+                    val interval = if (store.familyCare.state(active.id, child.botId) == null) 60_000 else 300_000
+                    if (now < previous || now - previous >= interval) {
+                        engine.requestSync(child.botId)
+                        prefs.edit().putLong(key, now).commit()
+                    }
+                }
+            }
+        }
+    }
+    suspend fun sendCareAction(roomId: String, childId: Long, kind: String, payload: JSONObject,
+        id: String = UUID.randomUUID().toString(), expectedRewardVersion: Long? = null) = withContext(Dispatchers.IO) {
+        synchronized(dataLock) {
+            check(careEnabled && room?.id == roomId) { "가족방이 변경되었어요. 다시 시도해 주세요." }
+            prepareCareLocked()
+            careEngine().enqueueCommand(childId, kind, payload, id, expectedRewardVersion)
+        }
+        scheduleOutbox()
+    }
     var sharingEnabled: Boolean
         get() = prefs.getBoolean("sharingEnabled", false)
         set(value) { prefs.edit().putBoolean("sharingEnabled", value).commit() }
@@ -90,7 +172,14 @@ class AppRepository internal constructor(context: Context, private val clientFac
     }
     suspend fun enqueueEventOnly(kind: String, payload: JSONObject, id: String = UUID.randomUUID().toString()) = withContext(Dispatchers.IO) {
         synchronized(dataLock) {
-            check(paired) { "위치와 칭찬판은 기존 1:1 가족 연결이 필요해요." }
+            if (careEnabled && kind in FamilyCareValidation.telemetryKinds) {
+                check(careRole == "child") { "자녀 휴대폰에서 위치를 공유할 수 있어요." }
+                prepareCareLocked()
+                careEngine().emitChildEvent(FamilyEvent(id, kind, JSONObject(payload.toString()), "child", Instant.now().toString(), "relayed"))
+                return@synchronized
+            }
+            check(!careEnabled || kind == "chat") { "가족 칭찬판에서 자녀를 선택한 뒤 사용해 주세요." }
+            check(paired) { "1:1 가족 연결이 필요해요." }
             val event = TelegramLedger.validate(FamilyEvent(id, kind, JSONObject(payload.toString()), role, Instant.now().toString(), "pending"))
             require(TelegramProtocol.event(event).length <= 4096) { "메시지가 너무 길어요. 내용을 나누어 보내 주세요." }
             store.transaction {
@@ -108,9 +197,10 @@ class AppRepository internal constructor(context: Context, private val clientFac
     /** Durable FIFO: next event is sent only after the peer acknowledges the current one. */
     suspend fun synchronize(timeout: Int = 0) = withContext(Dispatchers.IO) { networkMutex.withLock {
         if (!configured) return@withLock
+        synchronized(dataLock) { prepareCareLocked() }
         val client = clientFactory(vault.get())
         val peerId = prefs.getLong("peerBotId", 0)
-        val peerRole = if (isChild) "guardian" else "child"
+        val peerRole = if (role == "child") "guardian" else "child"
         val coroutineContext = currentCoroutineContext()
         val familyChat = room?.let { active -> FamilyChatExchange(client, store.familyChat, active, selfBotId,
             lock = dataLock, checkActive = { coroutineContext.ensureActive() },
@@ -120,6 +210,7 @@ class AppRepository internal constructor(context: Context, private val clientFac
             val exchanged = TelegramExchange(client, store, peerId, peerRole, lock = dataLock,
                 checkActive = { coroutineContext.ensureActive() },
                 onReceived = { FamilyNotifications.received(app, it) }, familyChat = familyChat,
+                familyCare = if (careEnabled) careEngine(client = client, checkActive = { coroutineContext.ensureActive() }) else null,
                 onLegacyFailure = { prefs.edit().putString("legacyDeliveryError", it.message).commit() }).synchronize(timeout)
             if (exchanged) prefs.edit().apply {
                 val failure = pendingDeliveryError()
@@ -139,8 +230,13 @@ class AppRepository internal constructor(context: Context, private val clientFac
         store.localEvents().forEach { events[it.id] = it }
         snapshot.copy(events = events.values.sortedBy { it.measuredAt })
     }
-    suspend fun movementHistory(day: String? = null, before: MovementHistoryCursor? = null): MovementHistoryPage = withContext(Dispatchers.IO) {
-        synchronized(dataLock) { store.movementHistory(day, before) }
+    suspend fun movementHistory(day: String? = null, before: MovementHistoryCursor? = null,
+        careRoomId: String? = if (careEnabled) room?.id else null,
+        childId: Long? = selectedCareChildId): MovementHistoryPage = withContext(Dispatchers.IO) {
+        synchronized(dataLock) {
+            if (careRoomId != null && childId != null) store.familyCare.movementHistory(careRoomId, childId, day, before)
+            else store.movementHistory(day, before)
+        }
     }
     suspend fun privateChatHistory(before: MovementHistoryCursor? = null): PrivateChatHistoryPage = withContext(Dispatchers.IO) {
         synchronized(dataLock) { store.privateChatHistory(before) }
@@ -230,8 +326,9 @@ class AppRepository internal constructor(context: Context, private val clientFac
     } }
     fun hasPending(): Boolean = synchronized(dataLock) {
         store.pending().isNotEmpty() || store.receipts().isNotEmpty() || room?.let {
-            store.familyChat.pendingChatDeliveries(it.id).isNotEmpty() || store.familyChat.chatReceipts(it.id).isNotEmpty()
-        } == true
+            store.familyChat.pendingChatDeliveries(it.id).isNotEmpty() || store.familyChat.chatReceipts(it.id).isNotEmpty() ||
+                store.familyCare.pendingPackets(it.id).isNotEmpty() || store.familyCare.receipts(it.id).isNotEmpty()
+        } == true || (careEnabled && careChildren.any { careEngine().hasPending(it.botId) })
     }
     private fun pendingDeliveryError(): String? = synchronized(dataLock) {
         val failures = mutableListOf<String>()

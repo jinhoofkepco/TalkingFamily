@@ -6,6 +6,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -130,7 +131,7 @@ private fun Onboarding(state: UiState, actions: UiActions) {
             Button({ familyRoomFlow = "create" }, Modifier.fillMaxWidth().testTag("onboarding-create-room")) { Text("가족방 만들기") }
             OutlinedButton({ familyRoomFlow = "join" }, Modifier.fillMaxWidth().testTag("onboarding-join-room")) { Text("가족방 코드로 참여") }
         }
-        Text("위치·칭찬판도 함께 쓰는 1:1 연결", fontWeight = FontWeight.Bold, fontSize = 17.sp)
+        Text("기존 방식으로 1:1 연결", fontWeight = FontWeight.Bold, fontSize = 17.sp)
         SectionCard {
             Text("이 휴대폰은 누가 쓰나요?", fontWeight = FontWeight.Bold)
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -226,9 +227,11 @@ private fun RoleButton(value: String, selected: String, label: String, icon: Ima
 private fun FamilyHome(state: UiState, actions: UiActions) {
     val parent = state.role == "guardian" || state.role == "parent"
     val paired = state.paired || state.demoMode
-    var tab by rememberSaveable(state.role, state.room?.id, paired) { mutableStateOf(if (parent && paired && state.room == null) "location" else "chat") }
-    var popup by rememberSaveable(state.role) { mutableStateOf("") }
-    var selectedRewardId by rememberSaveable(state.role) { mutableStateOf<String?>(null) }
+    val canUseCare = paired || state.careEnabled
+    val careScope = careScopeKey(state)
+    var tab by rememberSaveable(state.role, state.room?.id, canUseCare) { mutableStateOf(if (parent && paired && state.room == null) "location" else "chat") }
+    var popup by rememberSaveable(state.role, careScope) { mutableStateOf("") }
+    var selectedRewardId by rememberSaveable(state.role, careScope) { mutableStateOf<String?>(null) }
     var lastHandledChatRequestId by rememberSaveable { mutableIntStateOf(0) }
     val keyboard = LocalSoftwareKeyboardController.current
     val openPopup: (String) -> Unit = { keyboard?.hide(); popup = it }
@@ -263,7 +266,7 @@ private fun FamilyHome(state: UiState, actions: UiActions) {
             }
         },
         bottomBar = {
-            if (parent && paired) NavigationBar(containerColor = Color.White, tonalElevation = 0.dp) {
+            if (parent && canUseCare) NavigationBar(containerColor = Color.White, tonalElevation = 0.dp) {
                 NavigationBarItem(tab == "chat", { tab = "chat" }, modifier = Modifier.testTag("nav-chat"), icon = { Icon(Icons.AutoMirrored.Outlined.Chat, null) }, label = { Text("대화") })
                 NavigationBarItem(tab == "location", { tab = "location" }, modifier = Modifier.testTag("nav-location"), icon = { Icon(Icons.Outlined.LocationOn, null) }, label = { Text("자녀 위치") })
                 NavigationBarItem(tab == "stickers", { tab = "stickers" }, modifier = Modifier.testTag("nav-stickers"), icon = { Icon(Icons.Outlined.Stars, null) }, label = { Text("칭찬판") })
@@ -272,12 +275,14 @@ private fun FamilyHome(state: UiState, actions: UiActions) {
     ) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
             when {
-                parent && paired && tab == "stickers" -> StickerScreen(state, actions,
-                    openRewards = { openPopup("reward-manager") },
-                    selectReward = { selectedRewardId = it; openPopup("reward-confirm") },
-                    openFamily = { openPopup("settings-family") },
-                )
-                parent && paired && tab == "location" -> LocationScreen(state, actions)
+                parent && canUseCare && tab == "stickers" -> key(careScope) {
+                    StickerScreen(state, actions,
+                        openRewards = { openPopup("reward-manager") },
+                        selectReward = { selectedRewardId = it; openPopup("reward-confirm") },
+                        openFamily = { openPopup("settings-family") },
+                    )
+                }
+                parent && canUseCare && tab == "location" -> key(careScope) { LocationScreen(state, actions) }
                 else -> FamilyChatScreen(state, actions, { openPopup("settings-menu") }, { openPopup("stickers") }, { openPopup("settings-room") })
             }
         }
@@ -290,7 +295,7 @@ private fun FamilyHome(state: UiState, actions: UiActions) {
             "reward-select", "reward-confirm" -> "stickers"
             else -> ""
         }
-        val title = when (popup) {
+        val baseTitle = when (popup) {
             "stickers" -> "칭찬판"
             "settings-menu" -> "설정"
             "settings-location" -> "자동 위치 공유"
@@ -304,6 +309,8 @@ private fun FamilyHome(state: UiState, actions: UiActions) {
             "reward-select" -> "어떤 약속으로 바꿀까요?"
             else -> "이 약속으로 바꿀까요?"
         }
+        val childName = state.careChildren.firstOrNull { it.botId == state.selectedChildBotId }?.displayName
+        val title = if (state.careEnabled && childName != null && popup in setOf("stickers", "reward-manager", "reward-editor", "reward-select", "reward-confirm")) "$baseTitle · $childName" else baseTitle
         ModalBottomSheet(
             onDismissRequest = { popup = "" },
             modifier = Modifier.testTag(if (popup == "stickers") "child-sticker-popup" else popup),
@@ -339,8 +346,20 @@ private fun FamilyHome(state: UiState, actions: UiActions) {
                             edit = { selectedRewardId = it; popup = "reward-editor" },
                         )
                         "reward-editor" -> RewardEditor(state, selectedRewardId,
-                            save = { name, cost -> actions.saveReward(selectedRewardId, name, cost); popup = "reward-manager" },
-                            delete = { selectedRewardId?.let(actions.deleteReward); popup = "reward-manager" },
+                            save = { name, cost, version ->
+                                val versioned = actions.saveRewardVersioned
+                                if (state.careEnabled && versioned != null) versioned(selectedRewardId, name, cost, version)
+                                else actions.saveReward(selectedRewardId, name, cost)
+                                popup = "reward-manager"
+                            },
+                            delete = { version ->
+                                selectedRewardId?.let { id ->
+                                    val versioned = actions.deleteRewardVersioned
+                                    if (state.careEnabled && versioned != null) versioned(id, version)
+                                    else actions.deleteReward(id)
+                                }
+                                popup = "reward-manager"
+                            },
                         )
                         "reward-select" -> RewardSelection(state) { selectedRewardId = it; popup = "reward-confirm" }
                         "reward-confirm" -> RewardConfirmation(state, selectedRewardId) {
@@ -360,8 +379,9 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
         while (true) { delay(30_000); value = Instant.now() }
     }
     val readings = state.locationHistory
-    var selectedRecordId by rememberSaveable(state.historyDay) { mutableStateOf<String?>(null) }
-    var focusRequest by rememberSaveable(state.historyDay) { mutableIntStateOf(0) }
+    val careScope = careScopeKey(state)
+    var selectedRecordId by rememberSaveable(careScope, state.historyDay) { mutableStateOf<String?>(null) }
+    var focusRequest by rememberSaveable(careScope, state.historyDay) { mutableIntStateOf(0) }
     val locations = remember(readings) {
         readings.filter { it.toEmbeddedMapHistoryPoint() != null }
             .sortedWith(compareBy<FamilyEvent> { Instant.parse(eventTime(it)) }.thenBy { it.id })
@@ -386,6 +406,7 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
     }
     val dayIndex = state.historyDays.indexOf(state.historyDay)
     LazyColumn(Modifier.fillMaxSize().testTag("location-list"), state = listState, contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        if (state.careEnabled) item(key = "care-child-selector") { CareChildSelector(state, actions) }
         item(key = "history-day") {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 IconButton({ state.historyDays.getOrNull(dayIndex + 1)?.let(actions.selectHistoryDay) }, enabled = dayIndex >= 0 && dayIndex + 1 < state.historyDays.size) { Icon(Icons.Outlined.ChevronLeft, "이전 기록 날짜") }
@@ -411,10 +432,10 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
             else Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Surface(shape = RoundedCornerShape(22.dp), modifier = Modifier.fillMaxWidth().height(500.dp).testTag("embedded-location-map")) {
                     Box(Modifier.fillMaxSize()) {
-                        key(state.historyDay) {
+                        key(careScope, state.historyDay) {
                             EmbeddedLocationMap(selectedMapPoint.location.latitude, selectedMapPoint.location.longitude,
                                 selectedMapPoint.location.accuracy ?: Double.NaN, Modifier.fillMaxSize(),
-                                focusToken = "${state.historyDay}/${selectedRecordId?.takeIf { it == selected.id } ?: "latest"}/$focusRequest",
+                                focusToken = "$careScope/${state.historyDay}/${selectedRecordId?.takeIf { it == selected.id } ?: "latest"}/$focusRequest",
                                 history = historyPoints, selectedHistoryIndex = selectedIndex, timelineInsetDp = timelineInset)
                         }
                         Surface(shape = RoundedCornerShape(18.dp), color = Color.White.copy(alpha = .97f), shadowElevation = 3.dp,
@@ -493,7 +514,7 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
                 TimelineCard(event, selected = event.id == selected?.id, onSelect = if (event.kind == "location" && locationPoint(event) != null) ({
                     selectedRecordId = event.id
                     focusRequest++
-                    scope.launch { listState.animateScrollToItem(1) }
+                    scope.launch { listState.animateScrollToItem(if (state.careEnabled) 2 else 1) }
                 }) else null)
             }
         }
@@ -553,6 +574,46 @@ private fun historyClock(value: String): String = runCatching {
     DateTimeFormatter.ofPattern("HH:mm:ss", Locale.KOREA).withZone(ZoneId.systemDefault()).format(Instant.parse(value))
 }.getOrDefault(value)
 
+private fun careScopeKey(state: UiState): String =
+    if (state.careEnabled) "${state.room?.id}/${state.selectedChildBotId}" else "private-${state.role}"
+
+private fun careActionsEnabled(state: UiState): Boolean =
+    !state.loading && (!state.careEnabled || (state.careReady && !state.carePending && state.selectedChildBotId != null))
+
+@Composable
+private fun CareChildSelector(state: UiState, actions: UiActions) {
+    if (!state.careEnabled || state.role !in setOf("guardian", "parent")) return
+    Column(Modifier.fillMaxWidth().testTag("care-child-selector"), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("자녀 선택", fontSize = 12.sp, color = Muted)
+        if (state.careChildren.isEmpty()) {
+            Text("가족방 명단에 아들 또는 딸로 등록된 자녀가 없어요.", fontSize = 13.sp, color = Muted)
+        } else Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            state.careChildren.forEach { child ->
+                FilterChip(
+                    selected = child.botId == state.selectedChildBotId,
+                    onClick = { actions.selectCareChild(child.botId) },
+                    label = { Text(child.displayName) },
+                    modifier = Modifier.testTag("care-child-${child.botId}"),
+                    leadingIcon = if (child.botId == state.selectedChildBotId) ({ Icon(Icons.Outlined.Check, null, Modifier.size(16.dp)) }) else null,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CareSyncStatus(state: UiState) {
+    if (!state.careEnabled) return
+    val message = state.careStatus ?: when {
+        !state.careReady -> "자녀의 칭찬판을 기다리고 있어요. 자녀 휴대폰에서 앱을 업데이트하고 메시지 수신을 켜 주세요."
+        state.carePending -> "전달 대기 · 자녀 휴대폰에서 확인하면 부모의 칭찬판에도 함께 반영돼요."
+        else -> null
+    }
+    if (message != null) Surface(color = WarmGold, shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth().testTag("care-sync-status")) {
+        Text(message, Modifier.padding(14.dp), fontSize = 13.sp, lineHeight = 20.sp, color = Ink)
+    }
+}
+
 @Composable
 private fun StickerScreen(
     state: UiState,
@@ -562,16 +623,20 @@ private fun StickerScreen(
     selectReward: (String) -> Unit,
     openFamily: () -> Unit,
 ) {
-    var awardDialog by rememberSaveable { mutableStateOf(false) }
+    var awardDialog by rememberSaveable(careScopeKey(state)) { mutableStateOf(false) }
     val parent = state.role == "guardian" || state.role == "parent"
+    val ready = !state.careEnabled || state.careReady
+    val actionsEnabled = careActionsEnabled(state)
     LazyColumn(Modifier.fillMaxSize().testTag("sticker-list"), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+        if (state.careEnabled && parent) item(key = "care-child-selector") { CareChildSelector(state, actions) }
         if (!popup) item {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("차곡차곡, 칭찬판", fontSize = 25.sp, fontWeight = FontWeight.Bold)
                 Text("작은 노력도 반짝이는 별이 돼요.", color = Muted, fontSize = 13.sp)
             }
         }
-        item {
+        if (state.careEnabled) item { CareSyncStatus(state) }
+        if (ready) item {
             Surface(color = Forest, shape = RoundedCornerShape(26.dp), modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     Text("지금 모은 칭찬", color = Color(0xFFDCEBDF), fontSize = 14.sp)
@@ -596,27 +661,27 @@ private fun StickerScreen(
             }
         }
         item {
-            Button(if (parent) { { awardDialog = true } } else openRewards, Modifier.fillMaxWidth().height(52.dp), enabled = !state.loading) {
+            Button(if (parent) { { awardDialog = true } } else openRewards, Modifier.fillMaxWidth().height(52.dp).testTag("sticker-action"), enabled = actionsEnabled) {
                 Icon(if (parent) Icons.Outlined.Add else Icons.Outlined.Redeem, null, Modifier.size(21.dp))
                 Spacer(Modifier.width(8.dp))
                 Text(if (parent) "칭찬 스티커 1개 주기" else "모은 스티커 사용하기", fontWeight = FontWeight.Bold)
             }
         }
-        if (state.redemptions.isNotEmpty()) item { Text(if (parent && state.redemptions.any { it.status == "pending" || it.status == "requested" }) "아이의 사용 요청" else "스티커 사용 기록", fontSize = 19.sp, fontWeight = FontWeight.Bold) }
-        items(state.redemptions, key = { it.id }) { redemption -> RedemptionCard(redemption, parent, state.loading, actions) }
+        if (ready && state.redemptions.isNotEmpty()) item { Text(if (parent && state.redemptions.any { it.status == "pending" || it.status == "requested" }) "아이의 사용 요청" else "스티커 사용 기록", fontSize = 19.sp, fontWeight = FontWeight.Bold) }
+        items(if (ready) state.redemptions else emptyList(), key = { it.id }) { redemption -> RedemptionCard(redemption, parent, !actionsEnabled, actions) }
         item {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("우리의 약속", Modifier.weight(1f), fontSize = 19.sp, fontWeight = FontWeight.Bold)
-                if (parent) TextButton(openRewards, Modifier.testTag("rewards-manage-button")) { Text("관리") }
+                if (parent) TextButton(openRewards, Modifier.testTag("rewards-manage-button"), enabled = actionsEnabled) { Text("관리") }
             }
         }
-        if (state.rewards.isEmpty()) item { EmptyCard(Icons.Outlined.Redeem, "아직 정한 약속이 없어요", if (parent) "관리에서 아이와 정한 선물을 추가해 주세요." else "아빠와 어떤 선물을 받을지 함께 정해 보세요.") }
-        items(state.rewards, key = { "reward-${it.id}" }) { reward ->
-            RewardCard(reward, if (parent) null else state.stickerBalance, !state.loading && (parent || state.stickerBalance >= reward.cost), if (parent) "reward-summary-${reward.id}" else "reward-item-${reward.id}") {
+        if (ready && state.rewards.isEmpty()) item { EmptyCard(Icons.Outlined.Redeem, "아직 정한 약속이 없어요", if (parent) "관리에서 아이와 정한 선물을 추가해 주세요." else "부모님과 어떤 선물을 받을지 함께 정해 보세요.") }
+        items(if (ready) state.rewards else emptyList(), key = { "reward-${it.id}" }) { reward ->
+            RewardCard(reward, if (parent) null else state.stickerBalance, actionsEnabled && (parent || state.stickerBalance >= reward.cost), if (parent) "reward-summary-${reward.id}" else "reward-item-${reward.id}") {
                 if (parent) openRewards() else selectReward(reward.id)
             }
         }
-        val awards = state.events.filter { it.kind == "sticker_award" }
+        val awards = if (ready) state.events.filter { it.kind == "sticker_award" } else emptyList()
         if (awards.isNotEmpty()) {
             item { Text("도착한 칭찬", fontSize = 19.sp, fontWeight = FontWeight.Bold) }
             items(awards.reversed(), key = { "award-${it.id}" }) { event ->
@@ -636,7 +701,7 @@ private fun StickerScreen(
             TextButton(openFamily, Modifier.fillMaxWidth().testTag("parent-family-connection")) { Text("가족 연결", color = Muted, fontSize = 12.sp) }
         }
     }
-    if (awardDialog) AwardDialog({ awardDialog = false }) { reason -> actions.awardSticker(reason); awardDialog = false }
+    if (awardDialog && actionsEnabled) AwardDialog({ awardDialog = false }) { reason -> actions.awardSticker(reason); awardDialog = false }
 }
 
 @Composable
@@ -652,8 +717,8 @@ private fun RedemptionCard(item: Redemption, parent: Boolean, loading: Boolean, 
             Pill(status, gold = pending)
         }
         if (parent && pending) Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            OutlinedButton({ actions.approveRedemption(item.id, false) }, Modifier.weight(1f), enabled = !loading) { Text("다시 의논하기", fontSize = 12.sp) }
-            Button({ actions.approveRedemption(item.id, true) }, Modifier.weight(1f), enabled = !loading) { Text("사용 승인", fontSize = 12.sp) }
+            OutlinedButton({ actions.approveRedemption(item.id, false) }, Modifier.weight(1f).testTag("redemption-reject-${item.id}"), enabled = !loading) { Text("다시 의논하기", fontSize = 12.sp) }
+            Button({ actions.approveRedemption(item.id, true) }, Modifier.weight(1f).testTag("redemption-approve-${item.id}"), enabled = !loading) { Text("사용 승인", fontSize = 12.sp) }
         }
     }
 }
@@ -686,9 +751,12 @@ private fun RewardCard(reward: Reward, balance: Int?, enabled: Boolean = true, t
 
 @Composable
 private fun RewardManager(state: UiState, add: () -> Unit, edit: (String) -> Unit) {
+    val ready = !state.careEnabled || state.careReady
+    val actionsEnabled = careActionsEnabled(state)
     val changes = state.events.filter { it.kind in setOf("reward_upsert", "reward_delete") && it.delivery.lowercase() !in setOf("relayed", "telegram_sent", "delivered") }
     LazyColumn(Modifier.fillMaxSize().testTag("reward-manager-list"), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         item { Text("아이와 함께 정한 선물과 스티커 개수예요.", fontSize = 14.sp, color = Muted) }
+        if (state.careEnabled) item { CareSyncStatus(state) }
         if (changes.isNotEmpty()) item {
             SectionCard {
                 Text("약속 변경 전달 상태", fontWeight = FontWeight.Medium)
@@ -699,39 +767,48 @@ private fun RewardManager(state: UiState, add: () -> Unit, edit: (String) -> Uni
                 Text("전달이 완료되면 약속 목록에 반영돼요.", fontSize = 12.sp, color = Muted)
             }
         }
-        items(state.rewards, key = { it.id }) { reward -> RewardCard(reward, null, !state.loading) { edit(reward.id) } }
-        if (state.rewards.isEmpty()) item { Text("첫 약속을 추가해 보세요.", color = Muted, fontSize = 14.sp) }
-        item { Button(add, Modifier.fillMaxWidth().height(50.dp).testTag("reward-add"), enabled = !state.loading) { Icon(Icons.Outlined.Add, null); Spacer(Modifier.width(6.dp)); Text("약속 추가") } }
+        items(if (ready) state.rewards else emptyList(), key = { it.id }) { reward -> RewardCard(reward, null, actionsEnabled) { edit(reward.id) } }
+        if (ready && state.rewards.isEmpty()) item { Text("첫 약속을 추가해 보세요.", color = Muted, fontSize = 14.sp) }
+        item { Button(add, Modifier.fillMaxWidth().height(50.dp).testTag("reward-add"), enabled = actionsEnabled) { Icon(Icons.Outlined.Add, null); Spacer(Modifier.width(6.dp)); Text("약속 추가") } }
         item { Text("이미 요청한 선물은 요청 당시의 이름과 스티커 개수로 남아요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp) }
     }
 }
 
 @Composable
-private fun RewardEditor(state: UiState, rewardId: String?, save: (String, Int) -> Unit, delete: () -> Unit) {
+private fun RewardEditor(state: UiState, rewardId: String?, save: (String, Int, Long) -> Unit, delete: (Long) -> Unit) {
     val reward = state.rewards.firstOrNull { it.id == rewardId }
-    var name by rememberSaveable(rewardId) { mutableStateOf(reward?.name.orEmpty()) }
-    var costText by rememberSaveable(rewardId) { mutableStateOf(reward?.cost?.toString().orEmpty()) }
-    var deleteDialog by rememberSaveable(rewardId) { mutableStateOf(false) }
+    val careScope = careScopeKey(state)
+    val actionsEnabled = careActionsEnabled(state)
+    var name by rememberSaveable(careScope, rewardId) { mutableStateOf(reward?.name.orEmpty()) }
+    var costText by rememberSaveable(careScope, rewardId) { mutableStateOf(reward?.cost?.toString().orEmpty()) }
+    var deleteDialog by rememberSaveable(careScope, rewardId) { mutableStateOf(false) }
+    val openedVersion by rememberSaveable(careScope, rewardId) { mutableLongStateOf(reward?.version ?: 0L) }
     val cost = costText.toIntOrNull()
     val missing = rewardId != null && reward == null
-    val valid = name.trim().isNotEmpty() && name.trim().length <= 60 && cost != null && cost in 1..999 && !missing
+    val changed = state.careEnabled && reward != null && reward.version != openedVersion
+    val valid = name.trim().isNotEmpty() && name.trim().length <= 60 && cost != null && cost in 1..999 && !missing && !changed
     Column(Modifier.fillMaxSize().imePadding().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+        CareSyncStatus(state)
         Text("아이와 정한 선물 이름과 필요한 스티커 개수만 적어 주세요.", color = Muted, fontSize = 14.sp, lineHeight = 22.sp)
         if (missing) Text("이 약속이 삭제되었어요. 목록으로 돌아가 다시 골라 주세요.", color = MaterialTheme.colorScheme.error)
+        if (changed) Text("다른 부모님이 이 약속을 바꿨어요. 입력한 내용은 남겨 두었으니 목록으로 돌아가 최신 약속을 다시 열어 주세요.",
+            Modifier.testTag("reward-editor-changed"), color = MaterialTheme.colorScheme.error, fontSize = 13.sp, lineHeight = 20.sp)
         OutlinedTextField(name, { if (it.length <= 60) name = it }, Modifier.fillMaxWidth().testTag("reward-name"), label = { Text("선물 이름") }, placeholder = { Text("함께 아이스크림 먹기") }, maxLines = 2, supportingText = { Text("${name.length}/60") }, enabled = !missing)
         OutlinedTextField(costText, { if (it.length <= 3 && it.all(Char::isDigit)) costText = it }, Modifier.fillMaxWidth().testTag("reward-cost"), label = { Text("필요한 스티커 개수") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), supportingText = { Text("1개부터 999개까지 정할 수 있어요.") }, isError = costText.isNotEmpty() && (cost == null || cost !in 1..999), enabled = !missing)
-        Button({ cost?.let { save(name.trim(), it) } }, Modifier.fillMaxWidth().height(50.dp).testTag("reward-save"), enabled = valid && !state.loading) { Text("약속 저장") }
-        if (rewardId != null) TextButton({ deleteDialog = true }, Modifier.fillMaxWidth().testTag("reward-delete"), enabled = !state.loading && !missing) { Text("이 약속 삭제", color = MaterialTheme.colorScheme.error) }
+        Button({ cost?.let { save(name.trim(), it, openedVersion) } }, Modifier.fillMaxWidth().height(50.dp).testTag("reward-save"), enabled = valid && actionsEnabled) { Text("약속 저장") }
+        if (rewardId != null) TextButton({ deleteDialog = true }, Modifier.fillMaxWidth().testTag("reward-delete"), enabled = actionsEnabled && !missing && !changed) { Text("이 약속 삭제", color = MaterialTheme.colorScheme.error) }
     }
-    if (deleteDialog) AlertDialog(onDismissRequest = { deleteDialog = false }, title = { Text("이 약속을 삭제할까요?") }, text = { Text("새 사용 요청 목록에서 지워집니다. 이미 요청한 선물과 사용 기록은 그대로 남아요.") }, confirmButton = { TextButton({ deleteDialog = false; delete() }, Modifier.testTag("reward-delete-confirm")) { Text("삭제") } }, dismissButton = { TextButton({ deleteDialog = false }) { Text("취소") } })
+    if (deleteDialog) AlertDialog(onDismissRequest = { deleteDialog = false }, title = { Text("이 약속을 삭제할까요?") }, text = { Text("새 사용 요청 목록에서 지워집니다. 이미 요청한 선물과 사용 기록은 그대로 남아요.") }, confirmButton = { TextButton({ deleteDialog = false; delete(openedVersion) }, Modifier.testTag("reward-delete-confirm"), enabled = actionsEnabled && !missing && !changed) { Text("삭제") } }, dismissButton = { TextButton({ deleteDialog = false }) { Text("취소") } })
 }
 
 @Composable
 private fun RewardSelection(state: UiState, select: (String) -> Unit) {
+    val ready = !state.careEnabled || state.careReady
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        item { Text("지금 모은 스티커 ${state.stickerBalance}개", color = Muted, fontSize = 14.sp) }
-        if (state.rewards.isEmpty()) item { EmptyCard(Icons.Outlined.Redeem, "아직 정한 약속이 없어요", "아빠와 선물과 필요한 스티커 개수를 정해 보세요.") }
-        items(state.rewards, key = { it.id }) { reward -> RewardCard(reward, state.stickerBalance, !state.loading && state.stickerBalance >= reward.cost) { select(reward.id) } }
+        if (state.careEnabled) item { CareSyncStatus(state) }
+        if (ready) item { Text("지금 모은 스티커 ${state.stickerBalance}개", color = Muted, fontSize = 14.sp) }
+        if (ready && state.rewards.isEmpty()) item { EmptyCard(Icons.Outlined.Redeem, "아직 정한 약속이 없어요", "부모님과 선물과 필요한 스티커 개수를 정해 보세요.") }
+        items(if (ready) state.rewards else emptyList(), key = { it.id }) { reward -> RewardCard(reward, state.stickerBalance, careActionsEnabled(state) && state.stickerBalance >= reward.cost) { select(reward.id) } }
     }
 }
 
@@ -739,7 +816,10 @@ private fun RewardSelection(state: UiState, select: (String) -> Unit) {
 private fun RewardConfirmation(state: UiState, rewardId: String?, request: () -> Unit) {
     val reward = state.rewards.firstOrNull { it.id == rewardId }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(22.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
-        if (reward == null) {
+        CareSyncStatus(state)
+        if (state.careEnabled && !state.careReady) {
+            Text("칭찬판을 받은 뒤 다시 골라 주세요.", color = Muted)
+        } else if (reward == null) {
             Text("약속이 바뀌었어요. 칭찬판에서 다시 골라 주세요.", color = Muted)
         } else {
             SectionCard {
@@ -747,9 +827,9 @@ private fun RewardConfirmation(state: UiState, rewardId: String?, request: () ->
                 Text(reward.name, fontSize = 21.sp, fontWeight = FontWeight.Bold)
                 Text("스티커 ${reward.cost}개", color = Forest, fontSize = 17.sp)
             }
-            Text("지금 모은 스티커 ${state.stickerBalance}개\n아빠가 승인하면 ${reward.cost}개가 사용돼요.", color = Muted, lineHeight = 24.sp)
+            Text("지금 모은 스티커 ${state.stickerBalance}개\n부모님이 승인하면 ${reward.cost}개가 사용돼요.", color = Muted, lineHeight = 24.sp)
             if (state.stickerBalance < reward.cost) Text("${reward.cost - state.stickerBalance}개 더 모으면 돼요.", color = Gold)
-            Button(request, Modifier.fillMaxWidth().height(52.dp).testTag("reward-request"), enabled = !state.loading && state.stickerBalance >= reward.cost) { Text("아빠에게 사용 요청하기") }
+            Button(request, Modifier.fillMaxWidth().height(52.dp).testTag("reward-request"), enabled = careActionsEnabled(state) && state.stickerBalance >= reward.cost) { Text("부모님에게 사용 요청하기") }
         }
     }
 }
@@ -759,11 +839,11 @@ private fun SettingsMenu(state: UiState, select: (String) -> Unit) {
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("원하는 항목을 골라 주세요.", fontSize = 14.sp, color = Muted)
         SettingsMenuItem("가족 단체방", state.room?.let { "${it.title} · ${it.members.size}명" } ?: "가족방 만들기 · 코드로 참여", Icons.Outlined.Groups, "settings-room-menu-item") { select("settings-room") }
-        if (state.paired || state.demoMode) {
+        if (state.paired || state.demoMode || state.careEnabled) {
             SettingsMenuItem("자동 위치 공유", "현재 ${if (state.sharingEnabled) "켜짐" else "꺼짐"} · 공유 켜기 / 끄기", Icons.Outlined.MyLocation, "settings-location-menu-item") { select("settings-location") }
             SettingsMenuItem("공유 정보 안내", "공유하는 정보와 기록 보관", Icons.Outlined.Shield, "settings-info-menu-item") { select("settings-info") }
         }
-        SettingsMenuItem(if (state.paired || state.demoMode) "가족 연결" else "메시지 수신", "연결 상태 · 수신 설정", Icons.Outlined.FavoriteBorder, "settings-family-menu-item") { select("settings-family") }
+        SettingsMenuItem(if (state.paired || state.demoMode || state.careEnabled) "가족 연결" else "메시지 수신", "연결 상태 · 수신 설정", Icons.Outlined.FavoriteBorder, "settings-family-menu-item") { select("settings-family") }
         SettingsMenuItem("별 아이콘", when {
             state.overlayEnabled && state.overlayPermissionGranted -> "켜짐 · 다른 앱에서 대화 열기"
             state.overlaySavedEnabled -> "다시 표시 대기"
@@ -793,7 +873,11 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
     val child = state.role == "child"
     val context = LocalContext.current
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
-        if (section == "location" && (state.paired || state.demoMode)) SectionCard {
+        if (section == "location" && (state.paired || state.demoMode || state.careEnabled)) SectionCard {
+            if (state.careEnabled) {
+                state.careChildren.firstOrNull { it.botId == state.selectedChildBotId }?.let { Text("${it.displayName}의 위치 공유", fontWeight = FontWeight.Medium) }
+                Text("가족방의 엄마·아빠에게 위치를 공유해요. 다른 자녀나 대화 전용 가족에게는 보내지 않아요.", fontSize = 12.sp, color = Muted, lineHeight = 19.sp)
+            }
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                     Text("자동 위치 공유", fontWeight = FontWeight.Medium)
@@ -851,13 +935,13 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
                     Text("각 가족 휴대폰에서 수신을 켜 두면 메시지를 계속 받을 수 있어요. 수신 중에는 배터리를 사용합니다. 절전·강제 종료·인터넷 끊김으로 수신이 멈출 수 있으니 앱을 다시 열어 확인해 주세요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
                     Text("‘상대 기기 수신’은 상대 앱이 메시지를 받은 상태예요. 사람이 읽었다는 뜻은 아니에요. 상대 앱에서 받을 때까지 전송 대기로 표시될 수 있어요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
                 }
-                if (state.paired || state.demoMode) TextButton(firstGuide, Modifier.testTag("first-guide-button")) { Icon(Icons.Outlined.Info, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text("처음 안내 다시 보기") }
+                if (state.paired || state.demoMode || state.careEnabled) TextButton(firstGuide, Modifier.testTag("first-guide-button")) { Icon(Icons.Outlined.Info, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text("처음 안내 다시 보기") }
                 OutlinedButton(actions.refresh, Modifier.fillMaxWidth(), enabled = !state.loading) { Icon(Icons.Outlined.Refresh, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text("새로 고침") }
             }
             if (!state.demoMode) SectionCard {
                 Text("실행 알림 표시 설정", fontWeight = FontWeight.Bold)
                 Text("대화 메시지 알림은 유지하고, 아래 실행 알림만 따로 숨길 수 있어요. 열린 Android 설정에서 해당 알림의 허용을 꺼 주세요.", color = Muted, fontSize = 12.sp, lineHeight = 19.sp)
-                if (child && state.paired) OutlinedButton({ ServiceNotificationSettings.open(context, ServiceNotificationSettings.Kind.LOCATION) }, Modifier.fillMaxWidth()) { Text("위치 공유 알림") }
+                if (child && (state.paired || state.careEnabled)) OutlinedButton({ ServiceNotificationSettings.open(context, ServiceNotificationSettings.Kind.LOCATION) }, Modifier.fillMaxWidth()) { Text("위치 공유 알림") }
                 OutlinedButton({ ServiceNotificationSettings.open(context, ServiceNotificationSettings.Kind.RECEIVING) }, Modifier.fillMaxWidth()) { Text("메시지 수신 대기 알림") }
                 OutlinedButton({ ServiceNotificationSettings.open(context, ServiceNotificationSettings.Kind.STAR) }, Modifier.fillMaxWidth()) { Text("별 아이콘 실행 알림") }
             }
@@ -877,6 +961,7 @@ private fun SettingsScreen(state: UiState, actions: UiActions, section: String, 
         icon = { Icon(Icons.Outlined.MyLocation, null, tint = Forest) },
         title = { Text("자동 위치를 공유할까요?") },
         text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            if (state.careEnabled) Text("수신하는 부모님: ${state.room?.members?.filter { it.relationship in setOf("mother", "father") }?.joinToString { it.displayName }.orEmpty()}", fontWeight = FontWeight.Medium)
             Text("움직임이 없어도 약 5분마다 새 위치를 요청해 좌표·측정 시각·정확도와 움직임 상태를 보호자에게 보냅니다. 기압계가 있으면 상대 높이 변화로 오르내림 시작과 종료도 추정해 보냅니다.", lineHeight = 22.sp)
             Text("화면이 꺼져 있어도 공유를 이어가며, 켠 설정은 직접 끄기 전까지 기억해 앱을 다시 열면 이어서 공유합니다. 위치 신호·절전·통신 상태에 따라 기록과 전달이 늦어질 수 있어요.", lineHeight = 22.sp)
             Text("텔레그램 봇을 통해 보호자의 앱으로 전달되며 공유 중에는 휴대폰 알림이 표시됩니다. 언제든 이 설정에서 끌 수 있어요. 보호자 휴대폰에서 메시지 수신을 켜 두어야 빠르게 받을 수 있어요.", lineHeight = 22.sp)
@@ -966,7 +1051,7 @@ private fun FirstGuide() {
         }
         SectionCard {
             Text("대화하면서 위치를 보낼 수 있어요", fontWeight = FontWeight.Medium)
-            Text("대화의 ‘현재 위치 공유’를 누르면 그때의 위치를 한 번 아빠에게 보내요.", fontSize = 14.sp, lineHeight = 22.sp)
+            Text("대화의 ‘현재 위치 공유’를 누르면 그때의 위치를 한 번 부모님에게 보내요.", fontSize = 14.sp, lineHeight = 22.sp)
             Text("자동 공유는 따로 켜요", fontWeight = FontWeight.Medium)
             Text("자녀 대화에 정확히 ‘설정’을 보내고 자동 위치 공유를 고르세요. 동의하고 켜면 움직임이 없어도 약 5분마다 새 위치를 요청해요. 화면이 꺼져 있어도 공유를 이어가고, 앱을 다시 열면 켜 둔 공유 설정을 이어가요. 필요한 위치·신체 활동·알림 권한을 요청해요.", fontSize = 14.sp, lineHeight = 22.sp)
             Text("위치 신호·절전·통신 상태에 따라 기록과 전달이 늦어질 수 있어요. 자동 위치 공유 설정에서 최근 측정 시각과 전달 상태를 확인할 수 있어요.", fontSize = 13.sp, color = Muted, lineHeight = 21.sp)

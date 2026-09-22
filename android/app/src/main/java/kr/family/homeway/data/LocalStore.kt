@@ -10,8 +10,9 @@ import java.time.LocalDate
 import java.time.ZoneId
 
 class LocalStore internal constructor(context: Context, databaseName: String = "homeway.db") :
-    SQLiteOpenHelper(context, databaseName, null, 4), TelegramExchangeStore {
+    SQLiteOpenHelper(context, databaseName, null, 5), TelegramExchangeStore {
     val familyChat = SqliteFamilyChatStore(this)
+    val familyCare = SqliteFamilyCareStore(this)
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE outbox (id TEXT PRIMARY KEY, event TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', error TEXT)")
         db.execSQL("CREATE TABLE cache (id INTEGER PRIMARY KEY CHECK(id=1), state TEXT NOT NULL)")
@@ -19,6 +20,7 @@ class LocalStore internal constructor(context: Context, databaseName: String = "
         createMovementTables(db)
         createPrivateChatTables(db)
         SqliteFamilyChatStore.createTables(db)
+        SqliteFamilyCareStore.createTables(db)
     }
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         if (oldVersion < 2) createTelegramTables(db)
@@ -54,6 +56,8 @@ class LocalStore internal constructor(context: Context, databaseName: String = "
                 }
             }
         }
+        // New family-care tables are additive. Existing pair/chat ledgers and Telegram cursors stay intact.
+        if (oldVersion < 5) SqliteFamilyCareStore.createTables(db)
     }
     private fun createTelegramTables(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE telegram_receipts (id TEXT PRIMARY KEY)")
@@ -124,6 +128,7 @@ class LocalStore internal constructor(context: Context, databaseName: String = "
         writableDatabase.execSQL("DELETE FROM movement_history")
         writableDatabase.execSQL("DELETE FROM private_chat_history")
         SqliteFamilyChatStore.clearTables(writableDatabase)
+        SqliteFamilyCareStore.clearTables(writableDatabase)
     }
 
     /** Stable older-message pages, returned oldest first for a conversation list. */

@@ -34,7 +34,7 @@ data class FamilyEvent(
     }
 }
 data class Redemption(val id: String, val reward: String, val cost: Int, val status: String)
-data class Reward(val id: String, val name: String, val cost: Int)
+data class Reward(val id: String, val name: String, val cost: Int, val version: Long = 0)
 data class FamilySnapshot(
     val events: List<FamilyEvent> = emptyList(), val stickerBalance: Int = 0,
     val redemptions: List<Redemption> = emptyList(), val sharingEnabled: Boolean = false,
@@ -62,7 +62,7 @@ data class FamilySnapshot(
                 }, j.optBoolean("sharingEnabled"), j.optString("transport", "unconfigured"), j.optBoolean("pushConfigured"),
                 (0 until (rewards?.length() ?: 0)).map {
                     val reward = rewards!!.getJSONObject(it)
-                    Reward(reward.getString("id"), reward.getString("name"), reward.getInt("cost"))
+                    Reward(reward.getString("id"), reward.getString("name"), reward.getInt("cost"), reward.optLong("version", 0))
                 }
             )
         }
