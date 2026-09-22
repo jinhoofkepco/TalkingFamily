@@ -8,6 +8,33 @@ import java.io.IOException
 import java.util.UUID
 
 class FamilyChatExchangeTest {
+    @Test fun `family chat activity counts new sibling message once even if later ACK is rate limited`() {
+        val family = Family()
+        val message = family.enqueue(303, "딸에게 보내는 새 메시지")
+        family.sync(303)
+        family.telegram.rateLimitSendFrom = 404
+        assertThrows(TelegramException::class.java) { family.sync(404) }
+        assertEquals(listOf(404L), family.chatActivity)
+        assertEquals(message.text, family.stores.getValue(404).chatMessage(family.room.id, message.id)?.text)
+        family.time += 31_000
+        family.telegram.inject(303, 404, FamilyChatProtocol.message(message))
+        family.telegram.inject(303, 404, "invalid packet")
+        family.sync(404)
+        family.sync(303) // only incoming acknowledgements
+        assertEquals(listOf(404L), family.chatActivity)
+    }
+
+    @Test fun `rolled back room chat cannot reset the receive schedule`() {
+        val family = Family()
+        family.enqueue(303, "커밋 후에만")
+        family.sync(303)
+        family.stores.getValue(404).failCommit = true
+        assertThrows(IOException::class.java) { family.sync(404) }
+        assertTrue(family.chatActivity.isEmpty())
+        family.sync(404)
+        assertEquals(listOf(404L), family.chatActivity)
+    }
+
     @Test fun `four phones including two parents exchange and acknowledge one room`() {
         val family = Family()
         val messages = family.ids.map { family.enqueue(it, "안녕 $it") }
@@ -257,6 +284,7 @@ class FamilyChatExchangeTest {
         val stores = ids.associateWith { MemoryStore() }.toMutableMap()
         val telegram = FakeTelegram()
         val notifications = mutableListOf<Pair<Long, String>>()
+        val chatActivity = mutableListOf<Long>()
         var time = 1_000_000L
         var legacyPaired = false
         private fun client(id: Long) = TelegramClient("$id:${"a".repeat(32)}", telegram)
@@ -266,7 +294,8 @@ class FamilyChatExchangeTest {
             text, "2026-09-22T12:00:00Z").also { channel(id).enqueue(it) }
         fun sync(id: Long): Boolean = TelegramExchange(client(id), stores.getValue(id),
             if (legacyPaired) when (id) { 101L -> 202L; 202L -> 101L; else -> 0L } else 0L,
-            if (id == 101L) "guardian" else "child", now = { time }, familyChat = channel(id)).synchronize()
+            if (id == 101L) "guardian" else "child", now = { time }, familyChat = channel(id),
+            onNewChatCommitted = { chatActivity += id }).synchronize()
         fun drain() { repeat(12) { ids.forEach { sync(it) }; time += 1001 } }
         fun restart(id: Long) { stores[id] = MemoryStore(stores.getValue(id).saved()) }
         fun startWithOnlyCreatorConnected() {

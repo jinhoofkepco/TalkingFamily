@@ -77,7 +77,7 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
 
     override fun queuePacket(packet: FamilyCareOutgoing) = transaction {
         val db = owner.writableDatabase
-        require(packet.peerId > 0 && packet.childId > 0 && packet.sentAt >= 0)
+        require(packet.peerId > 0 && packet.childId > 0 && packet.sentAt >= 0 && (!packet.sendConfirmed || packet.sentAt > 0))
         val old = db.rawQuery("SELECT child_id,text,digest FROM family_care_packets WHERE room_id=? AND id=?",
             arrayOf(packet.roomId, packet.packetId)).use { if (it.moveToFirst()) Triple(it.getLong(0), it.getString(1), it.getString(2)) else null }
         require(old == null || old == Triple(packet.childId, packet.text, packet.digest)) {
@@ -89,22 +89,29 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
         }, SQLiteDatabase.CONFLICT_IGNORE)
         db.insertWithOnConflict("family_care_deliveries", null, ContentValues().apply {
             put("room_id", packet.roomId); put("packet_id", packet.packetId); put("peer_id", packet.peerId)
-            put("sent_at", packet.sentAt); put("completed", 0)
+            put("sent_at", packet.sentAt); put("send_confirmed", if (packet.sendConfirmed) 1 else 0); put("completed", 0)
         }, SQLiteDatabase.CONFLICT_IGNORE)
         Unit
     }
 
     override fun pendingPackets(roomId: String): List<FamilyCareOutgoing> = owner.readableDatabase.rawQuery(
-        "SELECT p.id,p.child_id,d.peer_id,p.text,p.digest,d.sent_at FROM family_care_packets p " +
+        "SELECT p.id,p.child_id,d.peer_id,p.text,p.digest,d.sent_at,d.send_confirmed FROM family_care_packets p " +
             "JOIN family_care_deliveries d ON d.room_id=p.room_id AND d.packet_id=p.id " +
             "WHERE p.room_id=? AND d.completed=0 ORDER BY p.rowid,d.peer_id", arrayOf(roomId)
     ).use { rows -> buildList { while (rows.moveToNext()) add(FamilyCareOutgoing(roomId, rows.getString(0),
-        rows.getLong(1), rows.getLong(2), rows.getString(3), rows.getString(4), rows.getLong(5))) } }
+        rows.getLong(1), rows.getLong(2), rows.getString(3), rows.getString(4), rows.getLong(5), rows.getInt(6) == 1)) } }
 
     override fun markSent(roomId: String, packetId: String, peerId: Long, sentAt: Long) {
         require(sentAt > 0)
-        owner.writableDatabase.update("family_care_deliveries", ContentValues().apply { put("sent_at", sentAt) },
+        owner.writableDatabase.update("family_care_deliveries", ContentValues().apply {
+            put("sent_at", sentAt); put("send_confirmed", 0)
+        },
             "room_id=? AND packet_id=? AND peer_id=? AND completed=0", arrayOf(roomId, packetId, peerId.toString()))
+    }
+
+    override fun markSendConfirmed(roomId: String, packetId: String, peerId: Long) {
+        owner.writableDatabase.update("family_care_deliveries", ContentValues().apply { put("send_confirmed", 1) },
+            "room_id=? AND packet_id=? AND peer_id=? AND sent_at>0 AND completed=0", arrayOf(roomId, packetId, peerId.toString()))
     }
 
     override fun acknowledge(roomId: String, packetId: String, peerId: Long, digest: String) {
@@ -292,6 +299,7 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
             db.execSQL("CREATE TABLE family_care_received (room_id TEXT NOT NULL,packet_id TEXT NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(room_id,packet_id))")
             db.execSQL("CREATE TABLE family_care_packets (room_id TEXT NOT NULL,id TEXT NOT NULL,child_id INTEGER NOT NULL,text TEXT NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(room_id,id))")
             db.execSQL("CREATE TABLE family_care_deliveries (room_id TEXT NOT NULL,packet_id TEXT NOT NULL,peer_id INTEGER NOT NULL,sent_at INTEGER NOT NULL DEFAULT 0," +
+                "send_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(send_confirmed IN (0,1))," +
                 "completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0,1)),PRIMARY KEY(room_id,packet_id,peer_id))")
             db.execSQL("CREATE INDEX family_care_delivery_pending ON family_care_deliveries(room_id,completed,packet_id,peer_id)")
             db.execSQL("CREATE TABLE family_care_receipts (room_id TEXT NOT NULL,packet_id TEXT NOT NULL,child_id INTEGER NOT NULL,peer_id INTEGER NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(room_id,packet_id,peer_id))")

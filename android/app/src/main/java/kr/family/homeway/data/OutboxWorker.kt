@@ -16,8 +16,9 @@ class OutboxWorker(context: Context, params: WorkerParameters) : CoroutineWorker
             receiverRunning = { TelegramReceiveService.runtime.value.running },
             hasPending = repo::hasPending,
             retryDelayMillis = repo::synchronizationRetryDelayMillis,
-            exchange = { repo.flush() },
+            exchange = { repo.synchronizeScheduled(0) },
             wakeReceiver = { TelegramPollWakeup.signal() },
+            nextDelayMillis = { repo.receiveDelayMillis().coerceIn(TelegramOutboxDrain.STEP_MILLIS, 15_000L) },
         )
         return if (complete) Result.success() else Result.retry()
     }
@@ -36,6 +37,7 @@ internal object TelegramOutboxDrain {
         retryDelayMillis: () -> Long,
         exchange: suspend () -> Unit,
         wakeReceiver: () -> Unit,
+        nextDelayMillis: () -> Long = { STEP_MILLIS },
         nowMillis: () -> Long = { System.nanoTime() / 1_000_000 },
         pause: suspend (Long) -> Unit = { delay(it) },
     ): Boolean {
@@ -55,7 +57,11 @@ internal object TelegramOutboxDrain {
                 exchange()
                 if (!hasPending()) return true
                 if (round == MAX_ROUNDS - 1 || nowMillis() - startedAt >= START_WINDOW_MILLIS) return false
-                pause(STEP_MILLIS)
+                val nextDelay = nextDelayMillis().coerceAtLeast(STEP_MILLIS)
+                // In background an ACK may legitimately wait for the next scheduled receive.
+                // Keep the durable retry instead of polling every second while that deadline is far away.
+                if (nowMillis() - startedAt + nextDelay >= START_WINDOW_MILLIS) return false
+                pause(nextDelay)
             }
         } catch (cancelled: CancellationException) { throw cancelled }
         catch (_: Exception) { return false }

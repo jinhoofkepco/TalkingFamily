@@ -56,7 +56,6 @@ class TelegramReceiveService : Service() {
         state.value = ReceiveState(true)
         if (polling?.isActive != true) polling = scope.launch {
             val repo = AppRepository(this@TelegramReceiveService)
-            val schedule = TelegramReceiveSchedule()
             while (isActive && repo.configured) {
                 // Capture before inspecting the queue: a send during the exchange or subsequent
                 // pause must remain visible, even if the HTTP poll already returned.
@@ -69,17 +68,20 @@ class TelegramReceiveService : Service() {
                 val startedAt = SystemClock.elapsedRealtime()
                 var waitMillis: Long
                 try {
-                    repo.synchronize(schedule.nextTimeoutSeconds(repo.hasPending(), revision))
+                    repo.synchronizeScheduled(TelegramChatReceiveSchedule.FOREGROUND_POLL_SECONDS)
                     state.value = ReceiveState(true)
                     // Long polling already waited. Only fast returns need pacing, including
                     // empty replies and a repository exchange skipped by a racing backoff.
-                    waitMillis = (TelegramReceiveSchedule.MIN_CYCLE_MILLIS -
-                        (SystemClock.elapsedRealtime() - startedAt)).coerceAtLeast(0)
+                    val receiveDelay = repo.receiveDelayMillis()
+                    val outgoingRetry = if (repo.hasPending()) OUTBOX_RECHECK_MILLIS else Long.MAX_VALUE
+                    waitMillis = if (receiveDelay > 0) minOf(receiveDelay, outgoingRetry)
+                        else (TelegramChatReceiveSchedule.MIN_CYCLE_MILLIS -
+                            (SystemClock.elapsedRealtime() - startedAt)).coerceAtLeast(0)
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (_: Exception) {
                     state.value = ReceiveState(true, "인터넷과 봇 설정을 확인해 주세요. 연결을 다시 시도하고 있어요.")
                     waitMillis = repo.synchronizationRetryDelayMillis().takeIf { it > 0 }
-                        ?: TelegramReceiveSchedule.ERROR_RETRY_MILLIS
+                        ?: TelegramChatReceiveSchedule.ERROR_RETRY_MILLIS
                 }
                 awaitWake(revision, waitMillis)
             }
@@ -103,6 +105,7 @@ class TelegramReceiveService : Service() {
         private const val CHANNEL = "family_telegram_receiving"
         private const val NOTIFICATION = 4040
         private const val ACTION_STOP = "kr.family.homeway.STOP_TELEGRAM_RECEIVING"
+        private const val OUTBOX_RECHECK_MILLIS = 15_000L
         data class ReceiveState(val running: Boolean, val error: String? = null)
         private val state = MutableStateFlow(ReceiveState(false))
         val runtime = state.asStateFlow()
@@ -117,31 +120,5 @@ class TelegramReceiveService : Service() {
             context.stopService(Intent(context, TelegramReceiveService::class.java))
             state.value = ReceiveState(false)
         }
-    }
-}
-
-/** Short bursts advance ACK-dependent queues; an offline peer cannot keep fast polling alive. */
-internal class TelegramReceiveSchedule {
-    private var previousRevision: Long? = null
-    private var previouslyPending = false
-    private var fastRoundsLeft = 0
-
-    fun nextTimeoutSeconds(hasPending: Boolean, revision: Long): Int {
-        val awakened = previousRevision != revision
-        if (awakened || (hasPending && !previouslyPending)) fastRoundsLeft = MAX_FAST_ROUNDS
-        previousRevision = revision
-        previouslyPending = hasPending
-        if (awakened || (hasPending && fastRoundsLeft > 0)) {
-            fastRoundsLeft--
-            return 0
-        }
-        return IDLE_POLL_SECONDS
-    }
-
-    companion object {
-        const val MAX_FAST_ROUNDS = 8
-        const val IDLE_POLL_SECONDS = 10
-        const val MIN_CYCLE_MILLIS = 1_000L
-        const val ERROR_RETRY_MILLIS = 15_000L
     }
 }

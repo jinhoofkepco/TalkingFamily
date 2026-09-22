@@ -5,9 +5,9 @@ import org.junit.Test
 
 class AdaptiveTrackingCadenceTest {
     private fun idle(cadence: AdaptiveTrackingCadence, now: Long) =
-        assertEquals(AdaptiveTrackingCadence.IDLE_INTERVAL_MILLIS, cadence.intervalMillis(now))
+        assertEquals(300_000L, cadence.intervalMillis(now))
     private fun moving(cadence: AdaptiveTrackingCadence, now: Long) =
-        assertEquals(AdaptiveTrackingCadence.MOVING_INTERVAL_MILLIS, cadence.intervalMillis(now))
+        assertEquals(20_000L, cadence.intervalMillis(now))
 
     @Test fun noActivityOrOnlyStillAndExitEvidenceNeverInventsMovement() {
         val cadence = AdaptiveTrackingCadence()

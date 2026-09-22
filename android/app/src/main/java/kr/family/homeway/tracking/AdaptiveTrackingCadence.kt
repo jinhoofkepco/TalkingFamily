@@ -102,7 +102,7 @@ class AdaptiveTrackingCadence {
     private fun moving(state: MotionState) = state in setOf(MotionState.WALKING, MotionState.RUNNING, MotionState.BICYCLE, MotionState.VEHICLE)
 
     companion object {
-        const val MOVING_INTERVAL_MILLIS = 30_000L
+        const val MOVING_INTERVAL_MILLIS = 20_000L
         const val IDLE_INTERVAL_MILLIS = 300_000L
         const val MAX_ACTIVITY_AGE_MILLIS = 30_000L
         const val MAX_SENSOR_AGE_MILLIS = 30_000L

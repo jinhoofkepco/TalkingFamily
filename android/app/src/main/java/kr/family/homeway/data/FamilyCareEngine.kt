@@ -148,8 +148,8 @@ class FamilyCareEngine(
             } catch (_: IllegalArgumentException) { return }
             catch (_: org.json.JSONException) { return }
             // Storage failures must roll back the shared receive offset, not disappear as malformed input.
-            val first = store.pendingPackets(room.id).firstOrNull { it.peerId == packet.actorId }
-            if (first?.packetId == packet.id && first.childId == packet.childId && first.digest == digest && first.sentAt > 0) {
+            val pending = store.pendingPackets(room.id).firstOrNull { it.peerId == packet.actorId && it.packetId == packet.id }
+            if (pending != null && pending.childId == packet.childId && pending.digest == digest && pending.sentAt > 0) {
                 store.acknowledge(room.id, packet.id, packet.actorId, digest)
                 store.setRetryAfter(room.id, packet.actorId, 0)
             }
@@ -364,13 +364,24 @@ class FamilyCareEngine(
     }
 
     fun hasReadyWork(): Boolean = synchronized(lock) {
-        val peers = (store.pendingPackets(room.id).map { it.peerId } + store.receipts(room.id).map { it.peerId }).distinct()
+        val packets = store.pendingPackets(room.id)
+        val receipts = store.receipts(room.id)
+        val peers = (packets.map { it.peerId } + receipts.map { it.peerId }).distinct()
         peers.any { peer -> store.retryAfter(room.id, peer) <= now() &&
-            (store.receipts(room.id).any { it.peerId == peer } ||
-                store.pendingPackets(room.id).firstOrNull { it.peerId == peer }?.let {
-                    it.sentAt == 0L || now() - it.sentAt >= 30_000
-                } == true)
+            (receipts.any { it.peerId == peer } || nextSendable(packets.filter { it.peerId == peer }) != null)
         }
+    }
+
+    /** Confirmed HTTP sends may await ACK together; an ambiguous attempt blocks everything after it. */
+    private fun nextSendable(packets: List<FamilyCareOutgoing>, sentThisFlush: Set<String> = emptySet()): FamilyCareOutgoing? {
+        for (packet in packets.take(MAX_UNACKNOWLEDGED_PER_PEER)) {
+            if (packet.packetId in sentThisFlush) continue
+            if (packet.sentAt == 0L) return packet
+            val retryDue = now() - packet.sentAt >= RETRY_MILLIS
+            if (!packet.sendConfirmed) return packet.takeIf { retryDue }
+            if (retryDue) return packet
+        }
+        return null
     }
 
     /** A slow family member cannot block the other parent, another child, or the v2/v3 lanes. */
@@ -381,22 +392,34 @@ class FamilyCareEngine(
             val member = room.members.firstOrNull { it.botId == peer } ?: continue
             if (synchronized(lock) { store.retryAfter(room.id, peer) > now() }) continue
             try {
-                val receipt = synchronized(lock) { store.receipts(room.id).firstOrNull { it.peerId == peer } }
-                if (receipt != null) {
+                for (index in 0 until MAX_RECEIPTS_PER_FLUSH) {
+                    val receipt = synchronized(lock) { store.receipts(room.id).firstOrNull { it.peerId == peer } } ?: break
+                    checkActive()
                     client.sendToFamilyMember(member, FamilyCareProtocol.receipt(room, ownBotId, receipt), checkActive)
                     synchronized(lock) { store.transaction { store.removeReceipt(receipt) } }
-                    continue
                 }
-                val packet = synchronized(lock) { store.pendingPackets(room.id).firstOrNull { it.peerId == peer } }
-                if (packet != null && (packet.sentAt == 0L || now() - packet.sentAt >= 30_000)) {
+                val sentThisFlush = mutableSetOf<String>()
+                for (index in 0 until MAX_PACKETS_PER_FLUSH) {
+                    val packet = synchronized(lock) { nextSendable(store.pendingPackets(room.id).filter { it.peerId == peer }, sentThisFlush) } ?: break
                     synchronized(lock) { store.transaction { store.markSent(room.id, packet.packetId, peer, now().coerceAtLeast(1)) } }
                     checkActive()
                     client.sendToFamilyMember(member, packet.text, checkActive)
+                    synchronized(lock) { store.transaction { store.markSendConfirmed(room.id, packet.packetId, peer) } }
+                    // Slow HTTP/peer resolution can outlast the retry interval. A successful
+                    // packet must still consume only one slot in this flush's bounded budget.
+                    sentThisFlush += packet.packetId
                 }
             } catch (error: TelegramException) {
                 if (error.errorCode in setOf(401, 404, 409, 429)) throw error
                 synchronized(lock) { store.transaction { store.setRetryAfter(room.id, peer, now() + 15_000) } }
             }
         }
+    }
+
+    companion object {
+        private const val MAX_UNACKNOWLEDGED_PER_PEER = 16
+        private const val MAX_PACKETS_PER_FLUSH = 8
+        private const val MAX_RECEIPTS_PER_FLUSH = 8
+        private const val RETRY_MILLIS = 30_000L
     }
 }

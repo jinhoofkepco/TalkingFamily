@@ -27,8 +27,8 @@ class FamilyChatScreenTest {
     private val room = FamilyChatRoom("test-room", "우리 네 가족", listOf(
         FamilyChatMember(101, "ui_mother_bot", "엄마", "mother"),
         FamilyChatMember(102, "ui_father_bot", "아빠", "father"),
-        FamilyChatMember(103, "ui_son_bot", "아들", "son"),
-        FamilyChatMember(104, "ui_daughter_bot", "딸", "daughter"),
+        FamilyChatMember(103, "ui_son_bot", "서인", "son"),
+        FamilyChatMember(104, "ui_daughter_bot", "서아", "daughter"),
     ))
 
     private fun state() = UiState(role = "child", configured = true, needsOnboarding = false,
@@ -154,8 +154,9 @@ class FamilyChatScreenTest {
         compose.setContent { HomewayApp(state().copy(roomEvents = (0 until 12).map(::message)), actions()) }
         compose.onNodeWithTag("chat-message-message-8").assertIsDisplayed().assert(hasAnyDescendant(hasText("엄마")))
         compose.onNodeWithTag("chat-message-message-9").assertIsDisplayed().assert(hasAnyDescendant(hasText("아빠")))
-        compose.onNodeWithTag("chat-message-message-10").assertIsDisplayed().assert(hasAnyDescendant(hasText("아들 메시지 10")))
-        compose.onNodeWithTag("chat-message-message-11").assertIsDisplayed().assert(hasAnyDescendant(hasText("딸")))
+        compose.onNodeWithTag("chat-message-message-10").assertIsDisplayed().assert(hasAnyDescendant(hasText("서인 메시지 10")))
+        compose.onNodeWithTag("chat-message-message-11").assertIsDisplayed().assert(hasAnyDescendant(hasText("서아")))
+            .assert(hasAnyDescendant(hasContentDescription("서아 프로필")))
         val image = compose.onRoot().captureToImage().asAndroidBitmap()
         val output = File(InstrumentationRegistry.getInstrumentation().targetContext.cacheDir, "family-room-preview.png")
         output.outputStream().use { image.compress(Bitmap.CompressFormat.PNG, 100, it) }

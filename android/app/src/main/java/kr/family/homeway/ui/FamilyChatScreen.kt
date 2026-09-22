@@ -26,6 +26,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -36,6 +38,7 @@ import kr.family.homeway.data.FamilyEvent
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import java.time.Instant
+import java.text.BreakIterator
 import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -296,9 +299,13 @@ private fun CompactChatBubble(
     ) {
         if (!mine) {
             if (showAuthor) Box(
-                Modifier.size(30.dp).background(avatarColor(author), RoundedCornerShape(10.dp)), contentAlignment = Alignment.Center,
-            ) { Text(author.take(1), fontWeight = FontWeight.Bold, fontSize = 13.sp, color = ChatGreen) }
-            else Spacer(Modifier.width(30.dp))
+                Modifier.size(34.dp).background(avatarColor(author), RoundedCornerShape(10.dp))
+                    .clearAndSetSemantics { contentDescription = "$author 프로필" }, contentAlignment = Alignment.Center,
+            ) {
+                Text(remember(author) { chatAvatarLabel(author) }, fontWeight = FontWeight.Bold,
+                    fontSize = 12.sp, lineHeight = 15.sp, maxLines = 1, color = ChatGreen)
+            }
+            else Spacer(Modifier.width(34.dp))
             Spacer(Modifier.width(6.dp))
         }
         Column(Modifier.weight(1f), horizontalAlignment = if (mine) Alignment.End else Alignment.Start) {
@@ -375,6 +382,18 @@ private fun chatDay(value: String): String = runCatching { chatInstant(value).at
 private fun chatTime(value: String): String = runCatching {
     DateTimeFormatter.ofPattern("HH:mm", Locale.KOREA).withZone(ZoneId.systemDefault()).format(chatInstant(value))
 }.getOrDefault("--:--")
+internal fun chatAvatarLabel(name: String): String {
+    val value = name.trim()
+    if (value.isEmpty()) return "?"
+    // Retain both short names (서아/서인); for longer names use the final two characters.
+    // Character boundaries preserve surrogate pairs and combined accents in other names.
+    val characters = BreakIterator.getCharacterInstance(Locale.ROOT).apply { setText(value) }
+    val end = characters.last()
+    val last = characters.previous()
+    val previous = characters.previous()
+    return value.substring(if (previous == BreakIterator.DONE) last else previous, end)
+}
+
 private fun avatarColor(name: String): Color {
     val colors = listOf(Color(0xFFD6E9DE), Color(0xFFE8E0F4), Color(0xFFFFE4CE), Color(0xFFD9E8F5))
     return colors[(name.hashCode() and Int.MAX_VALUE) % colors.size]

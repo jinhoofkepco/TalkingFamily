@@ -1,12 +1,17 @@
 package kr.family.homeway
 
 import android.Manifest
+import android.app.KeyguardManager
 import android.content.ActivityNotFoundException
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import java.io.FileDescriptor
 import java.io.PrintWriter
@@ -27,6 +32,8 @@ import kr.family.homeway.ui.HomewayApp
 import kr.family.homeway.ui.UiActions
 import kr.family.homeway.overlay.FloatingStarService
 import kr.family.homeway.data.TelegramReceiveService
+import kr.family.homeway.data.TelegramChatPresence
+import kr.family.homeway.data.isTelegramChatVisible
 import kr.family.homeway.tracking.TrackingService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -52,6 +59,20 @@ class MainActivity : ComponentActivity() {
     private var trackingResumeAttempted = false
     private var overlayResumeAttempted = false
     private var motionRecognitionAllowed by mutableStateOf(false)
+    private val chatPresenceOwner = Any()
+    private var chatScreenVisible = false
+    private var chatPresenceResumed = false
+    private var screenOff = false
+    private var screenReceiverRegistered = false
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                Intent.ACTION_SCREEN_OFF -> screenOff = true
+                Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> screenOff = false
+            }
+            updateChatPresence()
+        }
+    }
     private val motionPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         motionRecognitionAllowed = Build.VERSION.SDK_INT < 29 || has(Manifest.permission.ACTIVITY_RECOGNITION)
         TrackingService.refreshActivityRecognition(this)
@@ -84,6 +105,12 @@ class MainActivity : ComponentActivity() {
     }
     override fun onCreate(savedInstanceState:Bundle?) {
         super.onCreate(savedInstanceState)
+        ContextCompat.registerReceiver(this, screenReceiver, IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }, ContextCompat.RECEIVER_NOT_EXPORTED)
+        screenReceiverRegistered = true
         motionRecognitionAllowed = Build.VERSION.SDK_INT < 29 || has(Manifest.permission.ACTIVITY_RECOGNITION)
         overlayPermissionGranted = Settings.canDrawOverlays(this)
         overlaySavedEnabled = FloatingStarService.wantsOverlay(this)
@@ -184,7 +211,10 @@ class MainActivity : ComponentActivity() {
                         } else startTelegramReceiving()
                     } else TelegramReceiveService.stop(this)
                 }
-            ))
+            ), onChatVisibilityChanged = {
+                chatScreenVisible = it
+                updateChatPresence()
+            })
         }
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.RESUMED) {
@@ -207,7 +237,10 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 while(true) {
-                    model.refresh()
+                    // The receiver owns networking and its adaptive schedule. Local refreshes
+                    // preserve tracking/date updates without a second five-second poll loop.
+                    if (TelegramReceiveService.runtime.value.running) model.refreshCached()
+                    else model.refreshScheduled()
                     delay(5000)
                 }
             }
@@ -238,6 +271,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onPostResume() {
         super.onPostResume()
+        chatPresenceResumed = true
+        screenOff = !getSystemService(PowerManager::class.java).isInteractive
         motionRecognitionAllowed = Build.VERSION.SDK_INT < 29 || has(Manifest.permission.ACTIVITY_RECOGNITION)
         TrackingService.refreshActivityRecognition(this)
         trackingResumeAttempted = false
@@ -246,6 +281,33 @@ class MainActivity : ComponentActivity() {
         overlaySavedEnabled = FloatingStarService.wantsOverlay(this)
         if (!collapsing) FloatingStarService.setMessengerVisible(true)
         handleReadyState()
+        updateChatPresence()
+    }
+
+    override fun onPause() {
+        chatPresenceResumed = false
+        updateChatPresence()
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        chatPresenceResumed = false
+        TelegramChatPresence.setVisible(chatPresenceOwner, false)
+        if (screenReceiverRegistered) {
+            unregisterReceiver(screenReceiver)
+            screenReceiverRegistered = false
+        }
+        super.onDestroy()
+    }
+
+    private fun updateChatPresence() {
+        TelegramChatPresence.setVisible(chatPresenceOwner, isTelegramChatVisible(
+            chatScreen = chatScreenVisible,
+            resumed = chatPresenceResumed,
+            interactive = !screenOff && getSystemService(PowerManager::class.java).isInteractive,
+            keyguardLocked = getSystemService(KeyguardManager::class.java).isKeyguardLocked,
+            closing = collapsing || waitingForOverlayPermission,
+        ))
     }
 
     override fun onStop() {
@@ -331,6 +393,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         waitingForOverlayPermission = true
+        updateChatPresence()
         FloatingStarService.setMessengerVisible(true)
         try {
             overlayPermissionLauncher.launch(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
@@ -350,6 +413,7 @@ class MainActivity : ComponentActivity() {
         overlayResumeAttempted = true
         overlaySavedEnabled = false
         FloatingStarService.stop(this)
+        updateChatPresence()
     }
 
     private fun startAndCollapse() {
@@ -362,6 +426,7 @@ class MainActivity : ComponentActivity() {
         val state = model.state.value
         if (!state.configured && !state.demoMode) return
         collapsing = true
+        updateChatPresence()
         launchWantsBubble = false
         overlayPromptVisible = false
         collapseJob = lifecycleScope.launch {
@@ -374,7 +439,7 @@ class MainActivity : ComponentActivity() {
                     FloatingStarService.runtime.first { it.visible || it.error != null }
                 }
                 if (result?.visible == true) {
-                    moveTaskToBack(true)
+                    if (moveTaskToBack(true)) chatPresenceResumed = false
                 } else {
                     // Screen locking or a slow window attachment is not a request to disable the star.
                     val stillVisible = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
@@ -390,6 +455,7 @@ class MainActivity : ComponentActivity() {
             } finally {
                 overlaySavedEnabled = FloatingStarService.wantsOverlay(this@MainActivity)
                 collapsing = false
+                updateChatPresence()
             }
         }
     }

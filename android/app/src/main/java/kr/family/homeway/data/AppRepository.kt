@@ -7,11 +7,16 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -197,14 +202,24 @@ class AppRepository internal constructor(context: Context, private val clientFac
                 }
             }
         }
-        scheduleOutbox()
+        scheduleOutbox(immediateChat = kind == "chat")
     }
     suspend fun flush() { synchronize(0) }
     suspend fun refresh(): FamilySnapshot { synchronize(0); return cached() }
+    suspend fun refreshScheduled(): FamilySnapshot { synchronizeScheduled(0); return cached() }
+    suspend fun flushOutgoing() { exchange(outgoingOnly = true) }
+    suspend fun synchronizeScheduled(timeout: Int = 10) { exchange(timeout, scheduled = true) }
+    fun receiveDelayMillis(): Long = TelegramChatReceiveCadence.delayMillis()
 
-    /** Durable FIFO: next event is sent only after the peer acknowledges the current one. */
-    suspend fun synchronize(timeout: Int = 0) = withContext(Dispatchers.IO) { networkMutex.withLock {
+    /** Explicit sync; automatic callers share the scheduled receive deadline above. */
+    suspend fun synchronize(timeout: Int = 0) { exchange(timeout) }
+    private suspend fun exchange(timeout: Int = 0, scheduled: Boolean = false, outgoingOnly: Boolean = false) =
+        withContext(Dispatchers.IO) { networkMutex.withLock {
         if (!configured) return@withLock
+        // Decide after acquiring the sole network lock: waiting automatic callers must recheck
+        // the shared deadline rather than each opening another poll when the lock becomes free.
+        val poll = if (!outgoingOnly && (!scheduled || receiveDelayMillis() == 0L))
+            TelegramChatReceiveCadence.beginPoll() else null
         synchronized(dataLock) { prepareCareLocked() }
         val client = clientFactory(vault.get())
         val peerId = prefs.getLong("peerBotId", 0)
@@ -215,12 +230,20 @@ class AppRepository internal constructor(context: Context, private val clientFac
             onReceived = { FamilyNotifications.received(app, roomEvent(it, active)) },
             onPeerFailure = { id, failure -> prefs.edit().putString("roomDeliveryError_${active.id}_$id", failure.message).commit() }) }
         try {
-            val exchanged = TelegramExchange(client, store, peerId, peerRole, lock = dataLock,
+            val exchange = TelegramExchange(client, store, peerId, peerRole, lock = dataLock,
                 checkActive = { coroutineContext.ensureActive() },
                 onReceived = { FamilyNotifications.received(app, it) }, familyChat = familyChat,
                 onCommitted = ::publishChanges,
+                onNewChatCommitted = {
+                    TelegramChatReceiveCadence.onNewChatCommitted()
+                    TelegramPollWakeup.signal()
+                },
+                onPollCompleted = { poll?.let(TelegramChatReceiveCadence::onPollCompleted) },
+                pollAllowed = { !scheduled || (poll != null && TelegramChatReceiveCadence.isCurrent(poll)) },
                 familyCare = if (careEnabled) careEngine(client = client, checkActive = { coroutineContext.ensureActive() }) else null,
-                onLegacyFailure = { prefs.edit().putString("legacyDeliveryError", it.message).commit() }).synchronize(timeout)
+                onLegacyFailure = { prefs.edit().putString("legacyDeliveryError", it.message).commit() })
+            val exchanged = if (poll == null) exchange.flushOutgoing() else exchange.synchronize(
+                if (!scheduled) timeout else if (poll.visible) timeout.coerceIn(0, TelegramChatReceiveSchedule.FOREGROUND_POLL_SECONDS) else 0)
             if (exchanged) prefs.edit().apply {
                 val failure = pendingDeliveryError()
                 if (failure == null) remove("connectionError") else putString("connectionError", failure)
@@ -270,7 +293,7 @@ class AppRepository internal constructor(context: Context, private val clientFac
             FamilyChatExchange(clientFactory(vault.get()), store.familyChat, active, selfBotId, lock = dataLock)
                 .enqueue(FamilyChatMessage(UUID.randomUUID().toString(), active.id, selfBotId, text, Instant.now().toString()))
         }
-        scheduleOutbox()
+        scheduleOutbox(immediateChat = true)
     }
     private fun roomClient(rawToken: String): Pair<TelegramClient, String> {
         check(!demoMode) { "체험을 끝내고 가족방을 연결해 주세요." }
@@ -362,9 +385,12 @@ class AppRepository internal constructor(context: Context, private val clientFac
         }
         failures.firstOrNull()
     }
-    private fun scheduleOutbox() {
+    private fun scheduleOutbox(immediateChat: Boolean = false) {
         publishChanges()
         TelegramPollWakeup.signal()
+        // One process-wide conflated consumer makes a user send immediate without collecting
+        // one network-mutex waiter for every enqueue. WorkManager retains restart durability.
+        if (immediateChat) immediateOutbox.trySend(this)
         // A successor is needed even if the running worker just observed an empty outbox.
         // KEEP could discard this enqueue before that worker reports success and strands it.
         WorkManager.getInstance(app).enqueueUniqueWork("homeway_outbox", ExistingWorkPolicy.APPEND_OR_REPLACE,
@@ -374,5 +400,15 @@ class AppRepository internal constructor(context: Context, private val clientFac
         private val networkMutex = Mutex()
         private val dataLock = Any()
         private val changeRevision = MutableStateFlow(0L)
+        private val immediateOutbox = Channel<AppRepository>(Channel.CONFLATED)
+        private val immediateScope = CoroutineScope(SupervisorJob() + Dispatchers.IO).also { scope ->
+            scope.launch {
+                for (repository in immediateOutbox) {
+                    try { repository.flushOutgoing() }
+                    catch (cancelled: CancellationException) { throw cancelled }
+                    catch (_: Exception) { /* Persisted backoff and the durable worker own retries. */ }
+                }
+            }
+        }
     }
 }

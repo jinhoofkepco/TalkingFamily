@@ -10,45 +10,46 @@ class AutomaticLocationPolicyTest {
         policy.committed()
     }
 
-    @Test fun motionEntryRebasesFiveMinuteSlotAndAcceptsThirtySecondFixes() {
+    @Test fun motionEntryRebasesFiveMinuteSlotAndAcceptsTwentySecondFixes() {
         val policy = AutomaticLocationPolicy(0)
         save(policy, 0)
-        assertTrue(policy.updateInterval(30_000, 10_000))
+        assertTrue(policy.updateInterval(20_000, 10_000))
         assertTrue(policy.beginWatchdog(10_000))
         save(policy, 11_000)
-        save(policy, 40_000)
-        save(policy, 69_000)
-        assertEquals(100_000L, policy.nextScheduledAtMillis)
-        assertFalse(policy.updateInterval(30_000, 75_000))
-        assertEquals(100_000L, policy.nextScheduledAtMillis)
+        assertFalse(policy.reserve(fix(27_999), 27_999))
+        save(policy, 30_000)
+        save(policy, 49_000)
+        assertEquals(70_000L, policy.nextScheduledAtMillis)
+        assertFalse(policy.updateInterval(20_000, 55_000))
+        assertEquals(70_000L, policy.nextScheduledAtMillis)
     }
 
     @Test fun idleReturnSchedulesFromLastWriteWithoutImmediateBurst() {
-        val policy = AutomaticLocationPolicy(0, 30_000, 3_000)
+        val policy = AutomaticLocationPolicy(0, 20_000, 2_000)
         save(policy, 0)
-        save(policy, 30_000)
-        policy.updateInterval(300_000, 60_000)
-        assertEquals(330_000L, policy.nextScheduledAtMillis)
-        assertFalse(policy.reserve(fix(60_000), 60_000))
+        save(policy, 20_000)
+        policy.updateInterval(300_000, 40_000)
+        assertEquals(320_000L, policy.nextScheduledAtMillis)
+        assertFalse(policy.reserve(fix(40_000), 40_000))
         assertFalse(policy.beginWatchdog(120_000))
-        save(policy, 330_000)
+        save(policy, 320_000)
     }
 
     @Test fun pendingIdleWriteCannotConsumeNewMovingSlot() {
         val policy = AutomaticLocationPolicy(0)
         assertTrue(policy.reserve(fix(0), 0))
-        policy.updateInterval(30_000, 10_000)
+        policy.updateInterval(20_000, 10_000)
         assertFalse(policy.beginWatchdog(10_000))
         policy.committed()
         assertEquals(10_000L, policy.nextScheduledAtMillis)
         assertTrue(policy.beginWatchdog(10_000))
         save(policy, 11_000)
-        assertEquals(40_000L, policy.nextScheduledAtMillis)
+        assertEquals(30_000L, policy.nextScheduledAtMillis)
     }
 
     @Test fun pendingMovingWriteCannotAdvanceIdleSlotByFiveMinutesTwice() {
         val policy = AutomaticLocationPolicy(0)
-        policy.updateInterval(30_000, 0)
+        policy.updateInterval(20_000, 0)
         assertTrue(policy.reserve(fix(0), 0))
         policy.updateInterval(300_000, 10_000)
         policy.committed()
@@ -59,24 +60,24 @@ class AutomaticLocationPolicyTest {
     @Test fun freshMotionRequestDoesNotBurstAfterJustCommittedLocation() {
         val policy = AutomaticLocationPolicy(0)
         save(policy, 0)
-        policy.updateInterval(30_000, 1_000)
+        policy.updateInterval(20_000, 1_000)
         assertFalse(policy.beginWatchdog(1_000))
         assertFalse(policy.reserve(fix(1_000), 1_000))
         assertTrue(policy.beginWatchdog(5_000))
         assertFalse(policy.beginWatchdog(10_000))
-        assertFalse(policy.beginWatchdog(34_999))
-        assertTrue(policy.beginWatchdog(35_000))
-        save(policy, 36_000)
-        assertFalse(policy.reserve(fix(36_000), 36_001))
+        assertFalse(policy.beginWatchdog(24_999))
+        assertTrue(policy.beginWatchdog(25_000))
+        save(policy, 26_000)
+        assertFalse(policy.reserve(fix(26_000), 26_001))
     }
 
     @Test fun cancelledWriteAfterCadenceChangeLeavesMotionSlotAvailable() {
         val policy = AutomaticLocationPolicy(0)
         assertTrue(policy.reserve(fix(0), 0))
-        policy.updateInterval(30_000, 10_000)
+        policy.updateInterval(20_000, 10_000)
         policy.cancelReservation()
         save(policy, 10_000)
-        assertEquals(40_000L, policy.nextScheduledAtMillis)
+        assertEquals(30_000L, policy.nextScheduledAtMillis)
     }
 
     @Test fun stationaryInitialFixAndEveryFiveMinuteFixAreAccepted() {
@@ -85,6 +86,49 @@ class AutomaticLocationPolicyTest {
         save(policy, 300_000)
         save(policy, 600_000)
         assertEquals(900_000L, policy.nextScheduledAtMillis)
+    }
+
+    @Test fun freshStepDrivesTwentySecondWritesAndExpiredMotionReturnsToFiveMinutes() {
+        val cadence = AdaptiveTrackingCadence()
+        val policy = AutomaticLocationPolicy(0)
+        save(policy, 0)
+        cadence.onStep(10_000, 10_000)
+        assertTrue(policy.updateInterval(cadence.intervalMillis(10_000), 10_000))
+        assertEquals(20_000L, policy.intervalMillis)
+        for (at in 10_000L..110_000L step 20_000L) save(policy, at)
+
+        assertFalse(policy.updateInterval(cadence.intervalMillis(129_999), 129_999))
+        assertTrue(policy.updateInterval(cadence.intervalMillis(130_000), 130_000))
+        assertEquals(300_000L, policy.intervalMillis)
+        assertEquals(410_000L, policy.nextScheduledAtMillis)
+        assertFalse(policy.reserve(fix(130_000), 130_000))
+        save(policy, 410_000)
+
+        // New evidence must restore the same fast schedule even after a long idle period.
+        cadence.onStep(420_000, 420_000)
+        assertTrue(policy.updateInterval(cadence.intervalMillis(420_000), 420_000))
+        save(policy, 420_000)
+        save(policy, 440_000)
+        assertEquals(460_000L, policy.nextScheduledAtMillis)
+    }
+
+    @Test fun restartedSessionUsesFreshEvidenceAndDoesNotInheritAnOldMovingSchedule() {
+        val previousCadence = AdaptiveTrackingCadence()
+        previousCadence.onActivity(MotionState.WALKING, 0, true, 0)
+        assertEquals(20_000L, previousCadence.intervalMillis(1_000))
+
+        val cadence = AdaptiveTrackingCadence()
+        val policy = AutomaticLocationPolicy(60_000)
+        assertEquals(cadence.intervalMillis(60_000), policy.intervalMillis)
+        assertEquals(300_000L, policy.intervalMillis)
+        save(policy, 60_000)
+        // Steps/significant motion can activate the cadence without an activity callback.
+        cadence.onSignificantMotion(70_000, 70_000)
+        assertTrue(policy.updateInterval(cadence.intervalMillis(70_000), 70_000))
+        assertEquals(20_000L, policy.intervalMillis)
+        save(policy, 70_000)
+        save(policy, 90_000)
+        assertEquals(110_000L, policy.nextScheduledAtMillis)
     }
 
     @Test fun oneSecondInitialOffsetDoesNotDrop299SecondScheduledCallback() {

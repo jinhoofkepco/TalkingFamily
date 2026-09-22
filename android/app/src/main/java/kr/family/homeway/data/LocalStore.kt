@@ -10,7 +10,7 @@ import java.time.LocalDate
 import java.time.ZoneId
 
 class LocalStore internal constructor(context: Context, databaseName: String = "homeway.db") :
-    SQLiteOpenHelper(context, databaseName, null, 5), TelegramExchangeStore {
+    SQLiteOpenHelper(context, databaseName, null, 6), TelegramExchangeStore {
     val familyChat = SqliteFamilyChatStore(this)
     val familyCare = SqliteFamilyCareStore(this)
     override fun onCreate(db: SQLiteDatabase) {
@@ -58,6 +58,8 @@ class LocalStore internal constructor(context: Context, databaseName: String = "
         }
         // New family-care tables are additive. Existing pair/chat ledgers and Telegram cursors stay intact.
         if (oldVersion < 5) SqliteFamilyCareStore.createTables(db)
+        else if (oldVersion < 6) db.execSQL("ALTER TABLE family_care_deliveries ADD COLUMN " +
+            "send_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(send_confirmed IN (0,1))")
     }
     private fun createTelegramTables(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE telegram_receipts (id TEXT PRIMARY KEY)")
@@ -84,6 +86,10 @@ class LocalStore internal constructor(context: Context, databaseName: String = "
         if (it.moveToFirst()) it.getLong(0) else 0L
     }
     override fun setMeta(name: String, value: Long) {
+        if (value == 0L && (name.startsWith("legacySentAt:") || name.startsWith("legacyConfirmed:"))) {
+            writableDatabase.delete("telegram_meta", "name=?", arrayOf(name))
+            return
+        }
         writableDatabase.insertWithOnConflict("telegram_meta", null, ContentValues().apply {
             put("name", name); put("value", value)
         }, SQLiteDatabase.CONFLICT_REPLACE)

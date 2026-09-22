@@ -74,11 +74,13 @@ class FamilyCareEngineTest {
         val f = Family(); f.drain()
         f.engine(101).enqueueCommand(303, "sticker_award", award())
         f.sync(101)
-        f.sync(303) // Commits, sends only the transport receipt; outcome and snapshot remain queued.
+        f.sync(303)
+        f.http.pauseBeforeType = 101L to "outcome"
         f.sync(101)
         assertTrue(f.stores.getValue(101).pendingPackets(f.room.id).isEmpty())
         assertTrue(f.engine(101).hasPending(303))
         assertEquals(5, f.engine(101).currentSnapshot(303)!!.snapshot.stickerBalance)
+        f.http.pauseBeforeType = null
         f.drain()
         assertFalse(f.engine(101).hasPending(303))
         assertEquals(6, f.engine(101).currentSnapshot(303)!!.snapshot.stickerBalance)
@@ -197,6 +199,147 @@ class FamilyCareEngineTest {
         assertTrue(f.stores.getValue(303).pendingPackets(f.room.id).isEmpty())
     }
 
+    @Test fun `pipeline sends eight packets per flush and caps each parent at sixteen unacknowledged packets`() {
+        val f = Family(); f.drain(); f.http.sent.clear()
+        repeat(20) { f.engine(303).emitChildEvent(location()) }
+        f.engine(303).flush()
+        for (parent in listOf(101L, 202L)) assertEquals(8, f.http.sent.count { it.first == 303L && it.second == parent })
+        f.engine(303).flush()
+        f.engine(303).flush()
+        for (parent in listOf(101L, 202L)) {
+            val packets = f.stores.getValue(303).pendingPackets(f.room.id).filter { it.peerId == parent }
+            assertEquals(16, packets.count { it.sendConfirmed })
+            assertEquals(4, packets.count { it.sentAt == 0L })
+            assertEquals(packets.take(16).map { it.packetId },
+                f.http.sent.filter { it.first == 303L && it.second == parent }.map { JSONObject(it.third).getString("id") })
+        }
+        assertFalse(f.engine(303).hasReadyWork())
+        f.http.sent.clear()
+        f.sync(101)
+        assertEquals(8, f.http.sent.count { it.first == 101L && JSONObject(it.third).optString("type") == "care_ack" })
+        assertEquals(8, f.stores.getValue(101).receipts(f.room.id).size)
+        f.engine(101).flush()
+        assertEquals(16, f.http.sent.count { it.first == 101L && JSONObject(it.third).optString("type") == "care_ack" })
+        assertTrue(f.stores.getValue(101).receipts(f.room.id).isEmpty())
+    }
+
+    @Test fun `successful HTTP longer than retry interval does not resend the same packet in one flush`() {
+        val f = Family(); f.drain(); f.http.sent.clear()
+        repeat(3) { f.engine(303).emitChildEvent(location()) }
+        val expected = f.stores.getValue(303).pendingPackets(f.room.id).groupBy { it.peerId }
+        f.http.onSuccessfulSend = { f.time += 31_000 }
+        f.engine(303).flush()
+        for (parent in listOf(101L, 202L)) {
+            val sent = f.http.sent.filter { it.first == 303L && it.second == parent }
+                .map { JSONObject(it.third).getString("id") }
+            assertEquals(expected.getValue(parent).map { it.packetId }, sent)
+            assertEquals(3, sent.distinct().size)
+        }
+        assertTrue(f.stores.getValue(303).pendingPackets(f.room.id).all { it.sendConfirmed })
+    }
+
+    @Test fun `out of order ACK releases only its attempted packet and rejects wrong digest child sender or replay`() {
+        val f = Family(); f.drain()
+        repeat(3) { f.engine(303).emitChildEvent(location()) }
+        f.engine(303).flush()
+        val store = f.stores.getValue(303)
+        val packets = store.pendingPackets(f.room.id).filter { it.peerId == 101L }
+        fun receive(sender: Long = 101, child: Long = 303, digest: String = packets[1].digest) {
+            val text = FamilyCareProtocol.envelope(f.room, sender, child, "care_ack",
+                JSONObject().put("digest", digest), packets[1].packetId).toString()
+            store.transaction { f.engine(303).processUpdate(update(sender, text)) }
+        }
+        receive(digest = "0".repeat(64))
+        receive(child = 404)
+        receive(sender = 202)
+        assertEquals(6, store.pendingPackets(f.room.id).size)
+        receive()
+        receive() // Replay cannot discard the neighboring packet or the other parent's copy.
+        assertEquals(listOf(packets[0].packetId, packets[2].packetId),
+            store.pendingPackets(f.room.id).filter { it.peerId == 101L }.map { it.packetId })
+        assertEquals(3, store.pendingPackets(f.room.id).count { it.peerId == 202L })
+    }
+
+    @Test fun `ambiguous middle send blocks later packets across restart while the other parent advances`() {
+        val f = Family(); f.drain(); f.http.sent.clear()
+        repeat(3) { f.engine(303).emitChildEvent(location()) }
+        val store = f.stores.getValue(303)
+        val firstParent = store.pendingPackets(f.room.id).filter { it.peerId == 101L }
+        f.http.loseResponsePacketId = firstParent[1].packetId
+        f.engine(303).flush()
+        val interrupted = store.pendingPackets(f.room.id).filter { it.peerId == 101L }
+        assertTrue(interrupted[0].sendConfirmed)
+        assertTrue(interrupted[1].sentAt > 0)
+        assertFalse(interrupted[1].sendConfirmed)
+        assertEquals(0L, interrupted[2].sentAt)
+        assertEquals(3, store.pendingPackets(f.room.id).count { it.peerId == 202L && it.sendConfirmed })
+
+        f.time += 16_000 // Peer backoff has expired, but the ambiguous attempt still bars later sends.
+        f.engine(303).flush() // Every engine() call is a fresh instance using the same durable store.
+        assertEquals(2, f.http.sent.count { it.first == 303L && it.second == 101L })
+        f.time += 15_000
+        f.engine(303).flush()
+        assertEquals(listOf(firstParent[0].packetId, firstParent[1].packetId,
+            firstParent[0].packetId, firstParent[1].packetId, firstParent[2].packetId),
+            f.http.sent.filter { it.first == 303L && it.second == 101L }.map { JSONObject(it.third).getString("id") })
+        f.drain()
+        for (parent in listOf(101L, 202L)) assertEquals(3, f.stores.getValue(parent).archived.count { it.first == 303L })
+        assertTrue(store.pendingPackets(f.room.id).isEmpty())
+    }
+
+    @Test fun `ACK of an ambiguous attempt unlocks its successor without waiting for retry`() {
+        val f = Family(); f.drain()
+        repeat(2) { f.engine(303).emitChildEvent(location()) }
+        val store = f.stores.getValue(303)
+        val packets = store.pendingPackets(f.room.id).filter { it.peerId == 101L }
+        f.http.loseResponsePacketId = packets[0].packetId
+        f.engine(303).flush()
+        assertEquals(0L, store.pendingPackets(f.room.id).single { it.packetId == packets[1].packetId }.sentAt)
+        f.sync(101) // Receiver got the first packet despite the lost HTTP response and sends its ACK.
+        f.sync(303)
+        assertTrue(store.pendingPackets(f.room.id).single { it.packetId == packets[1].packetId }.sendConfirmed)
+    }
+
+    @Test fun `global rate limit aborts the pipeline and preserves a durable send barrier`() {
+        val f = Family(); f.drain(); f.http.sent.clear()
+        repeat(3) { f.engine(303).emitChildEvent(location()) }
+        f.http.nextSendErrorCode = 429
+        val error = assertThrows(TelegramException::class.java) { f.engine(303).flush() }
+        assertEquals(429, error.errorCode)
+        assertEquals(60, error.retryAfterSeconds)
+        assertEquals(1, f.http.sent.size)
+        val packets = f.stores.getValue(303).pendingPackets(f.room.id)
+        assertEquals(1, packets.count { it.sentAt > 0 })
+        assertTrue(packets.none { it.sendConfirmed })
+    }
+
+    @Test fun `twenty second locations remain bounded during ten minutes of sixty second receive polls`() {
+        val f = Family(); f.drain(); f.http.polls.clear()
+        val generated = mutableListOf<String>()
+        val startedAt = f.time
+        for (second in 0..600 step 5) {
+            f.time = startedAt + second * 1000L
+            if (second % 20 == 0) {
+                val at = Instant.ofEpochMilli(f.time).toString()
+                val event = location().let { it.copy(createdAt = at, payload = JSONObject(it.payload.toString()).put("capturedAt", at)) }
+                generated.add(event.id)
+                f.engine(303).emitChildEvent(event)
+            }
+            f.engine(303).flush() // Outgoing work does not poll Telegram or accelerate the receive schedule.
+            if (second % 60 == 30) { f.sync(101); f.sync(202) }
+            if (second % 60 == 55) f.sync(303)
+            for (parent in listOf(101L, 202L)) assertTrue("unbounded queue at $second seconds",
+                f.stores.getValue(303).pendingPackets(f.room.id).count { it.peerId == parent } <= 8)
+        }
+        assertEquals(mapOf(101L to 10, 202L to 10, 303L to 10), f.http.polls.groupingBy { it }.eachCount())
+        f.sync(101); f.sync(202); f.sync(303)
+        for (parent in listOf(101L, 202L)) {
+            assertEquals(generated, f.stores.getValue(parent).archived.filter { it.first == 303L }.map { it.second.id })
+            assertEquals(generated.last(), f.engine(parent).currentSnapshot(303)!!.snapshot.events.last().id)
+        }
+        assertTrue(f.stores.getValue(303).pendingPackets(f.room.id).isEmpty())
+    }
+
     @Test fun `room fingerprint roles and real Telegram sender are enforced`() {
         val f = Family(); f.drain()
         val command = FamilyCareCommand(UUID.randomUUID().toString(), f.room.id, 303, 101,
@@ -239,6 +382,24 @@ class FamilyCareEngineTest {
         assertEquals(300, state.getJSONArray("rewards").length())
         assertFalse(state.has("appliedEventIds"))
         assertFalse(state.toString().contains("private secret"))
+    }
+
+    @Test fun `initial snapshot chunks fill the pipeline without an ACK round trip for every chunk`() {
+        val f = Family(bootstrap = false)
+        val seed = TelegramLedger.emptyState()
+        repeat(120) { seed.getJSONArray("rewards").put(JSONObject().put("id", UUID.randomUUID().toString())
+            .put("name", UUID.randomUUID().toString()).put("cost", it + 1)) }
+        f.engine(303).ensureAuthority(seed)
+        val chunks = f.stores.getValue(303).pendingPackets(f.room.id).filter { it.peerId == 101L }
+        assertTrue(chunks.size in 2..8)
+        f.engine(303).flush()
+        assertEquals(chunks.map { it.packetId }, f.http.sent.filter { it.first == 303L && it.second == 101L }
+            .map { JSONObject(it.third).getString("id") })
+        assertEquals(chunks.size, f.stores.getValue(303).pendingPackets(f.room.id).count { it.peerId == 101L })
+        f.sync(101)
+        assertEquals(120, f.engine(101).currentSnapshot(303)!!.snapshot.rewards.size)
+        f.sync(303)
+        assertTrue(f.stores.getValue(303).pendingPackets(f.room.id).none { it.peerId == 101L })
     }
 
     @Test fun `compressed snapshot expansion is bounded before parsing`() {
@@ -358,17 +519,35 @@ class FamilyCareEngineTest {
         private val inbox = mutableMapOf<Long, MutableList<JSONObject>>()
         private var sequence = 0L
         var loseResponseFrom: Long? = null
+        var loseResponsePacketId: String? = null
+        var nextSendErrorCode: Int? = null
+        var pauseBeforeType: Pair<Long, String>? = null
+        var onSuccessfulSend: () -> Unit = {}
+        val polls = mutableListOf<Long>()
         fun inject(from: Long, to: Long, text: String) {
             inbox.getOrPut(to) { mutableListOf() }.add(update(from, text).put("update_id", ++sequence))
         }
         override fun execute(token: String, method: String, json: String, timeoutSeconds: Int): TelegramHttpResponse {
             val own = token.substringBefore(':').toLong(); val body = JSONObject(json)
             val result: Any = when (method) {
-                "getUpdates" -> JSONArray(inbox[own].orEmpty().filter { it.getLong("update_id") >= body.getLong("offset") }.take(100))
+                "getUpdates" -> {
+                    polls.add(own)
+                    JSONArray(inbox[own].orEmpty().filter { it.getLong("update_id") >= body.getLong("offset") }
+                        .takeWhile { pauseBeforeType != (own to JSONObject(it.getJSONObject("message").getString("text")).optString("type")) }.take(100))
+                }
                 "sendMessage" -> {
                     val peer = body.getLong("chat_id"); val text = body.getString("text")
-                    sent.add(Triple(own, peer, text)); inject(own, peer, text)
-                    if (loseResponseFrom == own) { loseResponseFrom = null; throw IOException("ambiguous send") }
+                    sent.add(Triple(own, peer, text))
+                    nextSendErrorCode?.let { code ->
+                        nextSendErrorCode = null
+                        return TelegramHttpResponse(code, JSONObject().put("ok", false).put("error_code", code)
+                            .put("parameters", JSONObject().put("retry_after", 60)).toString())
+                    }
+                    inject(own, peer, text)
+                    if (loseResponseFrom == own || loseResponsePacketId == JSONObject(text).optString("id")) {
+                        loseResponseFrom = null; loseResponsePacketId = null; throw IOException("ambiguous send")
+                    }
+                    onSuccessfulSend()
                     JSONObject().put("chat", JSONObject().put("id", peer).put("type", "private"))
                 }
                 else -> error("Unexpected method $method")
@@ -423,7 +602,10 @@ class FamilyCareEngineTest {
         }
         override fun pendingPackets(roomId: String) = outgoing.filter { it.roomId == roomId }
         override fun markSent(roomId: String, packetId: String, peerId: Long, sentAt: Long) {
-            outgoing.replaceAll { if (it.roomId == roomId && it.packetId == packetId && it.peerId == peerId) it.copy(sentAt = sentAt) else it }
+            outgoing.replaceAll { if (it.roomId == roomId && it.packetId == packetId && it.peerId == peerId) it.copy(sentAt = sentAt, sendConfirmed = false) else it }
+        }
+        override fun markSendConfirmed(roomId: String, packetId: String, peerId: Long) {
+            outgoing.replaceAll { if (it.roomId == roomId && it.packetId == packetId && it.peerId == peerId && it.sentAt > 0) it.copy(sendConfirmed = true) else it }
         }
         override fun acknowledge(roomId: String, packetId: String, peerId: Long, digest: String) {
             if (failAcknowledge) { failAcknowledge = false; throw IOException("acknowledgement storage failed") }

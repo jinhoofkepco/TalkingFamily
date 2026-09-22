@@ -6,6 +6,16 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class FamilyChatPresentationTest {
+    @Test fun avatarNamesKeepDistinctSiblingsAndCompleteCharacters() {
+        assertEquals("서아", chatAvatarLabel("서아"))
+        assertEquals("서인", chatAvatarLabel("서인"))
+        assertEquals("서아", chatAvatarLabel("김서아"))
+        assertEquals("서인", chatAvatarLabel(" 김서인 "))
+        assertEquals("아", chatAvatarLabel("아"))
+        assertEquals("😀", chatAvatarLabel("😀"))
+        assertEquals("e\u0301a", chatAvatarLabel("e\u0301a"))
+    }
+
     private fun event(
         id: String = "first", senderId: Long? = 101L, sender: String = "guardian",
         at: String = "2026-09-22T03:00:10Z", delivery: String = "pending",

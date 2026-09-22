@@ -28,6 +28,7 @@ import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /** Emulator-only local account. All transport stays in this fake; no real bot receives a message. */
 @RunWith(AndroidJUnit4::class)
@@ -42,6 +43,7 @@ class HomewayViewModelChatRefreshTest {
     private lateinit var model: HomewayViewModel
     private lateinit var room: FamilyChatRoom
     private var prepared = false
+    private val presenceOwner = Any()
 
     @Before fun prepare() = runBlocking {
         assumeTrue("These account-reset tests must never run on a physical family phone",
@@ -72,6 +74,7 @@ class HomewayViewModelChatRefreshTest {
 
     @After fun cleanUp() {
         if (!prepared) return
+        TelegramChatPresence.setVisible(presenceOwner, false)
         if (::fake.isInitialized) {
             fake.releaseAck.countDown()
             fake.releasePoll.countDown()
@@ -118,6 +121,39 @@ class HomewayViewModelChatRefreshTest {
         }
     }
 
+    @Test fun scheduledRefreshWaitsInBackgroundAndOpeningChatReceivesImmediately() = runBlocking {
+        val incoming = message("배경에서는 기다리고 대화를 열면 확인")
+        fake.incoming = update(incoming)
+        TelegramChatPresence.setVisible(presenceOwner, true)
+        TelegramChatPresence.setVisible(presenceOwner, false)
+        repeat(3) { repo.refreshScheduled() }
+        assertEquals("Automatic refresh must not consume Telegram before the shared deadline", 0, fake.pollRequests.get())
+        assertNull(store.familyChat.chatMessage(room.id, incoming.id))
+        assertTrue(repo.receiveDelayMillis() in 1..5_000)
+
+        TelegramChatPresence.setVisible(presenceOwner, true)
+        repo.refreshScheduled()
+        assertEquals(1, fake.pollRequests.get())
+        assertEquals(incoming.text, store.familyChat.chatMessage(room.id, incoming.id)?.text)
+        awaitState { model.state.value.roomEvents.any { it.id == incoming.id } }
+    }
+
+    @Test fun outgoingOnlySendsWithoutConsumingUpdatesOrResettingTheBackgroundDeadline() = runBlocking {
+        fake.incoming = update(message("다음 수신 시각까지 기다릴 메시지"))
+        val outgoing = FamilyChatMessage(UUID.randomUUID().toString(), room.id, 101, "즉시 발송",
+            "2026-09-22T12:00:00Z")
+        store.transaction { store.familyChat.insertChatMessage(outgoing, listOf(202)) }
+        TelegramChatPresence.setVisible(presenceOwner, true)
+        TelegramChatPresence.setVisible(presenceOwner, false)
+        val before = repo.receiveDelayMillis()
+        repo.flushOutgoing()
+        val after = repo.receiveDelayMillis()
+        assertEquals(0, fake.pollRequests.get())
+        assertEquals(1, fake.sentChats.get())
+        assertEquals(0L, store.meta("offset"))
+        assertTrue("Only elapsed time may change the receive deadline", after in 1..before)
+    }
+
     private suspend fun awaitState(predicate: () -> Boolean) = withTimeout(5_000) {
         while (!predicate()) delay(10)
     }
@@ -132,6 +168,8 @@ class HomewayViewModelChatRefreshTest {
 
     private class PausedTelegram : TelegramHttpTransport {
         @Volatile var incoming: JSONObject? = null
+        val pollRequests = AtomicInteger()
+        val sentChats = AtomicInteger()
         val pauseAck = AtomicBoolean(false)
         val pausePoll = AtomicBoolean(false)
         val ackStarted = CountDownLatch(1)
@@ -145,6 +183,7 @@ class HomewayViewModelChatRefreshTest {
                 "getMe" -> JSONObject().put("id", 101).put("is_bot", true).put("username", "refresh_self_bot")
                 "getWebhookInfo" -> JSONObject().put("url", "")
                 "getUpdates" -> {
+                    pollRequests.incrementAndGet()
                     if (pausePoll.compareAndSet(true, false)) {
                         pollStarted.countDown()
                         check(releasePoll.await(15, TimeUnit.SECONDS)) { "Test did not release its fake poll" }
@@ -155,8 +194,10 @@ class HomewayViewModelChatRefreshTest {
                 }
                 "sendMessage" -> {
                     assertEquals(202L, body.getLong("chat_id"))
-                    assertEquals("chat_ack", JSONObject(body.getString("text")).getString("type"))
-                    if (pauseAck.compareAndSet(true, false)) {
+                    val type = JSONObject(body.getString("text")).getString("type")
+                    assertTrue(type in setOf("chat", "chat_ack"))
+                    if (type == "chat") sentChats.incrementAndGet()
+                    if (type == "chat_ack" && pauseAck.compareAndSet(true, false)) {
                         ackStarted.countDown()
                         check(releaseAck.await(15, TimeUnit.SECONDS)) { "Test did not release its fake ACK" }
                     }

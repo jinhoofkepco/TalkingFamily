@@ -135,13 +135,15 @@ class HomewayViewModel internal constructor(app: Application, private val repo: 
     fun refreshCached() {
         render(if (repo.demoMode) demo.read() else repo.cached())
     }
-    fun refresh() {
+    fun refresh() = refreshNetwork(scheduled = false)
+    fun refreshScheduled() = refreshNetwork(scheduled = true)
+    private fun refreshNetwork(scheduled: Boolean) {
         refreshCached()
         if(refreshJob?.isActive==true) return
         if(repo.demoMode) return
         if(!repo.configured) return
         refreshJob=viewModelScope.launch {
-            try { render(repo.refresh()) }
+            try { render(if (scheduled) repo.refreshScheduled() else repo.refresh()) }
             catch(e: kotlinx.coroutines.CancellationException) { throw e }
             catch(_: Exception) { render(repo.cached(), repo.connectionError ?: "연결이 원활하지 않아요. 마지막 받은 기록을 표시하고 있어요.") }
         }
@@ -228,7 +230,7 @@ class HomewayViewModel internal constructor(app: Application, private val repo: 
     fun sendRoomChat(text: String) {
         if (text.isBlank()) return
         if (text.length > 1500) { showError("메시지는 1,500자 이내로 보내 주세요."); return }
-        perform { repo.sendRoomChat(text.trim()); render(repo.cached(), forceRoomChat = true); refresh() }
+        perform { repo.sendRoomChat(text.trim()); render(repo.cached(), forceRoomChat = true); refreshScheduled() }
     }
     fun createFamilyRoom(token: String, title: String, selfName: String, relationship: String, members: List<FamilyChatMemberDraft>) = perform {
         repo.createFamilyRoom(token, title, selfName, relationship, members)
@@ -443,7 +445,7 @@ class HomewayViewModel internal constructor(app: Application, private val repo: 
         if (roomId != null && childId != null) {
             repo.sendCareAction(roomId, childId, kind, payload, id, rewardVersion)
             render(repo.cached())
-            refresh()
+            refreshScheduled()
             return@perform
         }
         val accepted = repo.sendEvent(kind,payload,id)
@@ -455,7 +457,7 @@ class HomewayViewModel internal constructor(app: Application, private val repo: 
             return@perform
         }
         if(!accepted) notice("상대 기기의 수신을 기다리고 있어요. 두 휴대폰의 인터넷 연결과 메시지 수신 설정을 확인해 주세요.")
-        refresh()
+        refreshScheduled()
         }
     }
     fun shareCurrentLocation() = perform {
@@ -475,7 +477,7 @@ class HomewayViewModel internal constructor(app: Application, private val repo: 
             .put("accuracy",location.accuracy.toDouble()).put("capturedAt",Instant.ofEpochMilli(location.time).toString()).put("source","manual"),id)
         render(repo.cached())
         notice(if(accepted) "보호자 휴대폰이 위치를 받았어요. 읽음 여부는 확인되지 않아요." else "위치가 전송 대기 중이에요. 두 휴대폰의 인터넷 연결과 메시지 수신 설정을 확인해 주세요.")
-        refresh()
+        refreshScheduled()
     }
     fun setSharing(enabled:Boolean) {
         if (!requireRole("child")) return
@@ -485,7 +487,7 @@ class HomewayViewModel internal constructor(app: Application, private val repo: 
             if(enabled) {
                 repo.sharingEnabled=true
                 TrackingService.start(getApplication())
-                notice("자동 공유를 켰어요. 이동 중 약 30초, 정지 중 약 5분마다 새 위치를 요청해요.")
+                notice("자동 공유를 켰어요. 이동 중 약 20초, 정지 중 약 5분마다 새 위치를 요청해요.")
             } else {
                 TrackingService.stop(getApplication())
                 repo.sharingEnabled=false

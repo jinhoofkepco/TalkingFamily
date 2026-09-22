@@ -14,7 +14,9 @@ interface FamilyCareStore {
     fun recordReceived(roomId: String, packetId: String, digest: String)
     fun queuePacket(packet: FamilyCareOutgoing)
     fun pendingPackets(roomId: String): List<FamilyCareOutgoing>
+    /** Persist an attempt before HTTP; it also clears confirmation until that attempt succeeds. */
     fun markSent(roomId: String, packetId: String, peerId: Long, sentAt: Long)
+    fun markSendConfirmed(roomId: String, packetId: String, peerId: Long)
     fun acknowledge(roomId: String, packetId: String, peerId: Long, digest: String)
     fun queueReceipt(receipt: FamilyCareReceipt)
     fun receipts(roomId: String): List<FamilyCareReceipt>
@@ -31,7 +33,8 @@ interface FamilyCareStore {
 }
 
 data class FamilyCareOutgoing(val roomId: String, val packetId: String, val childId: Long,
-    val peerId: Long, val text: String, val digest: String, val sentAt: Long = 0)
+    val peerId: Long, val text: String, val digest: String, val sentAt: Long = 0,
+    val sendConfirmed: Boolean = false)
 data class FamilyCareReceipt(val roomId: String, val packetId: String, val childId: Long,
     val peerId: Long, val digest: String)
 data class FamilyCareChunk(val roomId: String, val transferId: String, val childId: Long,

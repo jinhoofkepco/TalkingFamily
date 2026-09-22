@@ -82,7 +82,7 @@ class FamilyCareStoreTest {
             db.version = 4
         }
         val db = store()
-        assertEquals(5, db.readableDatabase.version)
+        assertEquals(6, db.readableDatabase.version)
         assertEquals(oldState.toString(), db.cached()!!.toString())
         assertEquals(9812L, db.meta("offset"))
         assertEquals(119L, db.meta("sentAt"))
@@ -96,6 +96,65 @@ class FamilyCareStoreTest {
         assertEquals(10000L, db.familyChat.chatPeerRetryAfter(group.id, 101))
         assertNull(db.familyCare.state(group.id, 103))
         assertTrue(db.familyCare.pendingPackets(group.id).isEmpty())
+    }
+
+    @Test fun upgradeFromV5PreservesPendingAndCompletedCareWithUnconfirmedAttempts() {
+        val roomId = id()
+        val first = packet(roomId)
+        val second = packet(roomId, text = "second")
+        val source = state(roomId)
+        val db = store()
+        db.familyCare.saveState(source)
+        listOf(first, first.copy(peerId = 102), second).forEach(db.familyCare::queuePacket)
+        db.familyCare.markSent(roomId, first.packetId, 101, 111)
+        db.familyCare.acknowledge(roomId, first.packetId, 101, first.digest)
+        db.familyCare.markSent(roomId, first.packetId, 102, 222)
+        db.familyCare.markSendConfirmed(roomId, first.packetId, 102)
+        db.familyCare.setRetryAfter(roomId, 102, 999)
+        db.setMeta("offset", 12345)
+        // Recreate the exact v5 delivery schema; all other care tables are unchanged in v6.
+        db.writableDatabase.apply {
+            execSQL("ALTER TABLE family_care_deliveries RENAME TO care_deliveries_v6_fixture")
+            execSQL("CREATE TABLE family_care_deliveries (room_id TEXT NOT NULL,packet_id TEXT NOT NULL,peer_id INTEGER NOT NULL,sent_at INTEGER NOT NULL DEFAULT 0," +
+                "completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0,1)),PRIMARY KEY(room_id,packet_id,peer_id))")
+            execSQL("INSERT INTO family_care_deliveries(room_id,packet_id,peer_id,sent_at,completed) " +
+                "SELECT room_id,packet_id,peer_id,sent_at,completed FROM care_deliveries_v6_fixture")
+            execSQL("DROP TABLE care_deliveries_v6_fixture")
+            execSQL("CREATE INDEX family_care_delivery_pending ON family_care_deliveries(room_id,completed,packet_id,peer_id)")
+            version = 5
+        }
+        val upgraded = reopen()
+        assertEquals(6, upgraded.readableDatabase.version)
+        assertEquals(12345L, upgraded.meta("offset"))
+        assertEquals(source.epoch, upgraded.familyCare.state(roomId, 103)!!.epoch)
+        assertEquals(999L, upgraded.familyCare.retryAfter(roomId, 102))
+        val pending = upgraded.familyCare.pendingPackets(roomId)
+        assertEquals(listOf(first.packetId, second.packetId), pending.map { it.packetId })
+        assertEquals(listOf(102L, 101L), pending.map { it.peerId })
+        assertEquals(listOf(222L, 0L), pending.map { it.sentAt })
+        assertTrue(pending.none { it.sendConfirmed })
+        // An ACK of a pre-upgrade attempt still completes that exact packet safely.
+        upgraded.familyCare.acknowledge(roomId, first.packetId, 102, first.digest)
+        assertEquals(listOf(second.packetId), upgraded.familyCare.pendingPackets(roomId).map { it.packetId })
+    }
+
+    @Test fun confirmedSendAndAmbiguousRetryRemainDistinctAcrossRestart() {
+        val roomId = id()
+        val first = packet(roomId)
+        val second = packet(roomId, text = "second")
+        val care = store().familyCare
+        care.queuePacket(first)
+        care.queuePacket(second)
+        care.markSendConfirmed(roomId, first.packetId, 101) // No attempt cannot be confirmed.
+        assertFalse(care.pendingPackets(roomId).first().sendConfirmed)
+        care.markSent(roomId, first.packetId, 101, 1000)
+        care.markSendConfirmed(roomId, first.packetId, 101)
+        val resumed = reopen().familyCare
+        assertTrue(resumed.pendingPackets(roomId).first().sendConfirmed)
+        resumed.markSent(roomId, first.packetId, 101, 2000)
+        val afterRetry = reopen().familyCare.pendingPackets(roomId).first()
+        assertEquals(2000L, afterRetry.sentAt)
+        assertFalse(afterRetry.sendConfirmed)
     }
 
     @Test fun authoritativeStatesAndParentSnapshotsAreSeparateAndRejectRollbackEpochOrRoleReplacement() {

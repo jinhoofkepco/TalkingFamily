@@ -15,6 +15,67 @@ class TelegramExchangeTest {
     private fun award() = event("sticker_award", JSONObject().put("count", 1).put("reason", "잘했어요"))
     private fun chat(text: String, role: String) = event("chat", JSONObject().put("text", text), role)
 
+    @Test fun `outgoing only sends without polling and respects persisted global backoff`() {
+        val store = MemoryStore()
+        store.enqueue(chat("즉시 전송", "child"))
+        val methods = mutableListOf<String>()
+        val client = TelegramClient("101:${"a".repeat(32)}") { _, method, _, _ ->
+            methods += method
+            TelegramHttpResponse(200, """{"ok":true,"result":{}}""")
+        }
+        var activity = 0
+        val exchange = TelegramExchange(client, store, 202, "guardian", now = { 1_000 },
+            onNewChatCommitted = { activity++ }, onPollCompleted = { fail("No receive request") })
+        assertTrue(exchange.flushOutgoing())
+        assertEquals(listOf("sendMessage"), methods)
+        assertEquals(0, activity)
+        store.setMeta("retryAfter", 2_000)
+        assertFalse(exchange.flushOutgoing())
+        assertEquals(1, methods.size)
+    }
+
+    @Test fun `screen change before HTTP skips the stale poll but still flushes outgoing`() {
+        val store = MemoryStore()
+        store.enqueue(chat("전송만", "child"))
+        val methods = mutableListOf<String>()
+        val client = TelegramClient("101:${"a".repeat(32)}") { _, method, _, _ ->
+            methods += method
+            TelegramHttpResponse(200, """{"ok":true,"result":{}}""")
+        }
+        assertTrue(TelegramExchange(client, store, 202, "guardian", pollAllowed = { false },
+            onPollCompleted = { fail("Superseded request") }).synchronize(10))
+        assertEquals(listOf("sendMessage"), methods)
+    }
+
+    @Test fun `only newly committed legacy chat counts as incoming activity`() {
+        val family = Family()
+        val incoming = chat("새 메시지", "guardian")
+        family.guardianClient.send("101", TelegramProtocol.event(incoming))
+        var activity = 0
+        var completed = 0
+        val exchange = TelegramExchange(family.childClient, family.child, 202, "guardian", now = { family.time },
+            onNewChatCommitted = { activity++ }, onPollCompleted = { completed++ })
+        exchange.synchronize()
+        family.guardianClient.send("101", TelegramProtocol.event(incoming)) // same chat, new update ID
+        family.guardianClient.send("101", TelegramProtocol.event(award()))
+        family.guardianClient.send("101", TelegramProtocol.envelope("ack").put("id", UUID.randomUUID().toString()).toString())
+        exchange.synchronize()
+        assertEquals(1, activity)
+        assertEquals(2, completed)
+    }
+
+    @Test fun `failed commit cannot announce a new message or successful poll`() {
+        val family = Family()
+        family.guardianClient.send("101", TelegramProtocol.event(chat("저장 실패", "guardian")))
+        family.child.failCommit = true
+        var activity = 0
+        val exchange = TelegramExchange(family.childClient, family.child, 202, "guardian", now = { family.time },
+            onNewChatCommitted = { activity++ }, onPollCompleted = { fail("Commit failed") })
+        assertThrows(IOException::class.java) { exchange.synchronize() }
+        assertEquals(0, activity)
+        assertEquals(0L, family.child.meta("offset"))
+    }
+
     @Test fun `new local message interrupts idle poll and sends without error backoff`() {
         val store = MemoryStore()
         val message = chat("바로 전송", "child")
@@ -31,7 +92,8 @@ class TelegramExchangeTest {
             assertEquals(message.id, JSONObject(JSONObject(raw).getString("text")).getJSONObject("event").getString("id"))
             TelegramHttpResponse(200, """{"ok":true,"result":{}}""")
         }
-        assertTrue(TelegramExchange(client, store, 202, "guardian").synchronize(10))
+        assertTrue(TelegramExchange(client, store, 202, "guardian",
+            onPollCompleted = { fail("Intentional interruption is not an empty response") }).synchronize(10))
         assertEquals(listOf("getUpdates", "sendMessage"), methods)
         assertEquals(0L, store.meta("retryAfter"))
         assertEquals(0L, store.meta("offset"))
@@ -78,17 +140,18 @@ class TelegramExchangeTest {
                 assertEquals(2L, store.meta("offset"))
                 assertEquals(message.id, FamilySnapshot.parse(store.cached()).events.single().id)
                 order += "UI"
-            }, onReceived = { order += "notification" })
+            }, onNewChatCommitted = { order += "chat committed" },
+            onPollCompleted = { order += "poll complete" }, onReceived = { order += "notification" })
         assertThrows(TelegramException::class.java) { exchange.synchronize() }
-        assertEquals(listOf("UI", "notification", "receipt HTTP"), order)
+        assertEquals(listOf("UI", "chat committed", "notification", "poll complete", "receipt HTTP"), order)
     }
 
     @Test fun `legacy receipt replay has bounded work per exchange`() {
         val family = Family()
         repeat(10) { family.child.queueReceipt(UUID.randomUUID().toString()) }
         family.syncChild()
-        assertEquals(6, family.child.receipts().size)
-        assertEquals(4, family.telegram.sent.count { it.type == "ack" })
+        assertEquals(2, family.child.receipts().size)
+        assertEquals(8, family.telegram.sent.count { it.type == "ack" })
     }
 
     @Test fun `ACK keeps retained location and heartbeat received after timeline truncation and restart`() {
@@ -143,7 +206,7 @@ class TelegramExchangeTest {
         assertEquals(1, family.telegram.sent.count { it.type == "event" })
     }
 
-    @Test fun `lost ACK delivery resends only the oldest event and duplicate cannot grant twice`() {
+    @Test fun `lost ACK resends only its event while later ACKs complete and duplicate cannot grant twice`() {
         val family = Family()
         val first = award()
         val second = award()
@@ -153,17 +216,18 @@ class TelegramExchangeTest {
         family.telegram.dropAckFrom = 101
         family.syncChild()
         family.syncGuardian()
-        assertEquals(listOf(first.id), family.telegram.sent.filter { it.type == "event" }.map { it.id })
+        assertEquals(listOf(first.id, second.id), family.telegram.sent.filter { it.type == "event" }.map { it.id })
+        assertEquals(listOf(first.id), family.guardian.pending().map { it.id })
         family.time += 30_001
         family.guardian = MemoryStore(family.guardian.saved())
         family.child = MemoryStore(family.child.saved())
         family.syncGuardian()
         family.syncChild()
-        assertEquals(1, family.child.cached()!!.getInt("stickerBalance"))
+        assertEquals(2, family.child.cached()!!.getInt("stickerBalance"))
         assertEquals(1, family.notifications.count { it == first.id })
-        family.syncGuardian() // First ACK now allows the second event to be sent.
+        family.syncGuardian() // Only the first event's missing ACK remains.
         family.drain()
-        assertEquals(listOf(first.id, first.id, second.id), family.telegram.sent.filter { it.type == "event" }.map { it.id })
+        assertEquals(listOf(first.id, second.id, first.id), family.telegram.sent.filter { it.type == "event" }.map { it.id })
         assertEquals(2, family.child.cached()!!.getInt("stickerBalance"))
         assertTrue(family.guardian.pending().isEmpty())
     }
@@ -246,9 +310,9 @@ class TelegramExchangeTest {
         family.syncGuardian() // Its valid ACK arrives after the invalid financial event.
         val error = assertThrows(TelegramSyncException::class.java) { family.syncChild() }
         assertTrue(error.message!!.contains("두 휴대폰"))
-        assertEquals(listOf(second.id), family.child.pending().map { it.id })
+        assertTrue(family.child.pending().isEmpty())
         assertEquals(1, family.child.meta("ledgerConflict"))
-        assertEquals(3, family.child.meta("offset"))
+        assertEquals(4, family.child.meta("offset"))
         assertFalse(TelegramLedger.contains(family.child.cached()!!, invalid.id))
         assertFalse(family.telegram.sent.any { it.type == "ack" && it.id == invalid.id })
         assertTrue(family.telegram.sent.any { it.type == "event" && it.id == second.id })

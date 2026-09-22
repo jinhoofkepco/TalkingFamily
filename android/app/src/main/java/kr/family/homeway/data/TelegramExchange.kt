@@ -33,7 +33,11 @@ internal class TelegramExchange(
     private val onLegacyFailure: (TelegramException) -> Unit = {},
     private val familyCare: FamilyCareEngine? = null,
     private val onCommitted: () -> Unit = {},
+    private val onNewChatCommitted: () -> Unit = {},
+    private val onPollCompleted: () -> Unit = {},
+    private val pollAllowed: () -> Boolean = { true },
 ) {
+    private val legacyWindow = TelegramLegacyWindow(store, now)
     /** Caller serializes network runs; returns false when the persisted Telegram backoff is still active. */
     fun synchronize(timeout: Int = 0): Boolean {
         if (synchronized(lock) { store.meta("retryAfter") > now() }) return false
@@ -41,15 +45,21 @@ internal class TelegramExchange(
             checkActive()
             val pollRevision = TelegramPollWakeup.revision
             val ready = synchronized(lock) {
+                if (peerId > 0) legacyWindow.initialize()
                 (peerId > 0 && store.meta("legacyRetryAfter") <= now() &&
-                    (store.receipts().isNotEmpty() || (store.pending().isNotEmpty() &&
-                        (store.meta("sentAt") == 0L || now() - store.meta("sentAt") >= 30_000)))) ||
+                    (store.receipts().isNotEmpty() || legacyWindow.next() != null)) ||
                     familyChat?.hasReadyWork() == true || familyCare?.hasReadyWork() == true
             }
+            if (!pollAllowed()) {
+                flushAll()
+                return true
+            }
+            var interrupted = false
             val updates = try {
                 client.getUpdates(synchronized(lock) { store.meta("offset") }, if (ready) 0 else timeout, pollRevision)
             } catch (_: TelegramPollInterruptedException) {
                 // A local enqueue woke only getUpdates. Keep the offset and flush its durable outbox now.
+                interrupted = true
                 JSONArray()
             }
             checkActive()
@@ -86,8 +96,7 @@ internal class TelegramExchange(
                                 }
                             }
                             "ack" -> {
-                                val first = store.pending().firstOrNull()
-                                if (first?.id == packet.id && store.meta("sentAt") > 0) {
+                                if (legacyWindow.canAcknowledge(packet.id)) {
                                     val state = store.cached() ?: TelegramLedger.emptyState()
                                     val events = state.optJSONArray("events")
                                     for (j in 0 until (events?.length() ?: 0)) {
@@ -100,8 +109,7 @@ internal class TelegramExchange(
                                             ?.put("delivery", "relayed")
                                     }
                                     store.cache(state)
-                                    store.remove(packet.id!!)
-                                    store.setMeta("sentAt", 0)
+                                    legacyWindow.acknowledge(packet.id!!)
                                 }
                             }
                         }
@@ -111,9 +119,39 @@ internal class TelegramExchange(
                     }
                 }
                 if (committed) onCommitted()
+                // Notify at the commit boundary: a later notification or receipt failure must not
+                // erase the new-message deadline. Duplicates and non-chat packets do not reset it.
+                if (received?.kind == "chat" || chatReceived != null) onNewChatCommitted()
                 received?.let(onReceived)
                 chatReceived?.let { familyChat?.notifyReceived(it) }
             }
+            if (!interrupted) onPollCompleted()
+            flushAll()
+            return true
+        } catch (error: TelegramException) {
+            recordBackoff(error)
+            throw error
+        }
+    }
+
+    /** Sending a location or local chat must not consume or reschedule the incoming update stream. */
+    fun flushOutgoing(): Boolean {
+        if (synchronized(lock) { store.meta("retryAfter") > now() }) return false
+        try {
+            checkActive()
+            flushAll()
+            return true
+        } catch (error: TelegramException) {
+            recordBackoff(error)
+            throw error
+        }
+    }
+
+    private fun recordBackoff(error: TelegramException) = synchronized(lock) {
+        store.setMeta("retryAfter", now() + (error.retryAfterSeconds ?: 15).toLong() * 1000)
+    }
+
+    private fun flushAll() {
             familyChat?.flush()
             if (synchronized(lock) { store.meta("legacyRetryAfter") <= now() }) {
                 try { flushLegacy() }
@@ -127,30 +165,27 @@ internal class TelegramExchange(
             }
             familyCare?.flush()
             if (synchronized(lock) { store.meta("ledgerConflict") != 0L }) throw TelegramSyncException()
-            return true
-        } catch (error: TelegramException) {
-            synchronized(lock) {
-                store.setMeta("retryAfter", now() + (error.retryAfterSeconds ?: 15).toLong() * 1000)
-            }
-            throw error
-        }
     }
 
     private fun flushLegacy() {
         if (peerId <= 0) return
+        synchronized(lock) { legacyWindow.initialize() }
         // Receipts never create receipts, including after retries of an ambiguous send.
-        val receipts = synchronized(lock) { store.receipts().take(4) }
+        val receipts = synchronized(lock) { store.receipts().take(TelegramLegacyWindow.MAX_RECEIPTS_PER_FLUSH) }
         for (id in receipts) {
             checkActive()
             client.send(peerId.toString(), TelegramProtocol.envelope("ack").put("id", id).toString())
             synchronized(lock) { store.transaction { store.removeReceipt(id) } }
         }
-        val pending = synchronized(lock) { store.pending().firstOrNull() }
-        if (pending != null && synchronized(lock) { store.meta("sentAt") == 0L || now() - store.meta("sentAt") >= 30_000 }) {
+        val sentThisFlush = mutableSetOf<String>()
+        repeat(TelegramLegacyWindow.MAX_SENDS_PER_FLUSH) {
+            val pending = synchronized(lock) { legacyWindow.next(sentThisFlush) } ?: return
             checkActive()
             // Persist first: Telegram can accept this packet while its HTTP response is lost.
-            synchronized(lock) { store.transaction { store.setMeta("sentAt", now().coerceAtLeast(1)) } }
+            synchronized(lock) { store.transaction { legacyWindow.markAttempt(pending.id) } }
             client.send(peerId.toString(), TelegramProtocol.event(pending))
+            synchronized(lock) { store.transaction { legacyWindow.markConfirmed(pending.id) } }
+            sentThisFlush += pending.id
         }
     }
 }

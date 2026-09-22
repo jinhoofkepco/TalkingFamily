@@ -17,7 +17,7 @@ internal object TrackingOutboxRelay {
             receiverRunning = { TelegramReceiveService.runtime.value.running },
             hasPending = repository::hasPending,
             // Repository serialization and persisted Telegram backoff are shared with every sender.
-            exchange = { repository.synchronize(10) },
+            exchange = { repository.synchronizeScheduled(0) },
         )
     }
 

@@ -183,7 +183,7 @@ class TrackingService : Service(), SensorEventListener {
         val now = SystemClock.elapsedRealtime()
         policy = AutomaticLocationPolicy(now)
         lastHeartbeatMillis = now
-        repository.noteTrackingStatus("자동 공유 중 · 이동 중 약 30초, 정지 중 약 5분 · 첫 위치를 기다리고 있어요")
+        repository.noteTrackingStatus("자동 공유 중 · 이동 중 약 20초, 정지 중 약 5분 · 첫 위치를 기다리고 있어요")
         registerSensors()
         activityMotionMonitor.refresh()
         startLocationUpdates()
@@ -457,7 +457,7 @@ class TrackingService : Service(), SensorEventListener {
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setContentTitle("부모님께 위치 공유 중")
-            .setContentText("이동 중 약 30초, 정지 중 약 5분 · 높이 변화 추정")
+            .setContentText("이동 중 약 20초, 정지 중 약 5분 · 높이 변화 추정")
             .setOngoing(true).setOnlyAlertOnce(true).setSilent(true).setCategory(NotificationCompat.CATEGORY_SERVICE)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "공유 종료", stop)
         // Notification entry opens the app; only an explicit launcher entry starts collapsed.
