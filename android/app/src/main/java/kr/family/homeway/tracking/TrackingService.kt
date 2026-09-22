@@ -87,6 +87,7 @@ class TrackingService : Service(), SensorEventListener {
     private var subscriptionIntervalMillis: Long? = null
     private var locationCallback: LocationCallback? = null
     private var significantMotion: Sensor? = null
+    private var stepDetector: Sensor? = null
     private var lastMotionMillis = Long.MIN_VALUE
     private var accelerationCount = 0
     private var accelerationWindowStart = 0L
@@ -206,9 +207,7 @@ class TrackingService : Service(), SensorEventListener {
         significantMotion = sensors.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION, true)
             ?: sensors.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION)
         armSignificantMotion()
-        val activityAllowed = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
-            ContextCompat.checkSelfPermission(this, Manifest.permission.ACTIVITY_RECOGNITION) == PackageManager.PERMISSION_GRANTED
-        if (activityAllowed) register(Sensor.TYPE_STEP_DETECTOR, 200_000)
+        refreshStepDetector()
         // Low-rate acceleration also notices an elevator starting when there are no steps.
         register(Sensor.TYPE_ACCELEROMETER, 200_000)
         if (!register(Sensor.TYPE_PRESSURE, 1_000_000)) {
@@ -276,6 +275,22 @@ class TrackingService : Service(), SensorEventListener {
         val now = SystemClock.elapsedRealtime()
         refreshCadence(now)
         requestFreshFixIfDue(now)
+    }
+
+    /** A grant from settings must activate steps in the existing sharing session immediately. */
+    private fun refreshStepDetector() {
+        if (!ActivityMotionMonitor.hasPermission(this)) {
+            stepDetector?.let { sensors.unregisterListener(this, it) }
+            stepDetector = null
+            return
+        }
+        if (stepDetector != null) return
+        val sensor = sensors.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR, true)
+            ?: sensors.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR) ?: return
+        val registered = try {
+            sensors.registerListener(this, sensor, 200_000, 5_000_000, handler)
+        } catch (_: SecurityException) { false }
+        if (registered) stepDetector = sensor
     }
 
     private fun notePhysicalMovement(at: Long, now: Long) {
@@ -481,6 +496,7 @@ class TrackingService : Service(), SensorEventListener {
 
     private fun unregisterSensors() {
         sensors.unregisterListener(this)
+        stepDetector = null
         significantMotion?.let { sensors.cancelTriggerSensor(triggerListener, it) }
         handler.removeCallbacksAndMessages(null)
         detector.reset()
@@ -567,6 +583,8 @@ class TrackingService : Service(), SensorEventListener {
             fun refresh() {
                 if (active.started && !active.stopping &&
                     startDecision(active.repository, context) == TrackingStartPolicy.Decision.START) {
+                    active.refreshStepDetector()
+                    active.armSignificantMotion()
                     active.activityMotionMonitor.refresh()
                 }
             }
