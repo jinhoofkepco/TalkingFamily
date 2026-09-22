@@ -4,6 +4,7 @@ import android.app.ActivityManager
 import android.app.NotificationManager
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Context
+import android.content.BroadcastReceiver
 import android.content.Intent
 import android.graphics.Bitmap
 import android.os.Build
@@ -29,6 +30,7 @@ import kr.family.homeway.overlay.FloatingStarService
 import kr.family.homeway.overlay.OverlayPreferences
 import org.junit.After
 import org.junit.Assert.*
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -44,8 +46,13 @@ class FloatingOverlayTest {
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
     private val context get() = instrumentation.targetContext
     private val device get() = UiDevice.getInstance(instrumentation)
+    private var prepared = false
 
     @Before fun reset() {
+        assumeTrue("Overlay reset tests must never run on a physical family phone",
+            Build.HARDWARE in setOf("ranchu", "goldfish") || Build.FINGERPRINT.startsWith("generic/") ||
+                Build.FINGERPRINT.startsWith("generic_x86/"))
+        prepared = true
         instrumentation.runOnMainSync {
             FloatingStarService.stop(context)
             FloatingStarService.setMessengerVisible(false)
@@ -64,6 +71,7 @@ class FloatingOverlayTest {
     }
 
     @After fun cleanUp() {
+        if (!prepared) return
         val activities = mainActivities(Stage.CREATED, Stage.STARTED, Stage.RESUMED, Stage.PAUSED, Stage.STOPPED)
         instrumentation.runOnMainSync {
             FloatingStarService.stop(context)
@@ -274,6 +282,179 @@ class FloatingOverlayTest {
         assertTrue(OverlayPreferences(context).enabled)
         assertNoTrackingService()
     }
+
+    @Test fun delayedKeyguardReleaseRestoresSameForegroundStarWithoutAnotherVisibilityEvent() {
+        launchDemo(overlay = true)
+        awaitStar()
+        val service = activeOverlayService()
+        val screenField = FloatingStarService::class.java.getDeclaredField("screenAvailability").apply { isAccessible = true }
+        val originalScreen = screenField.get(service)
+        var available = false
+        try {
+            instrumentation.runOnMainSync {
+                screenField.set(service, { available })
+                deliverScreenEvent(service, Intent.ACTION_SCREEN_OFF)
+                // Samsung may still report a locked keyguard during both broadcasts.
+                deliverScreenEvent(service, Intent.ACTION_SCREEN_ON)
+                deliverScreenEvent(service, Intent.ACTION_USER_PRESENT)
+            }
+            assertFalse(FloatingStarService.runtime.value.visible)
+            assertTrue(OverlayPreferences(context).enabled)
+            assertTrue(overlayBoolean(service, "unlockRecoveryPending"))
+            compose.waitUntil(3000) { overlayLong(service, "unlockRecoveryAttemptCount") >= 1L }
+            assertFalse("The first check must respect the still-locked keyguard", FloatingStarService.runtime.value.visible)
+            assertEquals("This is not a WindowManager failure", 0L, overlayLong(service, "windowFailureCount"))
+
+            // Only the queried system state changes. No new broadcast, lifecycle event,
+            // setMessengerVisible call, or explicit show is allowed to trigger recovery.
+            instrumentation.runOnMainSync { available = true }
+            awaitStar()
+            assertSame("Unlock must retain the existing service", service, activeOverlayService())
+            assertFalse("Successful attachment must end unlock polling", overlayBoolean(service, "unlockRecoveryPending"))
+            assertEquals(0L, overlayLong(service, "windowFailureCount"))
+            assertTrue(OverlayPreferences(context).enabled)
+            assertNull(FloatingStarService.runtime.value.error)
+            val manager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            @Suppress("DEPRECATION")
+            assertTrue(manager.getRunningServices(Int.MAX_VALUE)
+                .any { it.service.className == FloatingStarService::class.java.name && it.foreground })
+            assertTrue(context.getSystemService(NotificationManager::class.java).activeNotifications.any { it.id == 4100 })
+
+            // A single pass must not query false to hide, then true to skip scheduling.
+            // The second query will report unlocked, but only a later pass may observe it.
+            var queries = 0
+            instrumentation.runOnMainSync {
+                screenField.set(service, { queries += 1; queries > 1 })
+                deliverScreenEvent(service, Intent.ACTION_SCREEN_OFF)
+                deliverScreenEvent(service, Intent.ACTION_SCREEN_ON)
+                assertEquals("Screen availability must be sampled once per visibility pass", 1, queries)
+                assertTrue(overlayBoolean(service, "unlockRecoveryPending"))
+            }
+            awaitStar()
+            assertSame(service, activeOverlayService())
+            assertFalse(overlayBoolean(service, "unlockRecoveryPending"))
+            assertNoTrackingService()
+        } finally {
+            instrumentation.runOnMainSync { screenField.set(service, originalScreen) }
+        }
+    }
+
+    @Test fun leavingMessengerAfterUserPresentWhileKeyguardIsStillLockedAlsoRestoresStar() {
+        launchDemo(overlay = true)
+        awaitStar()
+        val service = activeOverlayService()
+        tapStar()
+        val screenField = FloatingStarService::class.java.getDeclaredField("screenAvailability").apply { isAccessible = true }
+        val originalScreen = screenField.get(service)
+        var available = false
+        try {
+            instrumentation.runOnMainSync {
+                screenField.set(service, { available })
+                deliverScreenEvent(service, Intent.ACTION_SCREEN_OFF)
+                deliverScreenEvent(service, Intent.ACTION_SCREEN_ON)
+                deliverScreenEvent(service, Intent.ACTION_USER_PRESENT)
+            }
+            assertFalse("An open messenger must not schedule a star above itself",
+                overlayBoolean(service, "unlockRecoveryPending"))
+            assertFalse(FloatingStarService.runtime.value.visible)
+
+            // Exercise the real Activity onStop -> messengerVisible=false ordering after
+            // USER_PRESENT. The screen query remains locked throughout that transition.
+            device.pressHome()
+            compose.waitUntil(10_000) { mainActivities(Stage.STOPPED).isNotEmpty() }
+            assertTrue("Hiding the messenger while unlock is pending must schedule a recheck",
+                overlayBoolean(service, "unlockRecoveryPending"))
+            instrumentation.runOnMainSync { available = true }
+            awaitStar()
+            assertSame(service, activeOverlayService())
+            assertFalse(overlayBoolean(service, "unlockRecoveryPending"))
+            assertEquals(0L, overlayLong(service, "windowFailureCount"))
+            assertTrue(OverlayPreferences(context).enabled)
+            assertNoTrackingService()
+        } finally {
+            instrumentation.runOnMainSync { screenField.set(service, originalScreen) }
+        }
+    }
+
+    @Test fun unlockRechecksCancelWhenScreenTurnsOffChatOpensOrSavedChoiceIsDisabled() {
+        launchDemo(overlay = true)
+        awaitStar()
+        val service = activeOverlayService()
+        val screenField = FloatingStarService::class.java.getDeclaredField("screenAvailability").apply { isAccessible = true }
+        val originalScreen = screenField.get(service)
+        var available = false
+        try {
+            instrumentation.runOnMainSync {
+                screenField.set(service, { available })
+                deliverScreenEvent(service, Intent.ACTION_SCREEN_OFF)
+                deliverScreenEvent(service, Intent.ACTION_SCREEN_ON)
+                assertTrue(overlayBoolean(service, "unlockRecoveryPending"))
+                deliverScreenEvent(service, Intent.ACTION_SCREEN_OFF)
+                available = true
+            }
+            assertFalse(overlayBoolean(service, "unlockRecoveryPending"))
+            SystemClock.sleep(450)
+            assertFalse("A cancelled callback must not attach after screen OFF", FloatingStarService.runtime.value.visible)
+            assertTrue(OverlayPreferences(context).enabled)
+            instrumentation.runOnMainSync { deliverScreenEvent(service, Intent.ACTION_USER_PRESENT) }
+            awaitStar()
+
+            instrumentation.runOnMainSync {
+                available = false
+                deliverScreenEvent(service, Intent.ACTION_SCREEN_OFF)
+                deliverScreenEvent(service, Intent.ACTION_SCREEN_ON)
+                assertTrue(overlayBoolean(service, "unlockRecoveryPending"))
+                context.startActivity(FloatingStarService.chatIntent(context))
+            }
+            awaitMessenger()
+            instrumentation.runOnMainSync { available = true }
+            assertFalse(overlayBoolean(service, "unlockRecoveryPending"))
+            SystemClock.sleep(450)
+            assertFalse("The star must stay hidden while the messenger is open", FloatingStarService.runtime.value.visible)
+            assertTrue(OverlayPreferences(context).enabled)
+            device.pressBack()
+            awaitStar()
+
+            instrumentation.runOnMainSync {
+                available = false
+                deliverScreenEvent(service, Intent.ACTION_SCREEN_OFF)
+                deliverScreenEvent(service, Intent.ACTION_SCREEN_ON)
+                assertTrue(overlayBoolean(service, "unlockRecoveryPending"))
+                FloatingStarService.stop(context)
+                available = true
+            }
+            compose.waitUntil(5000) { !FloatingStarService.runtime.value.running }
+            assertFalse(overlayBoolean(service, "unlockRecoveryPending"))
+            SystemClock.sleep(450)
+            assertFalse(FloatingStarService.runtime.value.visible)
+            assertFalse("Recovery must never re-enable an explicit OFF choice", OverlayPreferences(context).enabled)
+            assertNoTrackingService()
+        } finally {
+            instrumentation.runOnMainSync { screenField.set(service, originalScreen) }
+        }
+    }
+
+    private fun activeOverlayService(): FloatingStarService {
+        var service: FloatingStarService? = null
+        instrumentation.runOnMainSync {
+            service = FloatingStarService::class.java.getDeclaredField("runningInstance").apply { isAccessible = true }
+                .get(null) as FloatingStarService
+        }
+        return requireNotNull(service)
+    }
+
+    /** Direct delivery avoids introducing a production broadcast hook or changing emulator security. */
+    private fun deliverScreenEvent(service: FloatingStarService, action: String) {
+        val receiver = FloatingStarService::class.java.getDeclaredField("screenReceiver").apply { isAccessible = true }
+            .get(service) as BroadcastReceiver
+        receiver.onReceive(context, Intent(action))
+    }
+
+    private fun overlayBoolean(service: FloatingStarService, name: String): Boolean =
+        FloatingStarService::class.java.getDeclaredField(name).apply { isAccessible = true }.getBoolean(service)
+
+    private fun overlayLong(service: FloatingStarService, name: String): Long =
+        FloatingStarService::class.java.getDeclaredField(name).apply { isAccessible = true }.getLong(service)
 
     private fun overlayDiagnostics(name: String): String {
         val output = StringWriter()

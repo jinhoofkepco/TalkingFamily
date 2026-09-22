@@ -34,3 +34,30 @@ internal class OverlayWindowRecovery {
         val DELAYS_MILLIS = longArrayOf(300L, 1_500L, 5_000L)
     }
 }
+
+/** Recheck only briefly after a screen/unlock event; keyguard state may lag the broadcast. */
+internal class OverlayUnlockRecovery {
+    var attemptsUsed = 0
+        private set
+    var active = false
+        private set
+
+    fun begin() {
+        attemptsUsed = 0
+        active = true
+    }
+
+    fun nextDelayMillis(): Long? {
+        if (!active) return null
+        val delay = DELAYS_MILLIS.getOrNull(attemptsUsed)
+        if (delay == null) active = false else attemptsUsed += 1
+        return delay
+    }
+
+    fun cancel() { active = false }
+
+    private companion object {
+        // Relative delays give checks at 300 ms, 1.5 s and 5 s after the latest screen event.
+        val DELAYS_MILLIS = longArrayOf(300L, 1_200L, 3_500L)
+    }
+}

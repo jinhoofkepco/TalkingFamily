@@ -46,4 +46,40 @@ class OverlayStartPolicyTest {
         assertEquals(OverlayStartPolicy.Decision.STOP, OverlayStartPolicy.decide(false, true, false))
         assertEquals(OverlayStartPolicy.Decision.STOP, OverlayStartPolicy.decide(false, true, true))
     }
+
+    @Test fun unlockChecksStopAfterFiveSecondsAndDoNotBecomeContinuousPolling() {
+        val recovery = OverlayUnlockRecovery()
+        assertEquals(null, recovery.nextDelayMillis())
+        recovery.begin()
+        var elapsed = 0L
+        val checkedAt = List(3) { elapsed += checkNotNull(recovery.nextDelayMillis()); elapsed }
+        assertEquals(listOf(300L, 1_500L, 5_000L), checkedAt)
+        assertEquals(3, recovery.attemptsUsed)
+        repeat(20) { assertEquals(null, recovery.nextDelayMillis()) }
+        assertFalse(recovery.active)
+    }
+
+    @Test fun screenOffMessengerOpenOrStopCanCancelAllRemainingUnlockChecks() {
+        val recovery = OverlayUnlockRecovery()
+        recovery.begin()
+        assertEquals(300L, recovery.nextDelayMillis())
+        recovery.cancel()
+        assertFalse(recovery.active)
+        repeat(5) { assertEquals(null, recovery.nextDelayMillis()) }
+        recovery.begin() // A later actual screen event starts a fresh bounded burst.
+        assertEquals(300L, recovery.nextDelayMillis())
+        assertEquals(1, recovery.attemptsUsed)
+    }
+
+    @Test fun unlockChecksDoNotResetOrConsumeTheIndependentWindowFailureBudget() {
+        val windows = OverlayWindowRecovery()
+        val unlock = OverlayUnlockRecovery()
+        repeat(3) { assertTrue(windows.nextDelayMillis() != null) }
+        unlock.begin()
+        repeat(3) { assertTrue(unlock.nextDelayMillis() != null) }
+        assertEquals(null, windows.nextDelayMillis())
+        assertEquals(3, windows.attemptsUsed)
+        unlock.cancel()
+        assertEquals(null, windows.nextDelayMillis())
+    }
 }

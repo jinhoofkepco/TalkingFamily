@@ -28,11 +28,19 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import java.io.FileDescriptor
+import java.io.PrintWriter
 
 /** User-visible remote messaging session. No location access, boot receiver, or silent restart. */
 class TelegramReceiveService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var polling: Job? = null
+    @Volatile private var healthRepository: AppRepository? = null
+    @Volatile private var lastExchangeAttemptAt: Long? = null
+    @Volatile private var lastSuccessfulCycleAt: Long? = null
+    @Volatile private var failedCycles = 0L
+    @Volatile private var consecutiveFailures = 0L
+    @Volatile private var waitReason = "not_started"
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) { stop(this); return START_NOT_STICKY }
@@ -56,37 +64,58 @@ class TelegramReceiveService : Service() {
         state.value = ReceiveState(true)
         if (polling?.isActive != true) polling = scope.launch {
             val repo = AppRepository(this@TelegramReceiveService)
-            while (isActive && repo.configured) {
-                // Capture before inspecting the queue: a send during the exchange or subsequent
-                // pause must remain visible, even if the HTTP poll already returned.
-                val revision = TelegramPollWakeup.revision
-                val retryDelay = repo.synchronizationRetryDelayMillis()
-                if (retryDelay > 0) {
-                    awaitWake(revision, retryDelay)
-                    continue
+            healthRepository = repo
+            try {
+                while (isActive && repo.configured) {
+                    waitReason = "checking_schedule"
+                    // Capture before inspecting the queue: a send during the exchange or subsequent
+                    // pause must remain visible, even if the HTTP poll already returned.
+                    val revision = TelegramPollWakeup.revision
+                    val retryDelay = repo.synchronizationRetryDelayMillis()
+                    if (retryDelay > 0) {
+                        waitReason = "telegram_backoff"
+                        awaitWake(revision, retryDelay)
+                        continue
+                    }
+                    val startedAt = SystemClock.elapsedRealtime()
+                    var waitMillis: Long
+                    try {
+                        lastExchangeAttemptAt = startedAt
+                        waitReason = "exchange_in_progress"
+                        repo.synchronizeScheduled(TelegramChatReceiveSchedule.FOREGROUND_POLL_SECONDS)
+                        state.value = ReceiveState(true)
+                        // Long polling already waited. Only fast returns need pacing, including
+                        // empty replies and a repository exchange skipped by a racing backoff.
+                        val receiveDelay = repo.receiveDelayMillis()
+                        val outgoingRetry = if (repo.hasPending()) OUTBOX_RECHECK_MILLIS else Long.MAX_VALUE
+                        waitMillis = if (receiveDelay > 0) minOf(receiveDelay, outgoingRetry)
+                            else (TelegramChatReceiveSchedule.MIN_CYCLE_MILLIS -
+                                (SystemClock.elapsedRealtime() - startedAt)).coerceAtLeast(0)
+                        waitReason = when {
+                            receiveDelay <= 0 -> "foreground_pacing"
+                            outgoingRetry < receiveDelay -> "outbox_recheck"
+                            else -> "receive_deadline"
+                        }
+                        // A completed cycle may have flushed outgoing work only, or skipped for a
+                        // racing backoff. This deliberately does not claim a successful Telegram poll.
+                        lastSuccessfulCycleAt = SystemClock.elapsedRealtime()
+                        consecutiveFailures = 0
+                    } catch (cancelled: CancellationException) { throw cancelled }
+                    catch (_: Exception) {
+                        failedCycles++
+                        consecutiveFailures++
+                        AppDiagnostics.record(this@TelegramReceiveService, "telegram.receiver", "인터넷과 봇 설정을 확인해 주세요. 연결을 다시 시도하고 있어요.")
+                        state.value = ReceiveState(true, "인터넷과 봇 설정을 확인해 주세요. 연결을 다시 시도하고 있어요.")
+                        val errorBackoff = repo.synchronizationRetryDelayMillis()
+                        waitMillis = errorBackoff.takeIf { it > 0 } ?: TelegramChatReceiveSchedule.ERROR_RETRY_MILLIS
+                        waitReason = if (errorBackoff > 0) "telegram_backoff" else "cycle_retry"
+                    }
+                    awaitWake(revision, waitMillis)
                 }
-                val startedAt = SystemClock.elapsedRealtime()
-                var waitMillis: Long
-                try {
-                    repo.synchronizeScheduled(TelegramChatReceiveSchedule.FOREGROUND_POLL_SECONDS)
-                    state.value = ReceiveState(true)
-                    // Long polling already waited. Only fast returns need pacing, including
-                    // empty replies and a repository exchange skipped by a racing backoff.
-                    val receiveDelay = repo.receiveDelayMillis()
-                    val outgoingRetry = if (repo.hasPending()) OUTBOX_RECHECK_MILLIS else Long.MAX_VALUE
-                    waitMillis = if (receiveDelay > 0) minOf(receiveDelay, outgoingRetry)
-                        else (TelegramChatReceiveSchedule.MIN_CYCLE_MILLIS -
-                            (SystemClock.elapsedRealtime() - startedAt)).coerceAtLeast(0)
-                } catch (cancelled: CancellationException) { throw cancelled }
-                catch (_: Exception) {
-                    AppDiagnostics.record(this@TelegramReceiveService, "telegram.receiver", "인터넷과 봇 설정을 확인해 주세요. 연결을 다시 시도하고 있어요.")
-                    state.value = ReceiveState(true, "인터넷과 봇 설정을 확인해 주세요. 연결을 다시 시도하고 있어요.")
-                    waitMillis = repo.synchronizationRetryDelayMillis().takeIf { it > 0 }
-                        ?: TelegramChatReceiveSchedule.ERROR_RETRY_MILLIS
-                }
-                awaitWake(revision, waitMillis)
+                stopSelf()
+            } finally {
+                waitReason = "stopped"
             }
-            stopSelf()
         }
         return START_NOT_STICKY
     }
@@ -95,12 +124,26 @@ class TelegramReceiveService : Service() {
         withTimeoutOrNull(waitMillis) { TelegramPollWakeup.changes.first { it != revision } }
     }
     override fun onDestroy() {
+        waitReason = "stopped"
         scope.cancel()
         // Release a blocking idle poll after cancellation, so the next authorized worker or
         // session does not wait for this stopped service's remaining HTTP timeout.
         TelegramPollWakeup.signal()
         state.value = ReceiveState(false)
+        healthRepository = null
         super.onDestroy()
+    }
+    override fun dump(fd: FileDescriptor, writer: PrintWriter, args: Array<out String>?) {
+        val now = SystemClock.elapsedRealtime()
+        fun age(at: Long?): String = at?.let { (now - it).coerceAtLeast(0).toString() } ?: "none"
+        val repo = healthRepository
+        val backoff = runCatching { repo?.synchronizationRetryDelayMillis()?.toString() }.getOrNull() ?: "unavailable"
+        val nextPoll = runCatching { repo?.receiveDelayMillis()?.toString() }.getOrNull() ?: "unavailable"
+        writer.println("receiverRunning=${state.value.running} pollingJobActive=${polling?.isActive == true}")
+        writer.println("lastExchangeAttemptAgeMillis=${age(lastExchangeAttemptAt)} lastSuccessfulCycleAgeMillis=${age(lastSuccessfulCycleAt)}")
+        writer.println("waitReason=$waitReason backoffRemainingMillis=$backoff nextPollDelayMillis=$nextPoll")
+        writer.println("failedCycles=$failedCycles consecutiveFailures=$consecutiveFailures")
+        writer.println("cycleSuccessDoesNotProvePollOrDelivery=true")
     }
     companion object {
         private const val CHANNEL = "family_telegram_receiving"

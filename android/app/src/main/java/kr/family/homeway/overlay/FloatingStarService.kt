@@ -39,6 +39,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kr.family.homeway.MainActivity
 import kr.family.homeway.R
+import kr.family.homeway.data.AppDiagnostics
 
 data class OverlayRuntime(
     val running: Boolean = false,
@@ -70,6 +71,35 @@ class FloatingStarService : Service() {
     private var windowFailureCount = 0L
     private var recoveryAttemptCount = 0L
     private var lastWindowFailure = "none"
+    private val unlockRecovery = OverlayUnlockRecovery()
+    private var unlockRecoveryPending = false
+    private var unlockRecoveryAttemptCount = 0L
+    private var lastVisibilityEvent = "none"
+    private var lastScreenEvent = "none"
+    private var lastUnlockResult = "none"
+    // Keeping the query in one private provider also permits deterministic native lifecycle tests.
+    private var screenAvailability: () -> Boolean = {
+        getSystemService(PowerManager::class.java).isInteractive &&
+            !getSystemService(KeyguardManager::class.java).isKeyguardLocked
+    }
+    private val recoverAfterUnlock = Runnable {
+        unlockRecoveryPending = false
+        if (!started || stopping) {
+            cancelUnlockRecovery("stopped")
+        } else {
+            unlockRecoveryAttemptCount += 1
+            val windowRequested = refreshBubble(resetRecovery = false)
+            when {
+                !started || stopping -> cancelUnlockRecovery("stopped")
+                messengerVisible -> cancelUnlockRecovery("messenger_open")
+                windowRequested -> {
+                    cancelUnlockRecovery(if (bubble?.isAttachedToWindow == true) "attached" else "screen_ready")
+                    AppDiagnostics.record(this, "overlay.visibility", "잠금 해제 상태를 다시 확인하고 별 아이콘 표시를 요청했어요.")
+                }
+                else -> scheduleUnlockRecovery()
+            }
+        }
+    }
     private val recoverWindow = Runnable {
         recoveryPending = false
         recoveryAttemptCount += 1
@@ -78,7 +108,25 @@ class FloatingStarService : Service() {
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == Intent.ACTION_SCREEN_OFF) hideBubble() else refreshBubble()
+            val event = when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> "screen_off"
+                Intent.ACTION_SCREEN_ON -> "screen_on"
+                Intent.ACTION_USER_PRESENT -> "user_present"
+                else -> return
+            }
+            lastVisibilityEvent = event
+            lastScreenEvent = event
+            cancelUnlockRecovery(event)
+            if (event == "screen_off") {
+                hideBubble()
+            } else {
+                val windowRequested = refreshBubble()
+                // The broadcast can arrive before Samsung's keyguard query reports unlocked.
+                // A ready screen uses the existing window recovery; do not start another burst.
+                if (started && !stopping && !messengerVisible && !windowRequested) {
+                    beginUnlockRecovery()
+                }
+            }
         }
     }
     private val permissionListener = AppOpsManager.OnOpChangedListener { operation, packageName ->
@@ -159,19 +207,49 @@ class FloatingStarService : Service() {
         return if (stopping) START_NOT_STICKY else START_STICKY
     }
 
-    private fun screenIsAvailable(): Boolean =
-        getSystemService(PowerManager::class.java).isInteractive &&
-            !getSystemService(KeyguardManager::class.java).isKeyguardLocked
+    private fun screenIsAvailable(): Boolean = screenAvailability()
 
-    private fun refreshBubble(resetRecovery: Boolean = true) {
-        if (!started || stopping) return
+    private fun beginUnlockRecovery() {
+        unlockRecovery.begin()
+        lastUnlockResult = "waiting_for_unlock"
+        scheduleUnlockRecovery()
+    }
+
+    private fun scheduleUnlockRecovery() {
+        val delay = unlockRecovery.nextDelayMillis()
+        if (delay == null) {
+            unlockRecoveryPending = false
+            lastUnlockResult = "waiting_for_visibility_event"
+            AppDiagnostics.record(this, "overlay.visibility", "잠금 해제 상태를 아직 확인하지 못해 다음 화면 전환을 기다려요.")
+        } else {
+            unlockRecoveryPending = true
+            handler.postDelayed(recoverAfterUnlock, delay)
+        }
+    }
+
+    private fun cancelUnlockRecovery(result: String) {
+        handler.removeCallbacks(recoverAfterUnlock)
+        unlockRecoveryPending = false
+        unlockRecovery.cancel()
+        lastUnlockResult = result
+    }
+
+    /** The result retains this check's screen decision, avoiding a second keyguard-query race. */
+    private fun refreshBubble(resetRecovery: Boolean = true): Boolean {
+        if (!started || stopping) return false
+        if (messengerVisible) cancelUnlockRecovery("messenger_open")
         val decision = startDecision(this)
         if (decision != OverlayStartPolicy.Decision.START) {
             end(clearChoice = decision == OverlayStartPolicy.Decision.CLEAR_CHOICE_AND_STOP)
-            return
+            return false
         }
         if (resetRecovery) windowRecovery.resetForVisibilityEvent()
-        if (messengerVisible || !screenIsAvailable()) hideBubble() else showBubble()
+        if (messengerVisible || !screenIsAvailable()) {
+            hideBubble()
+            return false
+        }
+        showBubble()
+        return true
     }
 
     private fun showBubble() {
@@ -207,7 +285,10 @@ class FloatingStarService : Service() {
         view.setOnClickListener { openMessenger() }
         view.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
             override fun onViewAttachedToWindow(attached: View) {
-                if (bubble === attached && started && !stopping) mutableRuntime.value = OverlayRuntime(running = true, visible = true)
+                if (bubble === attached && started && !stopping) {
+                    cancelUnlockRecovery("attached")
+                    mutableRuntime.value = OverlayRuntime(running = true, visible = true)
+                }
             }
             override fun onViewDetachedFromWindow(detached: View) {
                 // Intentional hides clear bubble before removing the view. An unexpected detach
@@ -244,8 +325,10 @@ class FloatingStarService : Service() {
     }
 
     private fun handleWindowFailure(reason: String) {
+        lastVisibilityEvent = "window"
         windowFailureCount += 1
         lastWindowFailure = reason
+        AppDiagnostics.record(this, "overlay.visibility", "별 아이콘 창을 표시하지 못해 복구를 시도하고 있어요.")
         hideBubble()
         if (!started || stopping) return
         val decision = startDecision(this)
@@ -350,6 +433,7 @@ class FloatingStarService : Service() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        lastVisibilityEvent = "window"
         // Recreate the tiny window using new physical DPI, insets and persisted fractional position.
         hideBubble()
         refreshBubble()
@@ -387,6 +471,7 @@ class FloatingStarService : Service() {
         if (stopping) return
         stopping = true
         started = false
+        cancelUnlockRecovery("stopped")
         hideBubble()
         mutableRuntime.value = OverlayRuntime(error = error, stopping = true)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -396,6 +481,7 @@ class FloatingStarService : Service() {
     override fun onDestroy() {
         started = false
         stopping = true
+        cancelUnlockRecovery("destroyed")
         hideBubble()
         if (runningInstance === this) runningInstance = null
         if (receiverRegistered) try { unregisterReceiver(screenReceiver) } catch (_: RuntimeException) { }
@@ -435,6 +521,7 @@ class FloatingStarService : Service() {
         writer.println("screenInteractive=$interactive keyguardLocked=$locked messengerVisible=$messengerVisible")
         writer.println("windowAttached=${bubble?.isAttachedToWindow == true} reportedVisible=${mutableRuntime.value.visible}")
         writer.println("windowFailures=$windowFailureCount recoveryAttempts=$recoveryAttemptCount burstAttempts=${windowRecovery.attemptsUsed} recoveryPending=$recoveryPending lastWindowFailure=$lastWindowFailure")
+        writer.println("lastVisibilityEvent=$lastVisibilityEvent lastScreenEvent=$lastScreenEvent unlockRecoveryPending=$unlockRecoveryPending unlockRecoveryAttempts=$unlockRecoveryAttemptCount unlockBurstAttempts=${unlockRecovery.attemptsUsed} lastUnlockResult=$lastUnlockResult")
     }
 
     companion object {
@@ -541,9 +628,21 @@ class FloatingStarService : Service() {
 
         /** Changes only an existing service; background lifecycle callbacks never start a new one. */
         fun setMessengerVisible(visible: Boolean) {
+            val becameBackground = messengerVisible && !visible
             messengerVisible = visible
-            if (Looper.myLooper() == Looper.getMainLooper()) runningInstance?.refreshBubble()
-            else mainHandler.post { runningInstance?.refreshBubble() }
+            fun refresh() { runningInstance?.let { service ->
+                service.lastVisibilityEvent = "visibility"
+                val windowRequested = service.refreshBubble()
+                // USER_PRESENT can precede the Activity's stop callback as well as keyguard release.
+                // Only a real foreground-to-background edge starts this bounded check; repeats do not.
+                if (becameBackground && !messengerVisible && service.started && !service.stopping &&
+                    !windowRequested && !service.unlockRecovery.active &&
+                    service.getSystemService(PowerManager::class.java).isInteractive) {
+                    service.beginUnlockRecovery()
+                }
+            } }
+            if (Looper.myLooper() == Looper.getMainLooper()) refresh()
+            else mainHandler.post { refresh() }
         }
 
         fun chatIntent(context: Context): Intent = Intent(context, MainActivity::class.java)
