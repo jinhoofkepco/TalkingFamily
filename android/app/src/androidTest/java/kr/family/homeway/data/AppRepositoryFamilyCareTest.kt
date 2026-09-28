@@ -106,7 +106,8 @@ class AppRepositoryFamilyCareTest {
             assertFalse(repo.sharingEnabled)
             assertEquals(if (child) own.botId else if (parent) 103L else null, repo.selectedCareChildId)
         }
-        assertTrue(fake.methods.all { it == "getMe" || it == "getWebhookInfo" })
+        assertTrue(fake.methods.all { it in setOf("getMe", "getWebhookInfo", "sendMessage") })
+        assertEquals(members.size * (members.size - 1), fake.greetings.size)
     }
 
     @Test fun careRoleCanDifferFromPreservedLegacyRoleWithoutGrantingParentLocationCollection() = runBlocking {
@@ -148,6 +149,7 @@ class AppRepositoryFamilyCareTest {
 
     @Test fun childTelemetryQueuesOnlyForBothParentsNeverSiblingOrChatOnlyFamily() = runBlocking {
         repo.joinFamilyRoom(token(103), activeRoom.toCode())
+        fake.methods.clear()
         val ids = mutableSetOf<String>()
         val telemetry = listOf(
             "location" to locationPayload(),
@@ -241,12 +243,22 @@ class AppRepositoryFamilyCareTest {
 
     private class IdentityTelegram(private val members: List<FamilyChatMember>) : TelegramHttpTransport {
         val methods = mutableListOf<String>()
+        val greetings = mutableListOf<JSONObject>()
         override fun execute(token: String, method: String, json: String, timeoutSeconds: Int): TelegramHttpResponse {
             methods += method
             val own = members.first { it.botId == token.substringBefore(':').toLong() }
             val result = when (method) {
                 "getMe" -> JSONObject().put("id", own.botId).put("is_bot", true).put("username", own.username.removePrefix("@"))
                 "getWebhookInfo" -> JSONObject().put("url", "")
+                "sendMessage" -> {
+                    val request = JSONObject(json)
+                    assertEquals("hello", JSONObject(request.getString("text")).getString("type"))
+                    val peer = members.first { it.username == request.getString("chat_id") }
+                    assertNotEquals(own.botId, peer.botId)
+                    greetings += request
+                    JSONObject().put("chat", JSONObject().put("id", peer.botId).put("type", "private")
+                        .put("username", peer.username.removePrefix("@")))
+                }
                 else -> error("Repository setup tests must not send or poll Telegram: $method")
             }
             return TelegramHttpResponse(200, JSONObject().put("ok", true).put("result", result).toString())

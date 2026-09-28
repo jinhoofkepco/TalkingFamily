@@ -14,17 +14,23 @@ class SqliteFamilyChatStore internal constructor(private val owner: LocalStore) 
         "SELECT r.configuration FROM family_chat_rooms r JOIN family_chat_active a ON a.room_id=r.id WHERE a.id=1", null
     ).use { rows -> if (rows.moveToFirst()) FamilyChatRoom.parse(JSONObject(rows.getString(0))) else null }
 
+    /** Validate before opening peer conversations, including when rejoining a previously left room. */
+    fun validateRoom(room: FamilyChatRoom): FamilyChatRoom {
+        val validated = FamilyChatValidation.room(room).let { it.copy(members = it.members.sortedBy { member -> member.botId }) }
+        val existing = owner.readableDatabase.rawQuery("SELECT configuration FROM family_chat_rooms WHERE id=?", arrayOf(validated.id)).use {
+            if (it.moveToFirst()) FamilyChatRoom.parse(JSONObject(it.getString(0))) else null
+        }
+        require(existing == null || existing == validated) { "가족 명단이 달라요. 새 가족방 코드를 만들어 주세요." }
+        return validated
+    }
+
     /** A room identity fixes its member list; a changed family list creates a new room identity. */
     fun setActiveRoom(room: FamilyChatRoom?) = transaction {
         val db = owner.writableDatabase
         if (room == null) {
             db.delete("family_chat_active", "id=1", null)
         } else {
-            val validated = FamilyChatValidation.room(room).let { it.copy(members = it.members.sortedBy { member -> member.botId }) }
-            val existing = db.rawQuery("SELECT configuration FROM family_chat_rooms WHERE id=?", arrayOf(validated.id)).use {
-                if (it.moveToFirst()) FamilyChatRoom.parse(JSONObject(it.getString(0))) else null
-            }
-            require(existing == null || existing == validated) { "가족 명단이 달라요. 새 가족방 코드를 만들어 주세요." }
+            val validated = validateRoom(room)
             db.insertWithOnConflict("family_chat_rooms", null, ContentValues().apply {
                 put("id", validated.id); put("configuration", validated.json().toString())
             }, SQLiteDatabase.CONFLICT_IGNORE)

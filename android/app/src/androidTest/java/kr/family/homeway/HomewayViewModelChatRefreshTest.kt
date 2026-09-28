@@ -224,9 +224,10 @@ class HomewayViewModelChatRefreshTest {
                     }
                 }
                 "sendMessage" -> {
-                    assertEquals(202L, body.getLong("chat_id"))
                     val type = JSONObject(body.getString("text")).getString("type")
-                    assertTrue(type in setOf("chat", "chat_ack"))
+                    assertTrue(type in setOf("hello", "chat", "chat_ack"))
+                    if (type == "hello") assertEquals("@refresh_peer_bot", body.getString("chat_id"))
+                    else assertEquals(202L, body.getLong("chat_id"))
                     if (type == "chat") sentChats.incrementAndGet()
                     if (type == "chat_ack" && pauseAck.compareAndSet(true, false)) {
                         ackStarted.countDown()

@@ -347,10 +347,25 @@ class AppRepository internal constructor(context: Context, private val clientFac
     suspend fun joinFamilyRoom(rawToken: String, code: String) = withContext(Dispatchers.IO) { networkMutex.withLock {
         val active = FamilyChatRoom.fromCode(code)
         check(room == null || room?.id == active.id) { "현재 가족방에서 나간 뒤 다른 방에 참여해 주세요." }
+        synchronized(dataLock) { store.familyChat.validateRoom(active) }
         val (client, token) = roomClient(rawToken)
         val me = verifyRoomIdentity(client)
         val own = active.members.firstOrNull { it.botId == me.getLong("id") }
         require(own != null && own.username.equals("@${me.getString("username")}", true)) { "이 휴대폰 봇이 가족 명단에 없어요. 가족방을 만든 사람에게 확인해 주세요." }
+        // Open each private bot conversation by username, including sibling-to-sibling peers.
+        // Only a content-free hello may precede verification of the roster's pinned bot ID.
+        val hello = FamilyChatProtocol.envelope("hello").toString()
+        for (member in active.members.filter { it.botId != own.botId }) {
+            currentCoroutineContext().ensureActive()
+            val chat = client.send(member.username, hello).optJSONObject("chat")
+            val id = chat?.opt("id")
+            if (chat == null || chat.optString("type") != "private" || id !is Number || id.toString() != member.botId.toString() ||
+                (chat.optString("username").isNotBlank() && !"@${chat.optString("username")}".equals(member.username, true))) {
+                throw TelegramException(400, reason = TelegramFailureReason.PEER_IDENTITY_MISMATCH)
+            }
+        }
+        // A failed or cancelled handshake must leave the saved connection and room untouched.
+        currentCoroutineContext().ensureActive()
         saveRoom(active, own, token)
     } }
     private fun saveRoom(active: FamilyChatRoom, own: FamilyChatMember, token: String) = synchronized(dataLock) {

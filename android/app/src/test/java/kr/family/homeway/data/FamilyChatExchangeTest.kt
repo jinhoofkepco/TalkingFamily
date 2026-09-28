@@ -8,6 +8,20 @@ import java.io.IOException
 import java.util.UUID
 
 class FamilyChatExchangeTest {
+    @Test fun `joining peer hello advances cursor without chat notification acknowledgement or reply`() {
+        val family = Family()
+        family.telegram.inject(303, 404, FamilyChatProtocol.envelope("hello").toString())
+        family.sync(404)
+
+        val receiver = family.stores.getValue(404)
+        assertTrue(receiver.meta("offset") > 0)
+        assertTrue(receiver.chatHistory(family.room.id).messages.isEmpty())
+        assertTrue(receiver.chatReceipts(family.room.id).isEmpty())
+        assertTrue(family.notifications.isEmpty())
+        assertTrue(family.chatActivity.isEmpty())
+        assertTrue(family.telegram.sendRequests.isEmpty())
+    }
+
     @Test fun `family chat activity counts new sibling message once even if later ACK is rate limited`() {
         val family = Family()
         val message = family.enqueue(303, "딸에게 보내는 새 메시지")
