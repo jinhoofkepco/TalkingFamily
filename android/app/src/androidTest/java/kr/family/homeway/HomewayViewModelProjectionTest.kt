@@ -6,6 +6,7 @@ import android.content.Intent
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import androidx.lifecycle.ViewModelStore
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -19,6 +20,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
@@ -31,6 +33,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /** Emulator-only DB fixtures. No Telegram method may reach the network. */
@@ -46,8 +49,12 @@ class HomewayViewModelProjectionTest {
     private lateinit var room: FamilyChatRoom
     private var prepared = false
     private val reads = AtomicInteger()
+    private val completedReads = AtomicInteger()
+    private val readStartedAt = AtomicLong()
+    private val lastReadDuration = AtomicLong()
     private val readOnMain = AtomicBoolean()
     private val nextGate = AtomicReference<ReadGate?>()
+    private val lastProjection = AtomicReference("not read")
     private val gates = mutableListOf<ReadGate>()
 
     private class ReadGate {
@@ -102,8 +109,15 @@ class HomewayViewModelProjectionTest {
         instrumentation.runOnMainSync {
             model = HomewayViewModel(context.applicationContext as Application, repo) {
                 reads.incrementAndGet()
+                val startedAt = SystemClock.elapsedRealtime()
+                readStartedAt.set(startedAt)
                 if (Looper.myLooper() == Looper.getMainLooper()) readOnMain.set(true)
                 val projection = repo.readUiSnapshot()
+                lastReadDuration.set(SystemClock.elapsedRealtime() - startedAt)
+                completedReads.incrementAndGet()
+                lastProjection.set("configured=${projection.configured}, care=${projection.careEnabled}, " +
+                    "ready=${projection.careSnapshot != null}, child=${projection.selectedChildBotId}, " +
+                    "balance=${projection.careSnapshot?.stickerBalance}")
                 nextGate.getAndSet(null)?.let { gate ->
                     gate.started.countDown()
                     check(gate.release.await(15, TimeUnit.SECONDS)) { "Test did not release its projection read" }
@@ -116,8 +130,19 @@ class HomewayViewModelProjectionTest {
 
     private fun blockNextRead(): ReadGate = ReadGate().also { gates.add(it); nextGate.set(it) }
 
-    private suspend fun awaitState(predicate: () -> Boolean) = withTimeout(5_000) {
-        while (!predicate()) delay(10)
+    private suspend fun awaitState(predicate: () -> Boolean) {
+        val ready = withTimeoutOrNull(5_000) {
+            while (!predicate()) delay(10)
+            true
+        }
+        if (ready != true) {
+            val current = model.state.value
+            throw AssertionError("UI did not settle: loading=${current.loading}, configured=${current.configured}, " +
+                "care=${current.careEnabled}, ready=${current.careReady}, child=${current.selectedChildBotId}, " +
+                "balance=${current.stickerBalance}, error=${current.error}; reads=${reads.get()}, " +
+                "completed=${completedReads.get()}, lastReadMs=${lastReadDuration.get()}, " +
+                "sinceReadStartMs=${SystemClock.elapsedRealtime() - readStartedAt.get()}, last=${lastProjection.get()}")
+        }
     }
 
     private suspend fun awaitReady() {

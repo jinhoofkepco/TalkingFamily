@@ -42,10 +42,11 @@ class AppRepository internal constructor(context: Context, private val clientFac
     val selfBotId: Long get() = prefs.getLong("ownBotId", 0)
     val room: FamilyChatRoom? get() = synchronized(dataLock) { store.familyChat.activeRoom() }
     val configured: Boolean get() = credentialsReady && (prefs.getLong("peerBotId", 0) > 0 || room?.members?.any { it.botId == selfBotId } == true)
-    val careRole: String? get() = room?.let { active ->
+    val careRole: String? get() = careRoleOf(room, selfBotId)
+    private fun careRoleOf(activeRoom: FamilyChatRoom?, ownId: Long): String? = activeRoom?.let { active ->
         if (active.members.none { it.relationship in FamilyCareValidation.parentRelationships } ||
             active.members.none { it.relationship in FamilyCareValidation.childRelationships }) return@let null
-        when (active.members.firstOrNull { it.botId == selfBotId }?.relationship) {
+        when (active.members.firstOrNull { it.botId == ownId }?.relationship) {
             "mother", "father" -> "guardian"
             "son", "daughter" -> "child"
             else -> null
@@ -75,26 +76,49 @@ class AppRepository internal constructor(context: Context, private val clientFac
     fun careSnapshot(childId: Long? = selectedCareChildId): FamilySnapshot? = synchronized(dataLock) {
         val active = room ?: return@synchronized null
         if (!careEnabled || childId == null) return@synchronized null
-        val state = store.familyCare.state(active.id, childId) ?: return@synchronized null
+        careSnapshotForRoom(active, childId)
+    }
+    private fun careSnapshotForRoom(active: FamilyChatRoom, childId: Long): FamilySnapshot? {
+        val state = store.familyCare.state(active.id, childId) ?: return null
         val member = active.members.firstOrNull { it.botId == childId }
         val snapshot = state.snapshot
-        snapshot.copy(events = snapshot.events.map {
+        return snapshot.copy(events = snapshot.events.map {
             it.copy(roomId = active.id, senderId = if (it.sender == "child") childId else null,
                 senderName = if (it.sender == "child") member?.displayName else "부모")
         }, rewards = snapshot.rewards.map { it.copy(version = state.rewardVersion(it.id)) })
     }
     /** Call from an IO dispatcher. All related screen fields come from one consistent local read. */
     fun readUiSnapshot(): RepositoryUiSnapshot = synchronized(dataLock) {
-        val selected = selectedCareChildId
-        val care = careSnapshot(selected)
+        // Do not fan out through public getters here: each credentialsReady read decrypts
+        // Android Keystore data. One projection needs one credential read and one room read.
+        val demo = demoMode
+        val token = if (!demo && prefs.getString("transport", "") == "telegram_direct") vault.get() else ""
+        val ready = token.isNotBlank()
+        val active = store.familyChat.activeRoom()
+        val ownId = selfBotId
+        val privateRole = role
+        val peerId = prefs.getLong("peerBotId", 0)
+        val activeRole = careRoleOf(active, ownId)
+        val useCare = ready && activeRole != null
+        val children = if (useCare) active!!.members.filter {
+            it.relationship in FamilyCareValidation.childRelationships
+        } else emptyList()
+        val selected = if (!useCare) null else if (activeRole == "child") ownId else {
+            val saved = prefs.getLong("careChild_${active!!.id}", 0)
+            children.firstOrNull { it.botId == saved }?.botId ?: children.firstOrNull()?.botId
+        }
+        val care = selected?.let { careSnapshotForRoom(active!!, it) }
+        val engine = if (useCare) FamilyCareEngine(clientFactory(token), store.familyCare, active!!, ownId, lock = dataLock) else null
         RepositoryUiSnapshot(
-            snapshot = if (careEnabled) care ?: FamilySnapshot.parse(TelegramLedger.emptyState()) else cached(),
+            snapshot = if (useCare) care ?: FamilySnapshot.parse(TelegramLedger.emptyState()) else cached(),
             careSnapshot = care,
-            role = effectiveRole, privateRole = role, configured = configured,
-            demoMode = demoMode, paired = paired, room = room, selfBotId = selfBotId,
+            role = if (useCare) activeRole!! else privateRole, privateRole = privateRole,
+            configured = ready && (peerId > 0 || active?.members?.any { it.botId == ownId } == true),
+            demoMode = demo, paired = ready && peerId > 0, room = active, selfBotId = ownId,
             botUsername = botUsername, peerBotUsername = peerBotUsername,
-            careEnabled = careEnabled, careChildren = careChildren, selectedChildBotId = selected,
-            carePending = carePending(selected), careStatus = careStatus(selected),
+            careEnabled = useCare, careChildren = children, selectedChildBotId = selected,
+            carePending = selected?.let { engine!!.hasPending(it) } ?: false,
+            careStatus = selected?.let { engine!!.status(it) },
             sharingEnabled = sharingEnabled, trackingStatus = trackingStatus, connectionError = connectionError,
         )
     }
@@ -107,11 +131,14 @@ class AppRepository internal constructor(context: Context, private val clientFac
     }
     suspend fun prepareCare() = withContext(Dispatchers.IO) { synchronized(dataLock) { prepareCareLocked() } }
     private fun prepareCareLocked() {
-        if (!careEnabled) return
-        val active = room!!
-        val engine = careEngine(active)
+        if (demoMode || prefs.getString("transport", "") != "telegram_direct") return
+        val token = vault.get().takeIf { it.isNotBlank() } ?: return
+        val active = store.familyChat.activeRoom() ?: return
+        val activeRole = careRoleOf(active, selfBotId) ?: return
+        val children = active.members.filter { it.relationship in FamilyCareValidation.childRelationships }
+        val engine = careEngine(active, clientFactory(token))
         store.transaction {
-            if (careRole == "child") {
+            if (activeRole == "child") {
                 val existing = store.familyCare.stateMetadata(active.id, selfBotId)
                 if (existing == null) {
                     val previousRoom = prefs.getString("lastCareRoom_$selfBotId", null)
@@ -124,9 +151,9 @@ class AppRepository internal constructor(context: Context, private val clientFac
             }
             else {
                 val oldChild = prefs.getLong("peerBotId", 0)
-                if (role == "guardian" && careChildren.any { it.botId == oldChild }) store.familyCare.importLegacyMovement(active.id, oldChild)
+                if (role == "guardian" && children.any { it.botId == oldChild }) store.familyCare.importLegacyMovement(active.id, oldChild)
                 val now = System.currentTimeMillis()
-                careChildren.forEach { child ->
+                children.forEach { child ->
                     val key = "careSync_${active.id}_${child.botId}"
                     val previous = prefs.getLong(key, 0)
                     val interval = if (store.familyCare.stateMetadata(active.id, child.botId) == null) 60_000 else 300_000

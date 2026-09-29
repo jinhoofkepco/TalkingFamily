@@ -16,6 +16,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.After
@@ -187,8 +188,17 @@ class HomewayViewModelChatRefreshTest {
         }
     }
 
-    private suspend fun awaitState(predicate: () -> Boolean) = withTimeout(5_000) {
-        while (!predicate()) delay(10)
+    private suspend fun awaitState(predicate: () -> Boolean) {
+        val ready = withTimeoutOrNull(5_000) {
+            while (!predicate()) delay(10)
+            true
+        }
+        if (ready != true) {
+            val current = model.state.value
+            throw AssertionError("UI did not settle: loading=${current.loading}, configured=${current.configured}, " +
+                "roomMatches=${current.room?.id == room.id}, roomLoading=${current.roomLoading}, " +
+                "messageCount=${current.roomEvents.size}, sound=${current.messageNotificationSoundEnabled}, error=${current.error}")
+        }
     }
 
     private fun message(text: String) = FamilyChatMessage(UUID.randomUUID().toString(), room.id, 202, text,
@@ -226,8 +236,14 @@ class HomewayViewModelChatRefreshTest {
                     }
                 }
                 "sendMessage" -> {
-                    val type = JSONObject(body.getString("text")).getString("type")
-                    assertTrue(type in setOf("hello", "chat", "chat_ack"))
+                    val envelope = JSONObject(body.getString("text"))
+                    val type = envelope.getString("type")
+                    assertTrue(type in setOf("hello", "chat", "chat_ack", "capabilities"))
+                    if (type == "capabilities") {
+                        assertEquals(5, envelope.getInt("v"))
+                        assertEquals(1, envelope.getInt("batch"))
+                        assertTrue(envelope.getLong("nonce") > 0)
+                    }
                     if (type == "hello") assertEquals("@refresh_peer_bot", body.getString("chat_id"))
                     else assertEquals(202L, body.getLong("chat_id"))
                     if (type == "chat") sentChats.incrementAndGet()
