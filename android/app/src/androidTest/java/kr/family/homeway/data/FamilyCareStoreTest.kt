@@ -165,11 +165,12 @@ class FamilyCareStoreTest {
         val identities = JSONObject().put(oldAward.id, TelegramLedger.eventDigest(oldAward))
             .put(latest.id, TelegramLedger.eventDigest(latest))
         repeat(2000) { identities.put(id(), "a".repeat(64)) }
-        val oldState = state(roomId, revision = 2077).let { it.copy(state = TelegramLedger.emptyState()
+        val oldProjection = TelegramLedger.emptyState()
             .put("stickerBalance", 37).put("sharingEnabled", true).put("appliedEventIds", identities)
             .put("events", JSONArray(listOf(latest.json(), oldAward.json())))
             .put("latestLocation", latest.json())
-            .put("rewards", JSONArray().put(JSONObject().put("id", id()).put("name", "가족 약속").put("cost", 3))) }
+            .put("rewards", JSONArray().put(JSONObject().put("id", id()).put("name", "가족 약속").put("cost", 3)))
+        val oldState = state(roomId, revision = 2077).copy(state = oldProjection)
         val legacy = TelegramLedger.apply(TelegramLedger.emptyState(), oldAward)
         db.cache(legacy)
         db.setMeta("offset", 74321)
