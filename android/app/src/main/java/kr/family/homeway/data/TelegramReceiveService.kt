@@ -31,11 +31,12 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.io.FileDescriptor
 import java.io.PrintWriter
 
-/** User-visible remote messaging session. No location access, boot receiver, or silent restart. */
+/** User-visible remote messaging session, recoverable after system process death while opted in. */
 class TelegramReceiveService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var polling: Job? = null
-    @Volatile private var healthRepository: AppRepository? = null
+    @Volatile private var backoffDeadline = 0L
+    @Volatile private var nextPollDeadline = 0L
     @Volatile private var lastExchangeAttemptAt: Long? = null
     @Volatile private var lastSuccessfulCycleAt: Long? = null
     @Volatile private var failedCycles = 0L
@@ -44,7 +45,8 @@ class TelegramReceiveService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) { stop(this); return START_NOT_STICKY }
-        if (!AppRepository(this).configured) { stopSelf(); return START_NOT_STICKY }
+        // A system sticky restart has a null intent. Never reverse the user's saved OFF choice.
+        if (!wantsReceiving(this)) { stopSelf(); return START_NOT_STICKY }
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(CHANNEL, "텔레그램 가족 소식 수신", NotificationManager.IMPORTANCE_LOW).apply {
                 setSound(null, null)
@@ -59,19 +61,26 @@ class TelegramReceiveService : Service() {
             .setContentTitle("가족 소식 수신 중").setContentText("텔레그램으로 대화와 칭찬을 주고받고 있어요.")
             .setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true).setSilent(true)
             .addAction(0, "수신 중지", stopIntent).build()
-        ServiceCompat.startForeground(this, NOTIFICATION, notification,
-            if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING else 0)
+        try {
+            ServiceCompat.startForeground(this, NOTIFICATION, notification,
+                if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING else 0)
+        } catch (_: RuntimeException) {
+            AppDiagnostics.record(this, "telegram.receiver", "가족 소식 수신 재개 대기 · 앱을 열어 다시 시작해 주세요.")
+            stopSelf()
+            return START_NOT_STICKY
+        }
         state.value = ReceiveState(true)
         if (polling?.isActive != true) polling = scope.launch {
-            val repo = AppRepository(this@TelegramReceiveService)
-            healthRepository = repo
             try {
-                while (isActive && repo.configured) {
+                val repo = AppRepository(this@TelegramReceiveService)
+                // Account/database checks and any upgrade work stay off the service's main thread.
+                while (isActive && wantsReceiving(this@TelegramReceiveService) && repo.configured) {
                     waitReason = "checking_schedule"
                     // Capture before inspecting the queue: a send during the exchange or subsequent
                     // pause must remain visible, even if the HTTP poll already returned.
                     val revision = TelegramPollWakeup.revision
                     val retryDelay = repo.synchronizationRetryDelayMillis()
+                    backoffDeadline = SystemClock.elapsedRealtime() + retryDelay
                     if (retryDelay > 0) {
                         waitReason = "telegram_backoff"
                         awaitWake(revision, retryDelay)
@@ -87,7 +96,9 @@ class TelegramReceiveService : Service() {
                         // Long polling already waited. Only fast returns need pacing, including
                         // empty replies and a repository exchange skipped by a racing backoff.
                         val receiveDelay = repo.receiveDelayMillis()
-                        val outgoingRetry = if (repo.hasPending()) OUTBOX_RECHECK_MILLIS else Long.MAX_VALUE
+                        nextPollDeadline = SystemClock.elapsedRealtime() + receiveDelay
+                        val outgoingRetry = minOf(repo.outgoingRecheckDelayMillis() ?: Long.MAX_VALUE,
+                            if (repo.hasPending()) OUTBOX_RECHECK_MILLIS else Long.MAX_VALUE)
                         waitMillis = if (receiveDelay > 0) minOf(receiveDelay, outgoingRetry)
                             else (TelegramChatReceiveSchedule.MIN_CYCLE_MILLIS -
                                 (SystemClock.elapsedRealtime() - startedAt)).coerceAtLeast(0)
@@ -107,17 +118,24 @@ class TelegramReceiveService : Service() {
                         AppDiagnostics.record(this@TelegramReceiveService, "telegram.receiver", "인터넷과 봇 설정을 확인해 주세요. 연결을 다시 시도하고 있어요.")
                         state.value = ReceiveState(true, "인터넷과 봇 설정을 확인해 주세요. 연결을 다시 시도하고 있어요.")
                         val errorBackoff = repo.synchronizationRetryDelayMillis()
+                        backoffDeadline = SystemClock.elapsedRealtime() + errorBackoff
                         waitMillis = errorBackoff.takeIf { it > 0 } ?: TelegramChatReceiveSchedule.ERROR_RETRY_MILLIS
                         waitReason = if (errorBackoff > 0) "telegram_backoff" else "cycle_retry"
                     }
                     awaitWake(revision, waitMillis)
                 }
                 stopSelf()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // A database/account initialization failure must not crash the location service too.
+                AppDiagnostics.record(this@TelegramReceiveService, "telegram.receiver", "수신 기록을 준비하지 못했어요. 앱을 열어 다시 시도해 주세요.")
+                stopSelf()
             } finally {
                 waitReason = "stopped"
             }
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
     private suspend fun awaitWake(revision: Long, waitMillis: Long) {
         if (waitMillis <= 0) return
@@ -130,15 +148,14 @@ class TelegramReceiveService : Service() {
         // session does not wait for this stopped service's remaining HTTP timeout.
         TelegramPollWakeup.signal()
         state.value = ReceiveState(false)
-        healthRepository = null
         super.onDestroy()
     }
     override fun dump(fd: FileDescriptor, writer: PrintWriter, args: Array<out String>?) {
         val now = SystemClock.elapsedRealtime()
         fun age(at: Long?): String = at?.let { (now - it).coerceAtLeast(0).toString() } ?: "none"
-        val repo = healthRepository
-        val backoff = runCatching { repo?.synchronizationRetryDelayMillis()?.toString() }.getOrNull() ?: "unavailable"
-        val nextPoll = runCatching { repo?.receiveDelayMillis()?.toString() }.getOrNull() ?: "unavailable"
+        // Diagnostics must never wait on the repository lock from the service's main thread.
+        val backoff = (backoffDeadline - now).coerceAtLeast(0)
+        val nextPoll = (nextPollDeadline - now).coerceAtLeast(0)
         writer.println("receiverRunning=${state.value.running} pollingJobActive=${polling?.isActive == true}")
         writer.println("lastExchangeAttemptAgeMillis=${age(lastExchangeAttemptAt)} lastSuccessfulCycleAgeMillis=${age(lastSuccessfulCycleAt)}")
         writer.println("waitReason=$waitReason backoffRemainingMillis=$backoff nextPollDelayMillis=$nextPoll")

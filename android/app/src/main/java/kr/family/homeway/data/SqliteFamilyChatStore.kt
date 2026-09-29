@@ -81,6 +81,29 @@ class SqliteFamilyChatStore internal constructor(private val owner: LocalStore) 
             "WHERE d.room_id=? AND d.completed=0 ORDER BY m.rowid,d.peer_id", arrayOf(roomId)
     ).use { rows -> buildList { while (rows.moveToNext()) add(FamilyChatDelivery(roomId, rows.getString(0), rows.getLong(1), rows.getLong(2))) } }
 
+    override fun pendingChatDeliveries(roomId: String, peerId: Long, limit: Int): List<FamilyChatDelivery> {
+        require(limit in 1..1000)
+        return owner.readableDatabase.rawQuery("SELECT d.message_id,d.sent_at FROM family_chat_deliveries d " +
+            "JOIN family_chat_messages m ON m.room_id=d.room_id AND m.id=d.message_id " +
+            "WHERE d.room_id=? AND d.peer_id=? AND d.completed=0 ORDER BY m.rowid LIMIT $limit", arrayOf(roomId, peerId.toString())
+        ).use { rows -> buildList { while (rows.moveToNext()) add(FamilyChatDelivery(roomId, rows.getString(0), peerId, rows.getLong(1))) } }
+    }
+
+    override fun pendingChatDelivery(roomId: String, messageId: String, peerId: Long): FamilyChatDelivery? = owner.readableDatabase.rawQuery(
+        "SELECT sent_at FROM family_chat_deliveries WHERE room_id=? AND message_id=? AND peer_id=? AND completed=0",
+        arrayOf(roomId, messageId, peerId.toString())
+    ).use { if (it.moveToFirst()) FamilyChatDelivery(roomId, messageId, peerId, it.getLong(0)) else null }
+
+    fun hasPending(roomId: String): Boolean = owner.readableDatabase.rawQuery(
+        "SELECT 1 FROM family_chat_deliveries WHERE room_id=? AND completed=0 UNION ALL " +
+            "SELECT 1 FROM family_chat_receipts WHERE room_id=? LIMIT 1", arrayOf(roomId, roomId)
+    ).use { it.moveToFirst() }
+
+    fun pendingPeers(roomId: String): List<Long> = owner.readableDatabase.rawQuery(
+        "SELECT peer_id FROM family_chat_deliveries WHERE room_id=? AND completed=0 UNION " +
+            "SELECT peer_id FROM family_chat_receipts WHERE room_id=?", arrayOf(roomId, roomId)
+    ).use { rows -> buildList { while (rows.moveToNext()) add(rows.getLong(0)) } }
+
     override fun markChatSent(roomId: String, messageId: String, peerId: Long, sentAt: Long) {
         require(sentAt > 0)
         owner.writableDatabase.update("family_chat_deliveries", ContentValues().apply { put("sent_at", sentAt) },
@@ -107,6 +130,15 @@ class SqliteFamilyChatStore internal constructor(private val owner: LocalStore) 
     override fun chatReceipts(roomId: String): List<FamilyChatReceipt> = owner.readableDatabase.rawQuery(
         "SELECT message_id,peer_id,digest FROM family_chat_receipts WHERE room_id=? ORDER BY rowid", arrayOf(roomId)
     ).use { rows -> buildList { while (rows.moveToNext()) add(FamilyChatReceipt(roomId, rows.getString(0), rows.getLong(1), rows.getString(2))) } }
+
+    override fun firstChatReceipt(roomId: String, peerId: Long): FamilyChatReceipt? = chatReceipts(roomId, peerId, 1).firstOrNull()
+
+    override fun chatReceipts(roomId: String, peerId: Long, limit: Int): List<FamilyChatReceipt> {
+        require(limit in 1..1000)
+        return owner.readableDatabase.rawQuery("SELECT message_id,digest FROM family_chat_receipts WHERE room_id=? AND peer_id=? ORDER BY rowid LIMIT $limit",
+            arrayOf(roomId, peerId.toString())
+        ).use { rows -> buildList { while (rows.moveToNext()) add(FamilyChatReceipt(roomId, rows.getString(0), peerId, rows.getString(1))) } }
+    }
 
     override fun removeChatReceipt(receipt: FamilyChatReceipt) {
         owner.writableDatabase.delete("family_chat_receipts", "room_id=? AND message_id=? AND peer_id=? AND digest=?",

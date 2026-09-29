@@ -157,7 +157,7 @@ class HomewayViewModelChatRefreshTest {
         assertTrue("Only elapsed time may change the receive deadline", after in 1..before)
     }
 
-    @Test fun notificationSoundDefaultsOffAndBothChoicesSurviveViewModelRecreation() {
+    @Test fun notificationSoundDefaultsOffAndBothChoicesSurviveViewModelRecreation() = runBlocking {
         assertFalse(model.state.value.messageNotificationSoundEnabled)
         assertFalse(FamilyNotifications.soundEnabled(context))
 
@@ -165,12 +165,14 @@ class HomewayViewModelChatRefreshTest {
         assertTrue(model.state.value.messageNotificationSoundEnabled)
         assertTrue(notificationPrefs.getBoolean("sound_enabled", false))
         recreateModel()
+        awaitState { !model.state.value.loading && model.state.value.room?.id == room.id }
         assertTrue("A new ViewModel must reload the saved ON choice", model.state.value.messageNotificationSoundEnabled)
 
         instrumentation.runOnMainSync { model.setMessageNotificationSoundEnabled(false) }
         assertFalse(model.state.value.messageNotificationSoundEnabled)
         assertFalse(notificationPrefs.getBoolean("sound_enabled", true))
         recreateModel()
+        awaitState { !model.state.value.loading && model.state.value.room?.id == room.id }
         assertFalse("A new ViewModel must reload the saved OFF choice", model.state.value.messageNotificationSoundEnabled)
         assertEquals("Changing notification sound must not poll Telegram", 0, fake.pollRequests.get())
         assertEquals("Changing notification sound must not send a message", 0, fake.sentChats.get())

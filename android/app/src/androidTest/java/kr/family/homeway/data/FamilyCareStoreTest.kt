@@ -82,7 +82,7 @@ class FamilyCareStoreTest {
             db.version = 4
         }
         val db = store()
-        assertEquals(6, db.readableDatabase.version)
+        assertEquals(7, db.readableDatabase.version)
         assertEquals(oldState.toString(), db.cached()!!.toString())
         assertEquals(9812L, db.meta("offset"))
         assertEquals(119L, db.meta("sentAt"))
@@ -124,7 +124,7 @@ class FamilyCareStoreTest {
             version = 5
         }
         val upgraded = reopen()
-        assertEquals(6, upgraded.readableDatabase.version)
+        assertEquals(7, upgraded.readableDatabase.version)
         assertEquals(12345L, upgraded.meta("offset"))
         assertEquals(source.epoch, upgraded.familyCare.state(roomId, 103)!!.epoch)
         assertEquals(999L, upgraded.familyCare.retryAfter(roomId, 102))
@@ -155,6 +155,190 @@ class FamilyCareStoreTest {
         val afterRetry = reopen().familyCare.pendingPackets(roomId).first()
         assertEquals(2000L, afterRetry.sentAt)
         assertFalse(afterRetry.sendConfirmed)
+    }
+
+    @Test fun populatedV6ReplayMigrationIsLazyAndRetainsFinancialStateHistoryQueuesAndCursor() {
+        val db = store()
+        val roomId = id()
+        val oldAward = FamilyEvent(id(), "sticker_award", JSONObject().put("count", 1).put("reason", "이전 칭찬"), "guardian", timestamp, "relayed")
+        val latest = location()
+        val identities = JSONObject().put(oldAward.id, TelegramLedger.eventDigest(oldAward))
+            .put(latest.id, TelegramLedger.eventDigest(latest))
+        repeat(2000) { identities.put(id(), "a".repeat(64)) }
+        val oldState = state(roomId, revision = 2077).let { it.copy(state = TelegramLedger.emptyState()
+            .put("stickerBalance", 37).put("sharingEnabled", true).put("appliedEventIds", identities)
+            .put("events", JSONArray(listOf(latest.json(), oldAward.json())))
+            .put("latestLocation", latest.json())
+            .put("rewards", JSONArray().put(JSONObject().put("id", id()).put("name", "가족 약속").put("cost", 3))) }
+        val legacy = TelegramLedger.apply(TelegramLedger.emptyState(), oldAward)
+        db.cache(legacy)
+        db.setMeta("offset", 74321)
+        db.familyCare.archiveEvent(roomId, 103, latest)
+        val pending = packet(roomId)
+        db.familyCare.queuePacket(pending)
+        db.writableDatabase.apply {
+            execSQL("DROP TABLE family_care_states")
+            execSQL("CREATE TABLE family_care_states (room_id TEXT NOT NULL,child_id INTEGER NOT NULL,state TEXT NOT NULL,PRIMARY KEY(room_id,child_id))")
+            execSQL("INSERT INTO family_care_states(room_id,child_id,state) VALUES(?,?,?)", arrayOf(roomId, 103, oldState.json().toString()))
+            execSQL("DROP TABLE family_care_event_ids")
+            execSQL("ALTER TABLE family_care_packets RENAME TO care_packets_v7_fixture")
+            execSQL("CREATE TABLE family_care_packets (room_id TEXT NOT NULL,id TEXT NOT NULL,child_id INTEGER NOT NULL,text TEXT NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(room_id,id))")
+            execSQL("INSERT INTO family_care_packets(room_id,id,child_id,text,digest) SELECT room_id,id,child_id,text,digest FROM care_packets_v7_fixture")
+            execSQL("DROP TABLE care_packets_v7_fixture")
+            version = 6
+        }
+        val upgraded = reopen()
+        assertEquals(7, upgraded.readableDatabase.version)
+        // Opening a database must not parse a large old care state on a service's main thread.
+        upgraded.readableDatabase.rawQuery("SELECT state,epoch FROM family_care_states", null).use {
+            assertTrue(it.moveToFirst()); assertTrue(it.isNull(1)); assertEquals(oldState.json().toString(), it.getString(0))
+        }
+        val migrated = checkNotNull(upgraded.familyCare.state(roomId, 103))
+        assertEquals(0, migrated.state.getJSONObject("appliedEventIds").length())
+        assertEquals(2002, identities.length()) // Caller-owned state was not mutated.
+        assertEquals(oldState.epoch, migrated.epoch)
+        assertEquals(2077L, migrated.revision)
+        assertEquals(37, migrated.snapshot.stickerBalance)
+        assertTrue(migrated.snapshot.sharingEnabled)
+        assertEquals("가족 약속", migrated.snapshot.rewards.single().name)
+        assertEquals(setOf(latest.id, oldAward.id), migrated.snapshot.events.map { it.id }.toSet())
+        assertEquals(TelegramLedger.eventDigest(oldAward), upgraded.familyCare.eventDigest(roomId, 103, oldAward.id))
+        assertEquals(TelegramLedger.eventDigest(latest), upgraded.familyCare.eventDigest(roomId, 103, latest.id))
+        assertNull(upgraded.familyCare.eventDigest(roomId, 104, oldAward.id))
+        upgraded.readableDatabase.rawQuery("SELECT COUNT(*) FROM family_care_event_ids WHERE room_id=?", arrayOf(roomId)).use {
+            it.moveToFirst(); assertEquals(2002, it.getInt(0))
+        }
+        assertEquals(74321L, upgraded.meta("offset"))
+        assertEquals(legacy.toString(), upgraded.cached()!!.toString())
+        assertEquals(listOf(pending.packetId), upgraded.familyCare.pendingPackets(roomId).map { it.packetId })
+        assertEquals(pending.text, upgraded.familyCare.pendingPacket(roomId, pending.packetId, 101)?.text)
+        assertEquals(listOf(latest.id), upgraded.familyCare.movementHistory(roomId, 103, zone = utc).events.map { it.id })
+        val engine = FamilyCareEngine(TelegramClient("103:${"synthetic_credentials_".repeat(2)}"), upgraded.familyCare,
+            room().copy(id = roomId), 103)
+        assertTrue(upgraded.transaction { engine.processLegacy(oldAward, 101) })
+        assertEquals("An archived financial identity must never award again", 37,
+            upgraded.familyCare.state(roomId, 103)!!.snapshot.stickerBalance)
+        assertEquals(2077L, upgraded.familyCare.stateMetadata(roomId, 103)!!.revision)
+        val resumed = reopen().familyCare
+        assertEquals(FamilyCareStateMetadata(oldState.epoch, 2077, true), resumed.stateMetadata(roomId, 103))
+        assertEquals(TelegramLedger.eventDigest(oldAward), resumed.eventDigest(roomId, 103, oldAward.id))
+        assertThrows(IllegalArgumentException::class.java) { resumed.recordEventDigest(roomId, 103, oldAward.id, "b".repeat(64)) }
+        resumed.markSent(roomId, pending.packetId, 101, 100)
+        resumed.acknowledge(roomId, pending.packetId, 101, pending.digest)
+        resumed.queuePacket(pending)
+        assertNull(resumed.pendingPacket(roomId, pending.packetId, 101))
+        assertThrows(IllegalArgumentException::class.java) { resumed.queuePacket(pending.copy(text = "changed old payload")) }
+    }
+
+    @Test fun compactStateAndReplayIdentityCommitTogetherAndConflictingReplayCannotChangeBalance() {
+        val db = store()
+        val initial = state(id())
+        val event = FamilyEvent(id(), "sticker_award", JSONObject().put("count", 1).put("reason", "정리"), "guardian", timestamp, "relayed")
+        db.familyCare.saveState(initial)
+        val next = initial.copy(revision = 2, state = TelegramLedger.apply(initial.state, event))
+        assertThrows(IllegalStateException::class.java) { db.transaction {
+            db.familyCare.saveState(next); db.setMeta("offset", 9); error("rollback")
+        } }
+        assertNull(db.familyCare.eventDigest(initial.roomId, 103, event.id))
+        assertEquals(0, db.familyCare.state(initial.roomId, 103)!!.snapshot.stickerBalance)
+        assertEquals(0L, db.meta("offset"))
+        db.familyCare.saveState(next)
+        val retained = reopen().familyCare
+        assertEquals(1, retained.state(initial.roomId, 103)!!.snapshot.stickerBalance)
+        assertEquals(0, retained.state(initial.roomId, 103)!!.state.getJSONObject("appliedEventIds").length())
+        assertEquals(TelegramLedger.eventDigest(event), retained.eventDigest(initial.roomId, 103, event.id))
+        val engine = FamilyCareEngine(TelegramClient("103:${"synthetic_credentials_".repeat(2)}"), retained,
+            room().copy(id = initial.roomId), 103)
+        assertTrue(store().transaction { engine.processLegacy(event, 101) })
+        assertEquals(1, retained.state(initial.roomId, 103)!!.snapshot.stickerBalance)
+        val conflicting = next.copy(revision = 3, state = JSONObject(next.state.toString()).put("stickerBalance", 99)
+            .put("appliedEventIds", JSONObject().put(event.id, "f".repeat(64))))
+        assertThrows(IllegalArgumentException::class.java) { retained.saveState(conflicting) }
+        assertEquals(2L, retained.stateMetadata(initial.roomId, 103)!!.revision)
+        assertEquals(1, retained.state(initial.roomId, 103)!!.snapshot.stickerBalance)
+    }
+
+    @Test fun movingAuthorityToAnotherRoomCopiesArchivedReplayIdsWithoutLosingEitherBoard() {
+        val db = store()
+        val care = db.familyCare
+        val oldAward = FamilyEvent(id(), "sticker_award", JSONObject().put("count", 1).put("reason", "오래된 칭찬"),
+            "guardian", timestamp, "relayed")
+        val oldIds = JSONObject().put(oldAward.id, TelegramLedger.eventDigest(oldAward))
+        repeat(1500) { oldIds.put(id(), "a".repeat(64)) }
+        val source = state(id(), revision = 2000).copy(state = TelegramLedger.emptyState()
+            .put("stickerBalance", 37).put("appliedEventIds", oldIds))
+        // A source left untouched since v6 still has its replay map inside JSON.
+        db.writableDatabase.execSQL("INSERT INTO family_care_states(room_id,child_id,state) VALUES(?,?,?)",
+            arrayOf(source.roomId, source.childId, source.json().toString()))
+        val targetRoom = room()
+        db.transaction {
+            care.copyEventDigests(source.roomId, targetRoom.id, 103)
+            val migrated = checkNotNull(care.state(source.roomId, 103))
+            care.saveState(migrated.copy(roomId = targetRoom.id, epoch = id(), revision = 0))
+        }
+        val engine = FamilyCareEngine(TelegramClient("103:${"synthetic_credentials_".repeat(2)}"), care, targetRoom, 103)
+        assertTrue(db.transaction { engine.processLegacy(oldAward, 101) })
+        assertEquals(37, care.state(targetRoom.id, 103)!!.snapshot.stickerBalance)
+        assertEquals(0L, care.stateMetadata(targetRoom.id, 103)!!.revision)
+        assertEquals(37, care.state(source.roomId, 103)!!.snapshot.stickerBalance)
+        assertEquals(TelegramLedger.eventDigest(oldAward), care.eventDigest(targetRoom.id, 103, oldAward.id))
+        assertNull(care.eventDigest(targetRoom.id, 104, oldAward.id))
+        db.readableDatabase.rawQuery("SELECT COUNT(*) FROM family_care_event_ids WHERE room_id=? AND child_id=103",
+            arrayOf(targetRoom.id)).use { it.moveToFirst(); assertEquals(1501, it.getInt(0)) }
+
+        val conflictRoom = id()
+        val ownId = id()
+        care.recordEventDigest(conflictRoom, 103, ownId, "b".repeat(64))
+        care.recordEventDigest(conflictRoom, 103, oldAward.id, "c".repeat(64))
+        assertThrows(IllegalArgumentException::class.java) { care.copyEventDigests(source.roomId, conflictRoom, 103) }
+        assertEquals("b".repeat(64), care.eventDigest(conflictRoom, 103, ownId))
+        assertEquals("c".repeat(64), care.eventDigest(conflictRoom, 103, oldAward.id))
+        assertEquals(TelegramLedger.eventDigest(oldAward), care.eventDigest(source.roomId, 103, oldAward.id))
+        db.readableDatabase.rawQuery("SELECT COUNT(*) FROM family_care_event_ids WHERE room_id=?", arrayOf(conflictRoom)).use {
+            it.moveToFirst(); assertEquals("A conflict must copy no partial identity set", 2, it.getInt(0))
+        }
+        val rolledBackRoom = id()
+        assertThrows(IllegalStateException::class.java) { db.transaction {
+            care.copyEventDigests(source.roomId, rolledBackRoom, 103); error("authority save failed")
+        } }
+        assertNull(reopen().familyCare.eventDigest(rolledBackRoom, 103, oldAward.id))
+    }
+
+    @Test fun exactAndLimitedQueriesKeepPeerFifoAndCompletedPayloadsRetainImmutableTombstones() {
+        val db = store()
+        val roomId = id()
+        val first = packet(roomId, text = "first large payload")
+        val others = List(50) { packet(roomId, text = "queued $it") }
+        val care = db.familyCare
+        listOf(first, first.copy(peerId = 102)).forEach(care::queuePacket)
+        others.forEach(care::queuePacket)
+        assertEquals(listOf(first.packetId, others.first().packetId), care.pendingPackets(roomId, 101, 2).map { it.packetId })
+        assertEquals(first.packetId, care.pendingPacket(roomId, first.packetId, 102)?.packetId)
+        assertNull(care.pendingPacket(roomId, first.packetId, 104))
+        assertEquals(setOf(101L, 102L), care.pendingPeers(roomId).toSet())
+        assertTrue(care.hasPendingPackets(roomId))
+        care.markSent(roomId, first.packetId, 101, 100)
+        care.acknowledge(roomId, first.packetId, 101, first.digest)
+        assertNull(care.pendingPacket(roomId, first.packetId, 101))
+        assertEquals(first.text, care.pendingPacket(roomId, first.packetId, 102)?.text)
+        care.markSent(roomId, first.packetId, 102, 101)
+        care.acknowledge(roomId, first.packetId, 102, first.digest)
+        db.readableDatabase.rawQuery("SELECT text,payload_hash,digest FROM family_care_packets WHERE room_id=? AND id=?",
+            arrayOf(roomId, first.packetId)).use {
+            assertTrue(it.moveToFirst()); assertEquals("", it.getString(0))
+            assertEquals(FamilyChatValidation.digest(first.text), it.getString(1)); assertEquals(first.digest, it.getString(2))
+        }
+        care.queuePacket(first)
+        assertNull(care.pendingPacket(roomId, first.packetId, 101))
+        assertThrows(IllegalArgumentException::class.java) { care.queuePacket(first.copy(text = "changed but reused digest")) }
+        // An explicitly added recipient restores only the original verified payload.
+        care.queuePacket(first.copy(peerId = 104))
+        assertEquals(first.text, care.pendingPacket(roomId, first.packetId, 104)?.text)
+        val receipts = List(4) { FamilyCareReceipt(roomId, id(), 103, 101, "c".repeat(64)) }
+        receipts.forEach(care::queueReceipt)
+        care.queueReceipt(FamilyCareReceipt(roomId, id(), 103, 102, "d".repeat(64)))
+        assertEquals(receipts.take(2), care.receipts(roomId, 101, 2))
+        assertEquals(receipts.first(), care.firstReceipt(roomId, 101))
     }
 
     @Test fun authoritativeStatesAndParentSnapshotsAreSeparateAndRejectRollbackEpochOrRoleReplacement() {

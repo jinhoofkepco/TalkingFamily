@@ -197,6 +197,8 @@ internal object TelegramLedger {
         return value
     }
 
+    internal fun eventDigest(event: FamilyEvent): String = digest(validate(event))
+
     private fun digest(event: FamilyEvent): String {
         // Payloads contain only validated primitives; sorting keys makes JSON key order irrelevant.
         val parts = JSONArray().put(event.id).put(event.kind).put(event.sender).put(event.createdAt)

@@ -55,7 +55,7 @@ class MovementHistoryStoreTest {
         assertEquals(listOf(retained.id), store.receipts())
         assertEquals(listOf(queued.id), store.pending().map { it.id })
         assertEquals(cached.toString(), store.cached()!!.toString())
-        assertEquals(6, store.readableDatabase.version)
+        assertEquals(7, store.readableDatabase.version)
     }
 
     @Test fun timelineTrimmingRetainsArchiveAndDeliveryUpdatesDeduplicateWithoutDowngrading() {

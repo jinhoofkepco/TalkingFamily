@@ -76,6 +76,7 @@ class TelegramClientTest {
         val error = assertThrows(TelegramException::class.java) { client.send("@ParentBot", "hello") }
         assertEquals(429, error.errorCode)
         assertEquals(67, error.retryAfterSeconds)
+        assertEquals(TelegramOperation.SEND, error.operation)
         assertEquals(1, calls)
         assertFalse(error.toString().contains(token))
         assertNull(error.cause)
@@ -87,8 +88,19 @@ class TelegramClientTest {
         }
         val error = assertThrows(TelegramException::class.java) { client.getMe() }
         assertEquals(0, error.errorCode)
+        assertEquals(TelegramOperation.IDENTITY, error.operation)
         assertFalse(error.stackTraceToString().contains(token))
         assertNull(error.cause)
+    }
+
+    @Test fun pollRateLimitRetainsSafeOperationAndBackoff() {
+        val client = TelegramClient(token) { _, _, _, _ ->
+            TelegramHttpResponse(429, """{"ok":false,"error_code":429,"description":"$token","parameters":{"retry_after":91}}""")
+        }
+        val error = assertThrows(TelegramException::class.java) { client.getUpdates(0) }
+        assertEquals(TelegramOperation.POLL, error.operation)
+        assertEquals(91, error.retryAfterSeconds)
+        assertFalse(error.stackTraceToString().contains(token))
     }
 
     @Test fun webhookInspectionDoesNotDeleteOrChangeIt() {

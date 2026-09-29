@@ -36,6 +36,7 @@ internal class TelegramExchange(
     private val onNewChatCommitted: () -> Unit = {},
     private val onPollCompleted: () -> Unit = {},
     private val pollAllowed: () -> Boolean = { true },
+    private val transport: FamilyTransport? = null,
 ) {
     private val legacyWindow = TelegramLegacyWindow(store, now)
     /** Caller serializes network runs; returns false when the persisted Telegram backoff is still active. */
@@ -67,14 +68,16 @@ internal class TelegramExchange(
                 checkActive()
                 val update = updates.getJSONObject(i)
                 val updateId = update.optLong("update_id", -1)
-                var received: FamilyEvent? = null
-                var chatReceived: FamilyChatMessage? = null
+                val received = mutableListOf<FamilyEvent>()
+                val chatReceived = mutableListOf<FamilyChatMessage>()
                 var committed = false
                 synchronized(lock) {
                     if (updateId >= store.meta("offset")) store.transaction {
-                        chatReceived = familyChat?.processUpdate(update)
-                        familyCare?.processUpdate(update)
-                        val packet = TelegramProtocol.receive(update, peerId, peerRole)
+                        val originals = if (transport == null) listOf(update) else transport.incoming(update).orEmpty()
+                        for (original in originals) {
+                        familyChat?.processUpdate(original)?.let(chatReceived::add)
+                        familyCare?.processUpdate(original)
+                        val packet = TelegramProtocol.receive(original, peerId, peerRole)
                         if (packet != null) when (packet.type) {
                             "event" -> {
                                 val event = packet.event!!
@@ -89,7 +92,7 @@ internal class TelegramExchange(
                                         // decision rejected by this child's authoritative family board.
                                         store.setMeta("ledgerConflict", 1)
                                     } else {
-                                        if (!TelegramLedger.contains(state, event.id)) received = event
+                                        if (!TelegramLedger.contains(state, event.id)) received.add(event)
                                         store.cache(next)
                                         store.queueReceipt(event.id)
                                     }
@@ -113,6 +116,7 @@ internal class TelegramExchange(
                                 }
                             }
                         }
+                        }
                         // Persist state, dedup identities, receipt and offset as one atomic write.
                         store.setMeta("offset", updateId + 1)
                         committed = true
@@ -121,9 +125,9 @@ internal class TelegramExchange(
                 if (committed) onCommitted()
                 // Notify at the commit boundary: a later notification or receipt failure must not
                 // erase the new-message deadline. Duplicates and non-chat packets do not reset it.
-                if (received?.kind == "chat" || chatReceived != null) onNewChatCommitted()
-                received?.let(onReceived)
-                chatReceived?.let { familyChat?.notifyReceived(it) }
+                if (received.any { it.kind == "chat" } || chatReceived.isNotEmpty()) onNewChatCommitted()
+                received.forEach(onReceived)
+                chatReceived.forEach { familyChat?.notifyReceived(it) }
             }
             if (!interrupted) onPollCompleted()
             flushAll()
@@ -152,6 +156,7 @@ internal class TelegramExchange(
     }
 
     private fun flushAll() {
+            transport?.flushControls(repliesOnly = true)
             familyChat?.flush()
             if (synchronized(lock) { store.meta("legacyRetryAfter") <= now() }) {
                 try { flushLegacy() }
@@ -164,6 +169,7 @@ internal class TelegramExchange(
                 }
             }
             familyCare?.flush()
+            transport?.flushControls(repliesOnly = false)
             if (synchronized(lock) { store.meta("ledgerConflict") != 0L }) throw TelegramSyncException()
     }
 
@@ -174,6 +180,12 @@ internal class TelegramExchange(
         val receipts = synchronized(lock) { store.receipts().take(TelegramLegacyWindow.MAX_RECEIPTS_PER_FLUSH) }
         for (id in receipts) {
             checkActive()
+            if (transport != null) {
+                if (!transport.sendLegacy(peerId, TelegramProtocol.envelope("ack").put("id", id).toString(), afterSend = {
+                    synchronized(lock) { store.transaction { store.removeReceipt(id) } }
+                })) return
+                continue
+            }
             client.send(peerId.toString(), TelegramProtocol.envelope("ack").put("id", id).toString())
             synchronized(lock) { store.transaction { store.removeReceipt(id) } }
         }
@@ -181,6 +193,15 @@ internal class TelegramExchange(
         repeat(TelegramLegacyWindow.MAX_SENDS_PER_FLUSH) {
             val pending = synchronized(lock) { legacyWindow.next(sentThisFlush) } ?: return
             checkActive()
+            if (transport != null) {
+                if (!transport.sendLegacy(peerId, TelegramProtocol.event(pending), beforeSend = {
+                    synchronized(lock) { store.transaction { legacyWindow.markAttempt(pending.id) } }
+                }, afterSend = {
+                    synchronized(lock) { store.transaction { legacyWindow.markConfirmed(pending.id) } }
+                })) return
+                sentThisFlush += pending.id
+                return@repeat
+            }
             // Persist first: Telegram can accept this packet while its HTTP response is lost.
             synchronized(lock) { store.transaction { legacyWindow.markAttempt(pending.id) } }
             client.send(peerId.toString(), TelegramProtocol.event(pending))

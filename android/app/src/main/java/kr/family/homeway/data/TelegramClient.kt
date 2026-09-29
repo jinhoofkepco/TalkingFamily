@@ -11,8 +11,23 @@ class TelegramException(
     val errorCode: Int,
     val retryAfterSeconds: Int? = null,
     val reason: TelegramFailureReason = TelegramFailureReason.UNKNOWN,
-    message: String = reason.safeMessage(errorCode, retryAfterSeconds)
+    message: String = reason.safeMessage(errorCode, retryAfterSeconds),
+    val operation: TelegramOperation = TelegramOperation.UNKNOWN,
 ) : Exception(message)
+
+enum class TelegramOperation {
+    SEND, POLL, IDENTITY, PEER_LOOKUP, WEBHOOK, UNKNOWN;
+    companion object {
+        fun forMethod(method: String): TelegramOperation = when (method) {
+            "sendMessage" -> SEND
+            "getUpdates" -> POLL
+            "getMe" -> IDENTITY
+            "getChat" -> PEER_LOOKUP
+            "getWebhookInfo" -> WEBHOOK
+            else -> UNKNOWN
+        }
+    }
+}
 
 /**
  * Direct Bot API transport. Each phone owns its bot and is the only getUpdates consumer.
@@ -85,11 +100,11 @@ class TelegramClient internal constructor(rawToken: String, private val transpor
             .put("limit", 100)
             .put("allowed_updates", JSONArray().put("message")), timeout,
             pollRevision.takeIf { timeout > 0 })
-        return response.optJSONArray("result") ?: throw TelegramException(0)
+        return response.optJSONArray("result") ?: throw TelegramException(0, operation = TelegramOperation.POLL)
     }
 
     private fun objectResult(method: String, body: JSONObject): JSONObject =
-        request(method, body).optJSONObject("result") ?: throw TelegramException(0)
+        request(method, body).optJSONObject("result") ?: throw TelegramException(0, operation = TelegramOperation.forMethod(method))
 
     private fun request(method: String, body: JSONObject, timeout: Int = 0, pollRevision: Long? = null): JSONObject {
         // Do not retain causes: IOException / JSONException may include a token-bearing URL or body.
@@ -107,7 +122,7 @@ class TelegramClient internal constructor(rawToken: String, private val transpor
                 val reason = if (response.status == code && parsed?.opt("ok") == false)
                     TelegramFailureReason.classify(code, parsed.optString("description"))
                     else TelegramFailureReason.UNKNOWN
-                throw TelegramException(code, retry, reason)
+                throw TelegramException(code, retry, reason, operation = TelegramOperation.forMethod(method))
             }
             return parsed
         } catch (interrupted: TelegramPollInterruptedException) {
@@ -115,7 +130,7 @@ class TelegramClient internal constructor(rawToken: String, private val transpor
         } catch (error: TelegramException) {
             throw error
         } catch (_: Exception) {
-            throw TelegramException(0)
+            throw TelegramException(0, operation = TelegramOperation.forMethod(method))
         }
     }
 

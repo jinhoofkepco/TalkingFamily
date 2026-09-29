@@ -228,6 +228,7 @@ class MainActivity : ComponentActivity() {
             repeatOnLifecycle(Lifecycle.State.RESUMED) {
                 TrackingService.runtime.collect {
                     AppDiagnostics.record(this@MainActivity, "tracking.runtime", it.error)
+                    model.refreshRuntimeState()
                     handleReadyState()
                 }
             }
@@ -244,10 +245,9 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 while(true) {
-                    // The receiver owns networking and its adaptive schedule. Local refreshes
-                    // preserve tracking/date updates without a second five-second poll loop.
-                    if (TelegramReceiveService.runtime.value.running) model.refreshCached()
-                    else model.refreshScheduled()
+                    // Commits drive local projections. Re-reading full history every five seconds
+                    // while the receiver is healthy creates needless DB work and UI contention.
+                    if (!TelegramReceiveService.runtime.value.running) model.refreshScheduled()
                     delay(5000)
                 }
             }
@@ -274,6 +274,11 @@ class MainActivity : ComponentActivity() {
             FloatingStarService.setMessengerVisible(true)
             openChatRequestId++
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        model.setUiActive(true)
     }
 
     override fun onPostResume() {
@@ -320,6 +325,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        model.setUiActive(false)
         super.onStop()
         // Showing an already-running shortcut is safe here; never start an FGS from onStop.
         if (!isChangingConfigurations && !waitingForOverlayPermission) {

@@ -321,7 +321,7 @@ class FamilyChatExchangeTest {
         }
     }
 
-    private class MemoryStore(saved: String? = null) : TelegramExchangeStore, FamilyChatStore {
+    internal class MemoryStore(saved: String? = null) : TelegramExchangeStore, FamilyChatStore {
         private var data = saved?.let(::JSONObject) ?: JSONObject().put("meta", JSONObject()).put("state", TelegramLedger.emptyState())
             .put("legacy", JSONArray()).put("legacyReceipts", JSONArray()).put("messages", JSONArray())
             .put("deliveries", JSONArray()).put("receipts", JSONArray()).put("retry", JSONObject())
@@ -380,11 +380,13 @@ class FamilyChatExchangeTest {
         }
     }
 
-    private class FakeTelegram : TelegramHttpTransport {
+    internal class FakeTelegram : TelegramHttpTransport {
         data class SendRequest(val sender: Long, val target: Any, val text: String)
         var calls = 0
         var blockedRecipient: Long? = null
         var loseChatResponseFrom: Long? = null
+        var loseBatchResponseFrom: Long? = null
+        var dropBatchFrom: Long? = null
         var dropAckFrom: Long? = null
         var rateLimitSendFrom: Long? = null
         var requireKnownRecipients = false
@@ -433,8 +435,10 @@ class FamilyChatExchangeTest {
                     if (requireKnownRecipients && (from to to) !in knownPeers) return chatNotFound()
                     val text = body.getString("text")
                     val type = JSONObject(text).getString("type")
-                    if (type == "chat_ack" && dropAckFrom == from) dropAckFrom = null else inject(from, to, text)
+                    if (type == "batch" && dropBatchFrom == from) dropBatchFrom = null
+                    else if (type == "chat_ack" && dropAckFrom == from) dropAckFrom = null else inject(from, to, text)
                     if (type == "chat" && loseChatResponseFrom == from) { loseChatResponseFrom = null; throw IOException("lost response") }
+                    if (type == "batch" && loseBatchResponseFrom == from) { loseBatchResponseFrom = null; throw IOException("lost response") }
                     ok(JSONObject().put("chat", JSONObject().put("id", to).put("type", "private")))
                 }
                 else -> error("Unexpected method $method")

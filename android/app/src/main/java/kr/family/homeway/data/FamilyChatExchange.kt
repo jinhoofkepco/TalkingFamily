@@ -13,6 +13,7 @@ class FamilyChatExchange(
     private val checkActive: () -> Unit = {},
     private val onReceived: (FamilyChatMessage) -> Unit = {},
     private val onPeerFailure: (Long, TelegramException) -> Unit = { _, _ -> },
+    private val transport: FamilyTransport? = null,
 ) {
     private val room = FamilyChatValidation.room(room)
     init { require(this.room.members.any { it.botId == ownBotId }) { "이 휴대폰이 가족 명단에 없어요." } }
@@ -36,6 +37,7 @@ class FamilyChatExchange(
             val prior = store.chatMessage(room.id, message.id)
             // Conflicting identities receive no ACK. A retry must never overwrite accepted text.
             if (prior != null && prior.digest != message.digest) return null
+            if (prior != null) transport?.noteReplayedPacket(message.senderId)
             if (prior == null) store.insertChatMessage(message, emptyList())
             store.queueChatReceipt(FamilyChatReceipt(room.id, message.id, message.senderId, message.digest))
             return message.takeIf { prior == null }
@@ -43,8 +45,8 @@ class FamilyChatExchange(
         packet.receipt?.let { receipt ->
             val message = store.chatMessage(room.id, receipt.messageId) ?: return null
             if (message.senderId != ownBotId || message.digest != receipt.digest) return null
-            val first = store.pendingChatDeliveries(room.id).firstOrNull { it.peerId == receipt.peerId }
-            if (first?.messageId == receipt.messageId && first.sentAt > 0) {
+            val delivery = store.pendingChatDelivery(room.id, receipt.messageId, receipt.peerId)
+            if (delivery != null && delivery.sentAt > 0) {
                 store.acknowledgeChat(room.id, receipt.messageId, receipt.peerId)
                 store.setChatPeerRetryAfter(room.id, receipt.peerId, 0)
             }
@@ -58,8 +60,8 @@ class FamilyChatExchange(
     fun hasReadyWork(): Boolean = synchronized(lock) {
         room.members.any { member ->
             member.botId != ownBotId && store.chatPeerRetryAfter(room.id, member.botId) <= now() &&
-                (store.chatReceipts(room.id).any { it.peerId == member.botId } ||
-                    store.pendingChatDeliveries(room.id).firstOrNull { it.peerId == member.botId }?.let {
+                (store.firstChatReceipt(room.id, member.botId) != null ||
+                    store.pendingChatDeliveries(room.id, member.botId, 1).firstOrNull()?.let {
                         it.sentAt == 0L || now() - it.sentAt >= 30_000
                     } == true)
         }
@@ -72,14 +74,18 @@ class FamilyChatExchange(
             val peer = member.botId
             if (synchronized(lock) { store.chatPeerRetryAfter(room.id, peer) > now() }) continue
             try {
+                if (transport != null) {
+                    flushTransport(member, transport)
+                    continue
+                }
                 // Bound each peer's work, so a replay burst cannot starve other people or location sharing.
-                val receipt = synchronized(lock) { store.chatReceipts(room.id).firstOrNull { it.peerId == peer } }
+                val receipt = synchronized(lock) { store.firstChatReceipt(room.id, peer) }
                 if (receipt != null) {
                     checkActive()
                     client.sendToFamilyMember(member, FamilyChatProtocol.receipt(receipt), checkActive)
                     synchronized(lock) { store.transaction { store.removeChatReceipt(receipt) } }
                 }
-                val delivery = synchronized(lock) { store.pendingChatDeliveries(room.id).firstOrNull { it.peerId == peer } }
+                val delivery = synchronized(lock) { store.pendingChatDeliveries(room.id, peer, 1).firstOrNull() }
                 if (delivery != null && (delivery.sentAt == 0L || now() - delivery.sentAt >= 30_000)) {
                     val message = synchronized(lock) { store.chatMessage(room.id, delivery.messageId) }
                         ?: error("가족방 발송 기록을 찾을 수 없어요.")
@@ -97,5 +103,26 @@ class FamilyChatExchange(
                 onPeerFailure(peer, error)
             }
         }
+    }
+
+    private fun flushTransport(member: FamilyChatMember, transport: FamilyTransport) {
+        val peer = member.botId
+        val receipts = synchronized(lock) { store.chatReceipts(room.id, peer, FamilyTransportProtocol.MAX_PACKETS) }
+        if (receipts.isNotEmpty()) transport.send(member, receipts.map(FamilyChatProtocol::receipt),
+            allowBatch = transport.canBatchAcknowledgements(peer), afterSend = { count ->
+            synchronized(lock) { store.transaction { receipts.take(count).forEach(store::removeChatReceipt) } }
+        })
+        val candidates = synchronized(lock) { store.pendingChatDeliveries(room.id, peer, FamilyTransportProtocol.MAX_PACKETS) }
+        val head = candidates.firstOrNull() ?: return
+        val deliveries = if (head.sentAt == 0L) candidates.takeWhile { it.sentAt == 0L }
+            else if (now() < head.sentAt || now() - head.sentAt >= 30_000) listOf(head) else return
+        val texts = synchronized(lock) { deliveries.map {
+            FamilyChatProtocol.message(checkNotNull(store.chatMessage(room.id, it.messageId)))
+        } }
+        transport.send(member, texts, allowBatch = head.sentAt == 0L, beforeSend = { count ->
+            synchronized(lock) { store.transaction {
+                deliveries.take(count).forEach { store.markChatSent(room.id, it.messageId, peer, now().coerceAtLeast(1)) }
+            } }
+        })
     }
 }

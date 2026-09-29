@@ -491,6 +491,47 @@ class FamilyCareEngineTest {
         assertEquals("pending", FamilySnapshot.parse(store.cached()).redemptions.single().status)
     }
 
+    @Test fun `negotiated telemetry batches preserve every revision and only reach both parents`() {
+        val f = Family(); f.drain()
+        f.batching = true
+        for (parent in listOf(101L, 202L)) {
+            f.http.inject(parent, 303, FamilyTransportProtocol.capability(42, false))
+            f.http.inject(303, parent, FamilyTransportProtocol.capability(42, false))
+        }
+        f.drain(rounds = 10)
+        f.http.sent.clear()
+        val events = (1..10).map { location() }
+        events.forEach { f.engine(303).emitChildEvent(it) }
+        f.drain(rounds = 20)
+        val batches = f.http.sent.filter { JSONObject(it.third).optString("type") == "batch" }
+        assertEquals(4, batches.size) // one telemetry batch and one ACK batch per parent
+        assertEquals(setOf(101L, 202L), batches.filter { it.first == 303L }.map { it.second }.toSet())
+        for (parent in listOf(101L, 202L)) {
+            assertEquals(f.engine(303).currentSnapshot(303)!!.revision, f.engine(parent).currentSnapshot(303)!!.revision)
+            assertTrue(f.stores.getValue(parent).archived.map { it.second.id }.containsAll(events.map { it.id }))
+        }
+        assertTrue(f.stores.getValue(404).archived.none { it.first == 303L })
+        assertTrue(f.stores.getValue(303).pendingPackets(f.room.id).isEmpty())
+    }
+
+    @Test fun `downgraded sender eventually receives individual ACKs after ignoring batch ACKs`() {
+        val f = Family(); f.drain(); f.batching = true
+        for (parent in listOf(101L, 202L)) {
+            f.http.inject(parent, 303, FamilyTransportProtocol.capability(42, false))
+            f.http.inject(303, parent, FamilyTransportProtocol.capability(42, false))
+        }
+        f.drain(rounds = 10)
+        f.oldPeers += 303L
+        f.http.sent.clear()
+        repeat(10) { f.engine(303).emitChildEvent(location()) }
+        f.drain(rounds = 150)
+        assertTrue(f.http.sent.any { it.first != 303L && JSONObject(it.third).optString("type") == "batch" })
+        assertTrue(f.http.sent.any { it.first != 303L && JSONObject(it.third).optString("type") == "care_ack" })
+        assertTrue(f.stores.getValue(303).pendingPackets(f.room.id).isEmpty())
+        for (parent in listOf(101L, 202L)) assertEquals(f.engine(303).currentSnapshot(303)!!.revision,
+            f.engine(parent).currentSnapshot(303)!!.revision)
+    }
+
     private class Family(bootstrap: Boolean = true) {
         val ids = listOf(101L, 202L, 303L, 404L)
         val room = FamilyChatRoom.create("우리집", ids.mapIndexed { index, id -> FamilyChatMember(id, "@care${id}_bot",
@@ -499,6 +540,8 @@ class FamilyCareEngineTest {
         val stores = ids.associateWith { MemoryStore() }
         val http = FakeTelegram()
         var time = Instant.parse("2026-09-22T12:00:00Z").toEpochMilli()
+        var batching = false
+        val oldPeers = mutableSetOf<Long>()
         init {
             if (bootstrap) {
                 val seed = TelegramLedger.emptyState().put("stickerBalance", 5)
@@ -508,8 +551,11 @@ class FamilyCareEngineTest {
             }
         }
         private fun client(id: Long) = TelegramClient("$id:${"x".repeat(32)}", http)
-        fun engine(id: Long) = FamilyCareEngine(client(id), stores.getValue(id), room, id, now = { time })
-        fun sync(id: Long) = TelegramExchange(client(id), stores.getValue(id), 0, "child", now = { time }, familyCare = engine(id)).synchronize()
+        fun engine(id: Long, transport: FamilyTransport? = null) = FamilyCareEngine(client(id), stores.getValue(id), room, id, now = { time }, transport = transport)
+        fun sync(id: Long): Boolean {
+            val transport = if (batching && id !in oldPeers) FamilyTransport(client(id), stores.getValue(id), room, id, now = { time }) else null
+            return TelegramExchange(client(id), stores.getValue(id), 0, "child", now = { time }, familyCare = engine(id, transport), transport = transport).synchronize()
+        }
         fun syncLegacy(id: Long, peerId: Long) = TelegramExchange(client(id), stores.getValue(id), peerId, "guardian", now = { time }, familyCare = engine(id)).synchronize()
         fun drain(active: List<Long> = ids, rounds: Int = 70) { repeat(rounds) { active.forEach { sync(it) }; time += 1001 } }
     }

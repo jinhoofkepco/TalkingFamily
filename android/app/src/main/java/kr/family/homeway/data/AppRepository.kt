@@ -69,17 +69,34 @@ class AppRepository internal constructor(context: Context, private val clientFac
         prefs.edit().putLong("careChild_${room!!.id}", id).commit()
     }
     private fun careEngine(active: FamilyChatRoom = checkNotNull(room), client: TelegramClient = clientFactory(vault.get()),
-        checkActive: () -> Unit = {}) =
-        FamilyCareEngine(client, store.familyCare, active, selfBotId, lock = dataLock, checkActive = checkActive)
+        checkActive: () -> Unit = {}, transport: FamilyTransport? = null) =
+        FamilyCareEngine(client, store.familyCare, active, selfBotId, lock = dataLock, checkActive = checkActive,
+            transport = transport)
     fun careSnapshot(childId: Long? = selectedCareChildId): FamilySnapshot? = synchronized(dataLock) {
         val active = room ?: return@synchronized null
         if (!careEnabled || childId == null) return@synchronized null
         val state = store.familyCare.state(active.id, childId) ?: return@synchronized null
         val member = active.members.firstOrNull { it.botId == childId }
-        state.snapshot.copy(events = state.snapshot.events.map {
+        val snapshot = state.snapshot
+        snapshot.copy(events = snapshot.events.map {
             it.copy(roomId = active.id, senderId = if (it.sender == "child") childId else null,
                 senderName = if (it.sender == "child") member?.displayName else "부모")
-        }, rewards = state.snapshot.rewards.map { it.copy(version = state.rewardVersion(it.id)) })
+        }, rewards = snapshot.rewards.map { it.copy(version = state.rewardVersion(it.id)) })
+    }
+    /** Call from an IO dispatcher. All related screen fields come from one consistent local read. */
+    fun readUiSnapshot(): RepositoryUiSnapshot = synchronized(dataLock) {
+        val selected = selectedCareChildId
+        val care = careSnapshot(selected)
+        RepositoryUiSnapshot(
+            snapshot = if (careEnabled) care ?: FamilySnapshot.parse(TelegramLedger.emptyState()) else cached(),
+            careSnapshot = care,
+            role = effectiveRole, privateRole = role, configured = configured,
+            demoMode = demoMode, paired = paired, room = room, selfBotId = selfBotId,
+            botUsername = botUsername, peerBotUsername = peerBotUsername,
+            careEnabled = careEnabled, careChildren = careChildren, selectedChildBotId = selected,
+            carePending = carePending(selected), careStatus = careStatus(selected),
+            sharingEnabled = sharingEnabled, trackingStatus = trackingStatus, connectionError = connectionError,
+        )
     }
     fun carePending(childId: Long? = selectedCareChildId): Boolean = synchronized(dataLock) {
         careEnabled && childId != null && careEngine().hasPending(childId)
@@ -95,10 +112,15 @@ class AppRepository internal constructor(context: Context, private val clientFac
         val engine = careEngine(active)
         store.transaction {
             if (careRole == "child") {
-                val previousRoom = prefs.getString("lastCareRoom_$selfBotId", null)
-                val previous = previousRoom?.let { store.familyCare.state(it, selfBotId) }?.takeIf { it.authoritative }
-                engine.ensureAuthority(previous?.state ?: if (role == "child") store.cached() else null)
-                prefs.edit().putString("lastCareRoom_$selfBotId", active.id).commit()
+                val existing = store.familyCare.stateMetadata(active.id, selfBotId)
+                if (existing == null) {
+                    val previousRoom = prefs.getString("lastCareRoom_$selfBotId", null)
+                    val previous = previousRoom?.let { store.familyCare.state(it, selfBotId) }?.takeIf { it.authoritative }
+                    if (previous != null) store.familyCare.copyEventDigests(previous.roomId, active.id, selfBotId)
+                    engine.ensureAuthority(previous?.state ?: if (role == "child") store.cached() else null)
+                } else check(existing.authoritative) { "자녀의 칭찬판 정보를 확인해 주세요." }
+                if (prefs.getString("lastCareRoom_$selfBotId", null) != active.id)
+                    prefs.edit().putString("lastCareRoom_$selfBotId", active.id).commit()
             }
             else {
                 val oldChild = prefs.getLong("peerBotId", 0)
@@ -107,7 +129,7 @@ class AppRepository internal constructor(context: Context, private val clientFac
                 careChildren.forEach { child ->
                     val key = "careSync_${active.id}_${child.botId}"
                     val previous = prefs.getLong(key, 0)
-                    val interval = if (store.familyCare.state(active.id, child.botId) == null) 60_000 else 300_000
+                    val interval = if (store.familyCare.stateMetadata(active.id, child.botId) == null) 60_000 else 300_000
                     if (now < previous || now - previous >= interval) {
                         engine.requestSync(child.botId)
                         prefs.edit().putLong(key, now).commit()
@@ -229,8 +251,12 @@ class AppRepository internal constructor(context: Context, private val clientFac
         val peerId = prefs.getLong("peerBotId", 0)
         val peerRole = if (role == "child") "guardian" else "child"
         val coroutineContext = currentCoroutineContext()
-        val familyChat = room?.let { active -> FamilyChatExchange(client, store.familyChat, active, selfBotId,
+        val activeRoom = room
+        val transport = activeRoom?.let { FamilyTransport(client, store, it, selfBotId,
+            lock = dataLock, checkActive = { coroutineContext.ensureActive() }) }
+        val familyChat = activeRoom?.let { active -> FamilyChatExchange(client, store.familyChat, active, selfBotId,
             lock = dataLock, checkActive = { coroutineContext.ensureActive() },
+            transport = transport,
             onReceived = { FamilyNotifications.received(app, roomEvent(it, active)) },
             onPeerFailure = { id, failure ->
                 prefs.edit().putString("roomDeliveryError_${active.id}_$id", failure.message).commit()
@@ -247,7 +273,9 @@ class AppRepository internal constructor(context: Context, private val clientFac
                 },
                 onPollCompleted = { poll?.let(TelegramChatReceiveCadence::onPollCompleted) },
                 pollAllowed = { !scheduled || (poll != null && TelegramChatReceiveCadence.isCurrent(poll)) },
-                familyCare = if (careEnabled) careEngine(client = client, checkActive = { coroutineContext.ensureActive() }) else null,
+                familyCare = if (careEnabled) careEngine(client = client, checkActive = { coroutineContext.ensureActive() },
+                    transport = transport) else null,
+                transport = transport,
                 onLegacyFailure = {
                     prefs.edit().putString("legacyDeliveryError", it.message).commit()
                     AppDiagnostics.record(app, "telegram.private_delivery", it.message)
@@ -261,12 +289,14 @@ class AppRepository internal constructor(context: Context, private val clientFac
         } catch (e: TelegramException) {
             prefs.edit().putString("connectionError", e.message).apply()
             AppDiagnostics.record(app, "telegram.connection", e.message)
+            AppDiagnostics.record(app, "telegram.request", "operation=${e.operation.name} code=${e.errorCode} retryAfterSeconds=${e.retryAfterSeconds ?: 0}")
             throw e
         } catch (e: TelegramSyncException) {
             prefs.edit().putString("connectionError", e.message).apply()
             AppDiagnostics.record(app, "telegram.sync", e.message)
             throw e
         } finally {
+            pacedOutboxDeadline = transport?.deferredUntilMillis ?: 0L
             publishChanges()
         }
     } }
@@ -388,22 +418,25 @@ class AppRepository internal constructor(context: Context, private val clientFac
         }
     } }
     fun hasPending(): Boolean = synchronized(dataLock) {
-        store.pending().isNotEmpty() || store.receipts().isNotEmpty() || room?.let {
-            store.familyChat.pendingChatDeliveries(it.id).isNotEmpty() || store.familyChat.chatReceipts(it.id).isNotEmpty() ||
-                store.familyCare.pendingPackets(it.id).isNotEmpty() || store.familyCare.receipts(it.id).isNotEmpty()
+        store.hasPendingLegacy() || room?.let {
+            store.familyChat.hasPending(it.id) ||
+                store.familyCare.hasPendingPackets(it.id) || store.familyCare.pendingPeers(it.id).isNotEmpty()
         } == true || (careEnabled && careChildren.any { careEngine().hasPending(it.botId) })
     }
     fun synchronizationRetryDelayMillis(): Long = synchronized(dataLock) {
         (store.meta("retryAfter") - System.currentTimeMillis()).coerceAtLeast(0)
     }
+    /** Only an actual rate-deferred send supplies this deadline; idle peers cannot create a busy loop. */
+    fun outgoingRecheckDelayMillis(): Long? = pacedOutboxDeadline.takeIf { it > 0 }?.let {
+        (it - System.currentTimeMillis()).coerceIn(1, FamilyTransport.PEER_INTERVAL_MILLIS)
+    }
     private fun pendingDeliveryError(): String? = synchronized(dataLock) {
         val failures = mutableListOf<String>()
-        if (store.pending().isNotEmpty() || store.receipts().isNotEmpty()) {
+        if (store.hasPendingLegacy()) {
             prefs.getString("legacyDeliveryError", null)?.let { failures.add("기존 1:1 전달 대기: $it") }
         } else prefs.edit().remove("legacyDeliveryError").apply()
         room?.let { active ->
-            val pendingPeers = store.familyChat.pendingChatDeliveries(active.id).map { it.peerId }.toSet() +
-                store.familyChat.chatReceipts(active.id).map { it.peerId }
+            val pendingPeers = store.familyChat.pendingPeers(active.id)
             active.members.forEach { member ->
                 val key = "roomDeliveryError_${active.id}_${member.botId}"
                 if (member.botId in pendingPeers) prefs.getString(key, null)?.let { failures.add("${member.displayName}에게 전달 대기: $it") }
@@ -427,6 +460,7 @@ class AppRepository internal constructor(context: Context, private val clientFac
         private val networkMutex = Mutex()
         private val dataLock = Any()
         private val changeRevision = MutableStateFlow(0L)
+        @Volatile private var pacedOutboxDeadline = 0L
         private val immediateOutbox = Channel<AppRepository>(Channel.CONFLATED)
         private val immediateScope = CoroutineScope(SupervisorJob() + Dispatchers.IO).also { scope ->
             scope.launch {

@@ -14,6 +14,7 @@ class FamilyCareEngine(
     private val lock: Any = Any(),
     private val now: () -> Long = System::currentTimeMillis,
     private val checkActive: () -> Unit = {},
+    private val transport: FamilyTransport? = null,
 ) {
     private val room = FamilyChatValidation.room(room)
     private val parents get() = room.members.filter { FamilyCareValidation.isParent(room, it.botId) }.map { it.botId }
@@ -25,7 +26,7 @@ class FamilyCareEngine(
 
     /** A transport ACK alone never makes a parent command appear completed. */
     fun hasPending(childId: Long): Boolean = synchronized(lock) {
-        val state = store.state(room.id, childId)
+        val state = store.stateMetadata(room.id, childId)
         val outcomes = store.outcomes(room.id, childId).associateBy { it.commandId }
         store.commands(room.id, childId).filter { it.actorId == ownBotId }.any { command ->
             val outcome = outcomes[command.id]
@@ -37,7 +38,7 @@ class FamilyCareEngine(
         val latest = store.commands(room.id, childId).lastOrNull { it.actorId == ownBotId }
         val outcome = latest?.let { store.outcome(room.id, it.id) }
         store.error(room.id, childId) ?: when {
-            store.state(room.id, childId) == null -> "자녀의 칭찬판을 처음 동기화하고 있어요."
+            store.stateMetadata(room.id, childId) == null -> "자녀의 칭찬판을 처음 동기화하고 있어요."
             hasPending(childId) -> "자녀 휴대폰에서 처리 결과를 확인하고 있어요."
             outcome?.accepted == false -> outcome.reason
             else -> null
@@ -92,9 +93,7 @@ class FamilyCareEngine(
             val event = TelegramLedger.validate(input.copy(sender = "child", delivery = "relayed"))
             val current = store.state(room.id, ownBotId) ?: ensureAuthority()
             require(current.authoritative)
-            if (TelegramLedger.contains(current.state, event.id)) {
-                // Checking the digest prevents an event identity being reused with altered content.
-                TelegramLedger.apply(current.state, event)
+            if (alreadyApplied(current, event)) {
                 return@transaction current
             }
             val next = current.copy(revision = nextRevision(current), state = TelegramLedger.apply(current.state, event))
@@ -117,8 +116,7 @@ class FamilyCareEngine(
         if (!current.authoritative) return false
         val event = TelegramLedger.validate(input.copy(sender = "guardian", delivery = "relayed"))
         try {
-            if (TelegramLedger.contains(current.state, event.id)) {
-                TelegramLedger.apply(current.state, event)
+            if (alreadyApplied(current, event)) {
                 return true
             }
             if (event.kind == "sticker_redeem_approve") require(current.snapshot.redemptions
@@ -148,7 +146,7 @@ class FamilyCareEngine(
             } catch (_: IllegalArgumentException) { return }
             catch (_: org.json.JSONException) { return }
             // Storage failures must roll back the shared receive offset, not disappear as malformed input.
-            val pending = store.pendingPackets(room.id).firstOrNull { it.peerId == packet.actorId && it.packetId == packet.id }
+            val pending = store.pendingPacket(room.id, packet.id, packet.actorId)
             if (pending != null && pending.childId == packet.childId && pending.digest == digest && pending.sentAt > 0) {
                 store.acknowledge(room.id, packet.id, packet.actorId, digest)
                 store.setRetryAfter(room.id, packet.actorId, 0)
@@ -157,6 +155,7 @@ class FamilyCareEngine(
         }
         val prior = store.receivedDigest(room.id, packet.id)
         if (prior != null && prior != packet.digest) return
+        if (prior != null) transport?.noteReplayedPacket(packet.actorId)
         if (prior == null) {
             val accepted = try {
                 when (packet.type) {
@@ -234,8 +233,8 @@ class FamilyCareEngine(
             validateTransition(current, command)
             val event = FamilyEvent(command.id, command.kind, command.payload,
                 if (command.kind in FamilyCareValidation.parentKinds) "guardian" else "child", command.createdAt, "relayed")
-            val alreadyApplied = TelegramLedger.contains(current.state, event.id)
-            val nextState = TelegramLedger.apply(current.state, event)
+            val alreadyApplied = alreadyApplied(current, event)
+            val nextState = if (alreadyApplied) current.state else TelegramLedger.apply(current.state, event)
             if (!alreadyApplied) bumpRewardVersion(nextState, event.kind, event.payload)
             next = current.copy(revision = if (alreadyApplied) current.revision else nextRevision(current), state = nextState)
             chunks = FamilyCareSnapshots.chunks(next!!)
@@ -301,11 +300,12 @@ class FamilyCareEngine(
         require(event.sender == "child" && event.kind in FamilyCareValidation.telemetryKinds)
         val current = store.state(room.id, packet.childId)
         if (current != null && current.epoch != epoch) { epochError(packet.childId); return }
+        val duplicate = current != null && alreadyApplied(current, event)
         store.archiveEvent(room.id, packet.childId, event)
         if (current == null || revision > current.revision + 1) { queueSync(packet.childId); return }
         require(!current.authoritative)
         if (revision <= current.revision) return
-        store.saveState(current.copy(revision = revision, state = TelegramLedger.apply(current.state, event)))
+        store.saveState(current.copy(revision = revision, state = if (duplicate) current.state else TelegramLedger.apply(current.state, event)))
     }
 
     private fun archiveProjection(state: FamilyCareState) {
@@ -315,7 +315,7 @@ class FamilyCareEngine(
 
     private fun queueSync(childId: Long) {
         require(FamilyCareValidation.isParent(room, ownBotId) && FamilyCareValidation.isChild(room, childId))
-        if (store.pendingPackets(room.id).any { it.childId == childId && JSONObject(it.text).optString("type") == "sync_request" }) return
+        if (store.hasPendingKind(room.id, childId, "sync_request")) return
         store.queuePacket(FamilyCareProtocol.outgoing(room, ownBotId, childId, childId, "sync_request", JSONObject()))
     }
 
@@ -333,6 +333,14 @@ class FamilyCareEngine(
         "자녀의 칭찬판이 다시 시작되었어요. 기록을 덮어쓰지 않았어요. 새 가족방 코드로 함께 연결해 주세요.")
 
     private fun nextRevision(state: FamilyCareState): Long = FamilyCareValidation.counter(state.revision + 1)
+
+    private fun alreadyApplied(state: FamilyCareState, event: FamilyEvent): Boolean {
+        val prior = store.eventDigest(room.id, state.childId, event.id)
+            ?: state.state.optJSONObject("appliedEventIds")?.optString(event.id)?.takeIf { it.isNotBlank() }
+            ?: return false
+        require(prior == TelegramLedger.eventDigest(event)) { "같은 기록의 내용이 달라졌어요. 연결을 확인해 주세요." }
+        return true
+    }
 
     private fun bumpRewardVersion(state: JSONObject, kind: String, payload: JSONObject) {
         if (kind !in setOf("reward_upsert", "reward_delete")) return
@@ -364,11 +372,9 @@ class FamilyCareEngine(
     }
 
     fun hasReadyWork(): Boolean = synchronized(lock) {
-        val packets = store.pendingPackets(room.id)
-        val receipts = store.receipts(room.id)
-        val peers = (packets.map { it.peerId } + receipts.map { it.peerId }).distinct()
+        val peers = store.pendingPeers(room.id)
         peers.any { peer -> store.retryAfter(room.id, peer) <= now() &&
-            (receipts.any { it.peerId == peer } || nextSendable(packets.filter { it.peerId == peer }) != null)
+            (store.firstReceipt(room.id, peer) != null || nextSendable(store.pendingPackets(room.id, peer, MAX_UNACKNOWLEDGED_PER_PEER)) != null)
         }
     }
 
@@ -386,21 +392,25 @@ class FamilyCareEngine(
 
     /** A slow family member cannot block the other parent, another child, or the v2/v3 lanes. */
     fun flush() {
-        val peers = synchronized(lock) { (store.pendingPackets(room.id).map { it.peerId } + store.receipts(room.id).map { it.peerId }).distinct() }
+        val peers = synchronized(lock) { store.pendingPeers(room.id) }
         for (peer in peers) {
             checkActive()
             val member = room.members.firstOrNull { it.botId == peer } ?: continue
             if (synchronized(lock) { store.retryAfter(room.id, peer) > now() }) continue
             try {
+                if (transport != null) {
+                    flushTransport(member, transport)
+                    continue
+                }
                 for (index in 0 until MAX_RECEIPTS_PER_FLUSH) {
-                    val receipt = synchronized(lock) { store.receipts(room.id).firstOrNull { it.peerId == peer } } ?: break
+                    val receipt = synchronized(lock) { store.firstReceipt(room.id, peer) } ?: break
                     checkActive()
                     client.sendToFamilyMember(member, FamilyCareProtocol.receipt(room, ownBotId, receipt), checkActive)
                     synchronized(lock) { store.transaction { store.removeReceipt(receipt) } }
                 }
                 val sentThisFlush = mutableSetOf<String>()
                 for (index in 0 until MAX_PACKETS_PER_FLUSH) {
-                    val packet = synchronized(lock) { nextSendable(store.pendingPackets(room.id).filter { it.peerId == peer }, sentThisFlush) } ?: break
+                    val packet = synchronized(lock) { nextSendable(store.pendingPackets(room.id, peer, MAX_UNACKNOWLEDGED_PER_PEER), sentThisFlush) } ?: break
                     synchronized(lock) { store.transaction { store.markSent(room.id, packet.packetId, peer, now().coerceAtLeast(1)) } }
                     checkActive()
                     client.sendToFamilyMember(member, packet.text, checkActive)
@@ -414,6 +424,29 @@ class FamilyCareEngine(
                 synchronized(lock) { store.transaction { store.setRetryAfter(room.id, peer, now() + 15_000) } }
             }
         }
+    }
+
+    private fun flushTransport(member: FamilyChatMember, transport: FamilyTransport) {
+        val peer = member.botId
+        val receipts = synchronized(lock) { store.receipts(room.id, peer, FamilyTransportProtocol.MAX_PACKETS) }
+        if (receipts.isNotEmpty()) transport.send(member, receipts.map { FamilyCareProtocol.receipt(room, ownBotId, it) },
+            allowBatch = transport.canBatchAcknowledgements(peer), afterSend = { count ->
+            synchronized(lock) { store.transaction { receipts.take(count).forEach(store::removeReceipt) } }
+        })
+        val candidates = synchronized(lock) { store.pendingPackets(room.id, peer, MAX_UNACKNOWLEDGED_PER_PEER) }
+        val first = nextSendable(candidates) ?: return
+        // Previously attempted envelopes retry separately: an old/downgraded app must never lose them.
+        val packets = if (first.sentAt == 0L) candidates.dropWhile { it.packetId != first.packetId }.takeWhile { it.sentAt == 0L }
+            else listOf(first)
+        transport.send(member, packets.map { it.text }, allowBatch = first.sentAt == 0L, beforeSend = { count ->
+            synchronized(lock) { store.transaction {
+                packets.take(count).forEach { store.markSent(room.id, it.packetId, peer, now().coerceAtLeast(1)) }
+            } }
+        }, afterSend = { count ->
+            synchronized(lock) { store.transaction {
+                packets.take(count).forEach { store.markSendConfirmed(room.id, it.packetId, peer) }
+            } }
+        })
     }
 
     companion object {

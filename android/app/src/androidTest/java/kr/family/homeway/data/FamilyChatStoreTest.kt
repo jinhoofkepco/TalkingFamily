@@ -62,7 +62,7 @@ class FamilyChatStoreTest {
             db.version = 3
         }
         val migrated = store()
-        assertEquals(6, migrated.readableDatabase.version)
+        assertEquals(7, migrated.readableDatabase.version)
         assertEquals(cached.toString(), migrated.cached()!!.toString())
         assertEquals(8492L, migrated.meta("offset"))
         assertEquals(129L, migrated.meta("sentAt"))
@@ -229,6 +229,28 @@ class FamilyChatStoreTest {
         assertTrue(FamilySnapshot.parse(db.cached()!!).events.isEmpty())
         db.clear()
         assertTrue(db.privateChatHistory().events.isEmpty())
+    }
+
+    @Test fun boundedPeerQueriesPreserveFifoAndExactAcknowledgementsAcrossSiblings() {
+        val group = room()
+        val chat = store().familyChat
+        val outgoing = List(30) { message(group.id) }
+        outgoing.forEach { chat.insertChatMessage(it, listOf(102, 103)) }
+        assertEquals(outgoing.take(2).map { it.id }, chat.pendingChatDeliveries(group.id, 103, 2).map { it.messageId })
+        assertNotNull(chat.pendingChatDelivery(group.id, outgoing.first().id, 102))
+        assertNull(chat.pendingChatDelivery(group.id, outgoing.first().id, 104))
+        chat.markChatSent(group.id, outgoing.first().id, 102, 100)
+        chat.acknowledgeChat(group.id, outgoing.first().id, 102)
+        assertNull(chat.pendingChatDelivery(group.id, outgoing.first().id, 102))
+        assertNotNull(chat.pendingChatDelivery(group.id, outgoing.first().id, 103))
+        val incoming = List(4) { message(group.id, 102) }
+        incoming.forEach {
+            chat.insertChatMessage(it, emptyList())
+            chat.queueChatReceipt(FamilyChatReceipt(group.id, it.id, 102, it.digest))
+        }
+        assertEquals(incoming.take(2).map { it.id }, chat.chatReceipts(group.id, 102, 2).map { it.messageId })
+        assertEquals(incoming.first().id, chat.firstChatReceipt(group.id, 102)?.messageId)
+        assertTrue(chat.chatReceipts(group.id, 103, 2).isEmpty())
     }
 
     @Test fun explicitResetClearsRoomConfigurationArchiveReceiptsAndPerPeerState() {
