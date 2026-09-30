@@ -37,11 +37,173 @@ class FamilyTransportTest {
         h.sync(101)
         assertEquals(10, h.stores.getValue(101).pendingChatDeliveries(h.room.id).size)
         h.oldPeer = true; h.time += 31_000
-        repeat(30) { h.sync(101); h.sync(202); h.advance() }
+        repeat(90) { h.sync(101); h.sync(202); h.advance() }
         assertTrue(h.stores.getValue(101).pendingChatDeliveries(h.room.id).isEmpty())
         assertEquals(messages.map { it.id }.toSet(), h.stores.getValue(202).chatHistory(h.room.id).messages.map { it.id }.toSet())
         val retries = h.telegram.sendRequests.filter { it.sender == 101L && JSONObject(it.text).optString("type") == "chat" }
         assertEquals(messages.map { it.digest }, retries.map { FamilyChatMessage.parse(JSONObject(it.text).getJSONObject("message")).digest })
+    }
+
+    @Test fun `attempted backlog from previous app batches again without replacing identities`() {
+        val h = Harness(); h.confirm()
+        val messages = (1..12).map { h.enqueue("이전 발신 시도 $it") }
+        messages.forEach { h.stores.getValue(101).markChatSent(h.room.id, it.id, 202, h.time - 31_000) }
+        h.sync(101); h.sync(202); h.advance(); h.sync(101)
+        val data = h.telegram.sendRequests.single { it.sender == 101L && JSONObject(it.text).optString("type") == "batch" }
+        assertEquals(messages.map { it.id }, FamilyTransportProtocol.unpack(JSONObject(data.text))
+            .map { JSONObject(it).getJSONObject("message").getString("id") })
+        assertTrue(h.stores.getValue(101).pendingChatDeliveries(h.room.id).isEmpty())
+        assertEquals(messages.size, h.notifications.size)
+    }
+
+    @Test fun `ordinary repeated batch duplicates keep receipts batched`() {
+        val h = Harness(); h.confirm()
+        val messages = (1..5).map { h.enqueue("반복 묶음 $it") }
+        h.sync(101)
+        val batch = h.telegram.sendRequests.single { it.sender == 101L && JSONObject(it.text).optString("type") == "batch" }.text
+        h.sync(202)
+        repeat(3) { h.telegram.inject(101, 202, batch); h.advance(); h.sync(202) }
+        assertEquals(messages.size, h.notifications.size)
+        assertTrue(h.telegram.sendRequests.none { it.sender == 202L && JSONObject(it.text).optString("type") == "chat_ack" })
+        assertTrue(h.transport(202).canBatchAcknowledgements(101, messages.map { it.id }))
+    }
+
+    @Test fun `downgraded sender recovers its replay ACK without disabling unrelated receipt batches`() {
+        val h = Harness(); h.confirm()
+        val messages = (1..3).map { h.enqueue("발신앱 구버전 $it") }
+        h.sync(101)
+        h.telegram.dropBatchFrom = 202
+        h.sync(202)
+        h.oldSender = true
+        repeat(12) { h.time += 31_000; h.sync(101); h.sync(202) }
+        assertTrue(h.stores.getValue(101).pendingChatDeliveries(h.room.id).isEmpty())
+        assertEquals(messages.size, h.notifications.size)
+        val transport = h.transport(202)
+        assertTrue(transport.supportsBatch(101))
+        assertTrue(transport.canBatchAcknowledgements(101, listOf(UUID.randomUUID().toString())))
+        assertTrue(h.telegram.sendRequests.any { it.sender == 202L && JSONObject(it.text).optString("type") == "chat_ack" })
+    }
+
+    @Test fun `continuous old backlog gives probes a turn then resumes the same FIFO`() {
+        val h = Harness(); h.oldPeer = true
+        val messages = (1..8).map { h.enqueue("협상 중에도 $it") }
+        messages.forEach { h.stores.getValue(101).markChatSent(h.room.id, it.id, 202, h.time - 31_000) }
+        repeat(90) { h.sync(101); h.sync(202); h.advance() }
+        assertEquals(1, h.telegram.sendRequests.count { it.sender == 101L && JSONObject(it.text).optString("type") == "capabilities" })
+        assertTrue(h.stores.getValue(101).pendingChatDeliveries(h.room.id).isEmpty())
+        assertEquals(messages.size, h.notifications.size)
+    }
+
+    @Test fun `failed capability HTTP retries shortly while old packets continue`() {
+        val h = Harness(); h.oldPeer = true
+        h.telegram.failCapabilityFrom = 101
+        h.enqueue("협상 실패 후에도")
+        repeat(20) { h.sync(101); h.sync(202); h.advance() }
+        assertEquals(2, h.telegram.sendRequests.count { it.sender == 101L && JSONObject(it.text).optString("type") == "capabilities" })
+        assertTrue(h.stores.getValue(101).pendingChatDeliveries(h.room.id).isEmpty())
+        assertEquals(1, h.notifications.size)
+    }
+
+    @Test fun `failed capability reply respects its deadline while the other feature reply progresses`() {
+        val h = Harness(); val transport = h.transport(101)
+        transport.incoming(update(202, FamilyTransportProtocol.capability(42, false)))
+        transport.incoming(update(202, FamilyTransportProtocol.careCapability(43, false)))
+        h.telegram.failCapabilityFrom = 101
+        transport.flushControls(true)
+        assertEquals(1, h.telegram.sendRequests.size)
+        h.advance(); transport.flushControls(true)
+        assertEquals(2, h.telegram.sendRequests.size)
+        assertEquals("care_capabilities", JSONObject(h.telegram.sendRequests.last().text).getString("type"))
+        repeat(5) { h.advance(); transport.flushControls(true) }
+        assertEquals(2, h.telegram.sendRequests.size)
+        // The batch reply remains durable across exchange reconstruction and retries at its 15s deadline.
+        h.time += 8_000
+        h.transport(101).flushControls(true)
+        assertEquals(3, h.telegram.sendRequests.size)
+        val retry = JSONObject(h.telegram.sendRequests.last().text)
+        assertEquals("capabilities", retry.getString("type"))
+        assertEquals(42L, retry.getLong("nonce"))
+        assertTrue(retry.getBoolean("reply"))
+        h.advance(); h.transport(101).flushControls(true)
+        assertEquals(3, h.telegram.sendRequests.size)
+    }
+
+    @Test fun `care capability is separately authenticated and does not extend old strict batch controls`() {
+        val h = Harness(); val transport = h.transport(101)
+        assertNull(transport.incoming(update(202, FamilyTransportProtocol.careCapability(42, true))))
+        assertNull(transport.incoming(update(999, FamilyTransportProtocol.careCapability(42, false))))
+        assertFalse(transport.supportsCareDeltas(202))
+        assertEquals(emptyList<JSONObject>(), transport.incoming(update(202, FamilyTransportProtocol.careCapability(42, false))))
+        assertTrue(transport.supportsCareDeltas(202))
+        assertTrue(FamilyTransport.supportsCareDeltas(h.stores.getValue(101), h.room.id, 202, h.time))
+        assertFalse(transport.supportsBatch(202))
+        val old = JSONObject(FamilyTransportProtocol.capability(42, false)).put("delta", 1)
+        assertNull(transport.incoming(update(202, old.toString())))
+        assertFalse(transport.supportsBatch(202))
+    }
+
+    @Test fun `individual replays fall back only the repeated original ACK and expire promptly`() {
+        val h = Harness(); h.confirm()
+        val messages = (1..3).map { h.enqueue("개별 확인응답 $it") }
+        val transport = h.transport(202)
+        val channel = h.channel(202, transport)
+        messages.forEach { channel.processUpdate(update(101, FamilyChatProtocol.message(it))) }
+        channel.processUpdate(update(101, FamilyChatProtocol.message(messages[0])))
+        assertTrue(transport.canBatchAcknowledgements(101, messages.map { it.id }))
+        channel.processUpdate(update(101, FamilyChatProtocol.message(messages[0])))
+        assertFalse(transport.canBatchAcknowledgements(101, listOf(messages[0].id)))
+        assertTrue(transport.canBatchAcknowledgements(101, messages.drop(1).map { it.id }))
+        assertTrue(transport.supportsBatch(101))
+        h.time += 121_000
+        assertTrue(transport.canBatchAcknowledgements(101, messages.map { it.id }))
+    }
+
+    @Test fun `one compatibility ACK at the end leaves the preceding receipt batch intact`() {
+        val h = Harness(); h.confirm()
+        val messages = (1..15).map { h.enqueue("섞인 확인응답 $it") }
+        val transport = h.transport(202)
+        val channel = h.channel(202, transport)
+        messages.forEach { channel.processUpdate(update(101, FamilyChatProtocol.message(it))) }
+        repeat(2) { channel.processUpdate(update(101, FamilyChatProtocol.message(messages.last()))) }
+        channel.flush()
+        val batch = h.telegram.sendRequests.single { it.sender == 202L && JSONObject(it.text).optString("type") == "batch" }
+        val ids = FamilyTransportProtocol.unpack(JSONObject(batch.text)).map { JSONObject(it).getString("id") }
+        assertEquals(messages.dropLast(1).map { it.id }, ids)
+        assertEquals(listOf(messages.last().id), h.stores.getValue(202).chatReceipts(h.room.id).map { it.messageId })
+    }
+
+    @Test fun `unacknowledged delta attempts invalidate care lease only after a bounded retry window`() {
+        val h = Harness(); val transport = h.transport(101)
+        transport.incoming(update(202, FamilyTransportProtocol.careCapability(42, false)))
+        val member = h.room.members.single { it.botId == 202L }
+        val outgoing = FamilyCareProtocol.outgoing(h.room, 101, 101, 202, "care_delta", JSONObject())
+        assertEquals(1, transport.send(member, listOf(outgoing.text)))
+        assertFalse(transport.shouldFallbackCarePacket(202, outgoing.packetId))
+        h.time += 31_000
+        transport.flushControls(false); h.advance()
+        assertEquals(1, transport.send(member, listOf(outgoing.text)))
+        assertFalse(transport.shouldFallbackCarePacket(202, outgoing.packetId))
+        h.time += 31_000
+        assertTrue(transport.shouldFallbackCarePacket(202, outgoing.packetId))
+        transport.noteCareDeltaFallback(202)
+        assertFalse(transport.supportsCareDeltas(202))
+        transport.noteAcknowledgedPacket(202, outgoing.packetId)
+        assertFalse(transport.shouldFallbackCarePacket(202, outgoing.packetId))
+    }
+
+    @Test fun `data gets a turn when receipt traffic would otherwise occupy every permit`() {
+        val h = Harness(); h.confirm()
+        val transport = h.transport(101)
+        val member = h.room.members.single { it.botId == 202L }
+        val message = h.enqueue("확인응답 사이의 메시지")
+        val acknowledgement = FamilyChatProtocol.receipt(FamilyChatReceipt(h.room.id, UUID.randomUUID().toString(), 202, "0".repeat(64)))
+        assertEquals(1, transport.send(member, listOf(acknowledgement)))
+        assertEquals(0, transport.send(member, listOf(FamilyChatProtocol.message(message))))
+        h.advance()
+        // An optional capability gets one turn; then ACKs yield to the waiting data lane.
+        transport.flushControls(false); h.advance()
+        assertEquals(0, transport.send(member, listOf(acknowledgement)))
+        assertEquals(1, transport.send(member, listOf(FamilyChatProtocol.message(message))))
     }
 
     @Test fun `ambiguous batch response and replay notify once and ack each original`() {
@@ -145,6 +307,7 @@ class FamilyTransportTest {
         val notifications = mutableListOf<String>()
         var time = 1_000_000L
         var oldPeer = false
+        var oldSender = false
         fun advance() { time += 1_200 }
         fun client(id: Long) = TelegramClient("$id:${"a".repeat(32)}", telegram)
         fun transport(id: Long) = FamilyTransport(client(id), stores.getValue(id), room, id, now = { time })
@@ -153,7 +316,7 @@ class FamilyTransportTest {
         fun enqueue(text: String) = FamilyChatMessage(UUID.randomUUID().toString(), room.id, 101, text, "2026-09-29T12:00:00Z")
             .also { channel(101).enqueue(it) }
         fun sync(id: Long) {
-            val transport = if (oldPeer && id == 202L) null else transport(id)
+            val transport = if (oldPeer && id == 202L || oldSender && id == 101L) null else transport(id)
             TelegramExchange(client(id), stores.getValue(id), 0, "child", now = { time }, familyChat = channel(id, transport),
                 transport = transport).synchronize()
         }

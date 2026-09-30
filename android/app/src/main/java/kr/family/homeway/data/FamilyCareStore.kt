@@ -8,6 +8,15 @@ interface FamilyCareStore {
         FamilyCareStateMetadata(it.epoch, it.revision, it.authoritative)
     }
     fun saveState(state: FamilyCareState)
+    /** Bounded repair history; permanent event identities must never be pruned with it. */
+    fun saveDelta(delta: FamilyCareDelta) = Unit
+    fun deltas(roomId: String, childId: Long, epoch: String, afterRevision: Long, limit: Int): List<FamilyCareDelta> = emptyList()
+    /** Keep the original durable until every compatible replacement has been acknowledged. */
+    fun replacePacket(original: FamilyCareOutgoing, replacements: List<FamilyCareOutgoing>) = Unit
+    fun hasReplacement(roomId: String, packetId: String, peerId: Long): Boolean = false
+    fun packetsNeedingCompatibility(roomId: String, peerId: Long, limit: Int): List<FamilyCareOutgoing> =
+        pendingPackets(roomId).filter { it.peerId == peerId && !hasReplacement(roomId, it.packetId, peerId) &&
+            runCatching { org.json.JSONObject(it.text).optString("type") in setOf("care_delta", "care_sync") }.getOrDefault(false) }.take(limit)
     /** Replay identities are independent of the bounded display projection. */
     fun eventDigest(roomId: String, childId: Long, eventId: String): String? =
         state(roomId, childId)?.state?.optJSONObject("appliedEventIds")?.optString(eventId)?.takeIf { it.isNotEmpty() }

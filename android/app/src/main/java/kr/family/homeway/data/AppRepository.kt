@@ -72,7 +72,9 @@ class AppRepository internal constructor(context: Context, private val clientFac
     private fun careEngine(active: FamilyChatRoom = checkNotNull(room), client: TelegramClient = clientFactory(vault.get()),
         checkActive: () -> Unit = {}, transport: FamilyTransport? = null) =
         FamilyCareEngine(client, store.familyCare, active, selfBotId, lock = dataLock, checkActive = checkActive,
-            transport = transport)
+            transport = transport, canSyncDeltas = { peer ->
+                FamilyTransport.supportsCareDeltas(store, active.id, peer, System.currentTimeMillis())
+            })
     fun careSnapshot(childId: Long? = selectedCareChildId): FamilySnapshot? = synchronized(dataLock) {
         val active = room ?: return@synchronized null
         if (!careEnabled || childId == null) return@synchronized null
@@ -299,6 +301,12 @@ class AppRepository internal constructor(context: Context, private val clientFac
                     TelegramPollWakeup.signal()
                 },
                 onPollCompleted = { poll?.let(TelegramChatReceiveCadence::onPollCompleted) },
+                onPollProgress = TelegramChatReceiveCadence::onPollProgress,
+                pendingOutgoingWork = { synchronized(dataLock) {
+                    store.hasQueuedLegacyEvents() || activeRoom?.let { active ->
+                        store.familyChat.hasPendingDeliveries(active.id) || store.familyCare.hasPendingPackets(active.id)
+                    } == true
+                } },
                 pollAllowed = { !scheduled || (poll != null && TelegramChatReceiveCadence.isCurrent(poll)) },
                 familyCare = if (careEnabled) careEngine(client = client, checkActive = { coroutineContext.ensureActive() },
                     transport = transport) else null,
@@ -308,7 +316,8 @@ class AppRepository internal constructor(context: Context, private val clientFac
                     AppDiagnostics.record(app, "telegram.private_delivery", it.message)
                 })
             val exchanged = if (poll == null) exchange.flushOutgoing() else exchange.synchronize(
-                if (!scheduled) timeout else if (poll.visible) timeout.coerceIn(0, TelegramChatReceiveSchedule.FOREGROUND_POLL_SECONDS) else 0)
+                if (!scheduled) timeout else if (poll.catchingUp) 0 else if (poll.visible)
+                    timeout.coerceIn(0, TelegramChatReceiveSchedule.FOREGROUND_POLL_SECONDS) else 0)
             if (exchanged) prefs.edit().apply {
                 val failure = pendingDeliveryError()
                 if (failure == null) remove("connectionError") else putString("connectionError", failure)

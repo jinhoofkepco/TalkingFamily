@@ -42,6 +42,9 @@ class TelegramReceiveService : Service() {
     @Volatile private var failedCycles = 0L
     @Volatile private var consecutiveFailures = 0L
     @Volatile private var waitReason = "not_started"
+    @Volatile private var catchUpActive = false
+    @Volatile private var catchUpPolls = 0
+    @Volatile private var catchUpCooldownMillis = 0L
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) { stop(this); return START_NOT_STICKY }
@@ -96,6 +99,10 @@ class TelegramReceiveService : Service() {
                         // Long polling already waited. Only fast returns need pacing, including
                         // empty replies and a repository exchange skipped by a racing backoff.
                         val receiveDelay = repo.receiveDelayMillis()
+                        val catchUp = TelegramChatReceiveCadence.catchUpState()
+                        catchUpActive = catchUp.active
+                        catchUpPolls = catchUp.polls
+                        catchUpCooldownMillis = catchUp.cooldownRemainingMillis
                         nextPollDeadline = SystemClock.elapsedRealtime() + receiveDelay
                         val outgoingRetry = minOf(repo.outgoingRecheckDelayMillis() ?: Long.MAX_VALUE,
                             if (repo.hasPending()) OUTBOX_RECHECK_MILLIS else Long.MAX_VALUE)
@@ -103,8 +110,10 @@ class TelegramReceiveService : Service() {
                             else (TelegramChatReceiveSchedule.MIN_CYCLE_MILLIS -
                                 (SystemClock.elapsedRealtime() - startedAt)).coerceAtLeast(0)
                         waitReason = when {
+                            catchUp.active && receiveDelay <= 0 -> "catch_up_pacing"
                             receiveDelay <= 0 -> "foreground_pacing"
                             outgoingRetry < receiveDelay -> "outbox_recheck"
+                            catchUp.active -> "catch_up_deadline"
                             else -> "receive_deadline"
                         }
                         // A completed cycle may have flushed outgoing work only, or skipped for a
@@ -160,6 +169,7 @@ class TelegramReceiveService : Service() {
         writer.println("lastExchangeAttemptAgeMillis=${age(lastExchangeAttemptAt)} lastSuccessfulCycleAgeMillis=${age(lastSuccessfulCycleAt)}")
         writer.println("waitReason=$waitReason backoffRemainingMillis=$backoff nextPollDelayMillis=$nextPoll")
         writer.println("failedCycles=$failedCycles consecutiveFailures=$consecutiveFailures")
+        writer.println("catchUpActive=$catchUpActive catchUpPolls=$catchUpPolls catchUpCooldownMillis=$catchUpCooldownMillis")
         writer.println("cycleSuccessDoesNotProvePollOrDelivery=true")
     }
     companion object {

@@ -56,6 +56,77 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
         return read() ?: state(roomId, childId)?.let { FamilyCareStateMetadata(it.epoch, it.revision, it.authoritative) }
     }
 
+    override fun saveDelta(delta: FamilyCareDelta) = transaction {
+        // Validate persisted rows exactly as wire input; an existing revision is immutable.
+        val body = delta.json()
+        FamilyCareDelta.parse(delta.roomId, delta.childId, body)
+        val db = owner.writableDatabase
+        val args = arrayOf(delta.roomId, delta.childId.toString(), delta.epoch, delta.revision.toString())
+        val old = db.rawQuery("SELECT delta FROM family_care_deltas WHERE room_id=? AND child_id=? AND epoch=? AND revision=?", args)
+            .use { if (it.moveToFirst()) JSONObject(it.getString(0)) else null }
+        require(old == null || FamilyCareValidation.digest(old) == FamilyCareValidation.digest(body)) { "같은 순서의 변경 기록이 달라요." }
+        db.insertWithOnConflict("family_care_deltas", null, ContentValues().apply {
+            put("room_id", delta.roomId); put("child_id", delta.childId); put("epoch", delta.epoch)
+            put("revision", delta.revision); put("delta", body.toString())
+        }, SQLiteDatabase.CONFLICT_IGNORE)
+        // This table is a repair cache. The independent financial replay index remains untouched.
+        db.delete("family_care_deltas", "room_id=? AND child_id=? AND (epoch<>? OR revision<=?)",
+            arrayOf(delta.roomId, delta.childId.toString(), delta.epoch, (delta.revision - FamilyCareDelta.HISTORY_LIMIT).toString()))
+        Unit
+    }
+
+    override fun deltas(roomId: String, childId: Long, epoch: String, afterRevision: Long, limit: Int): List<FamilyCareDelta> {
+        require(afterRevision >= 0 && limit in 1..FamilyCareDelta.HISTORY_LIMIT)
+        return owner.readableDatabase.rawQuery("SELECT delta FROM family_care_deltas WHERE room_id=? AND child_id=? AND epoch=? " +
+            "AND revision>? ORDER BY revision LIMIT $limit", arrayOf(roomId, childId.toString(), epoch, afterRevision.toString()))
+            .use { rows -> buildList { while (rows.moveToNext()) add(FamilyCareDelta.parse(roomId, childId, JSONObject(rows.getString(0)))) } }
+    }
+
+    override fun hasReplacement(roomId: String, packetId: String, peerId: Long): Boolean = owner.readableDatabase.rawQuery(
+        "SELECT 1 FROM family_care_replacements WHERE room_id=? AND original_id=? AND peer_id=? LIMIT 1",
+        arrayOf(roomId, packetId, peerId.toString())).use { it.moveToFirst() }
+
+    override fun packetsNeedingCompatibility(roomId: String, peerId: Long, limit: Int): List<FamilyCareOutgoing> =
+        packetQuery(roomId, " AND d.peer_id=? AND p.packet_type IN ('care_delta','care_sync')", arrayOf(peerId.toString()), limit, skipReplaced = true)
+
+    override fun replacePacket(original: FamilyCareOutgoing, replacements: List<FamilyCareOutgoing>) = transaction {
+        require(replacements.isNotEmpty() && replacements.all { it.roomId == original.roomId && it.childId == original.childId &&
+            it.peerId == original.peerId && it.packetId != original.packetId })
+        require(pendingPacket(original.roomId, original.packetId, original.peerId)?.digest == original.digest)
+        require(!hasReplacement(original.roomId, original.packetId, original.peerId))
+        val source = JSONObject(original.text)
+        val envelopes = replacements.map { JSONObject(it.text) }
+        if (source.getString("type") == "care_sync") {
+            require(envelopes.size == 1 && envelopes.single().getString("type") == "sync_request" &&
+                envelopes.single().getJSONObject("body").length() == 0)
+        } else {
+            require(source.getString("type") == "care_delta")
+            val delta = FamilyCareDelta.parse(original.roomId, original.childId, source.getJSONObject("body"))
+            if (delta.event.kind in FamilyCareValidation.telemetryKinds) {
+                val target = envelopes.single().also { require(it.getString("type") == "child_event") }.getJSONObject("body")
+                require(target.getString("epoch") == delta.epoch && target.getLong("revision") == delta.revision &&
+                    TelegramLedger.eventDigest(FamilyEvent.parse(target.getJSONObject("event"))) == TelegramLedger.eventDigest(delta.event))
+            } else {
+                val chunks = envelopes.map { envelope ->
+                    require(envelope.getString("type") == "snapshot_chunk")
+                    FamilyCareSnapshots.parseChunk(original.roomId, original.childId, envelope.getJSONObject("body"))
+                }
+                val first = chunks.first()
+                require(first.epoch == delta.epoch && first.revision >= delta.revision && chunks.size == first.count &&
+                    chunks.map { it.index }.toSet() == (0 until first.count).toSet() &&
+                    chunks.all { it.copy(index = first.index, encoded = first.encoded) == first })
+            }
+        }
+        replacements.forEach { replacement ->
+            require(pendingPacket(replacement.roomId, replacement.packetId, replacement.peerId)?.digest == replacement.digest)
+            owner.writableDatabase.insertOrThrow("family_care_replacements", null, ContentValues().apply {
+                put("room_id", original.roomId); put("original_id", original.packetId); put("peer_id", original.peerId)
+                put("replacement_id", replacement.packetId)
+            })
+        }
+        Unit
+    }
+
     override fun eventDigest(roomId: String, childId: Long, eventId: String): String? = owner.readableDatabase.rawQuery(
         "SELECT digest FROM family_care_event_ids WHERE room_id=? AND child_id=? AND event_id=?",
         arrayOf(roomId, childId.toString(), eventId)
@@ -174,14 +245,18 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
         packetQuery(roomId, " AND p.id=? AND d.peer_id=?", arrayOf(packetId, peerId.toString()), 1).firstOrNull()
 
     override fun pendingPackets(roomId: String, peerId: Long, limit: Int): List<FamilyCareOutgoing> =
-        packetQuery(roomId, " AND d.peer_id=?", arrayOf(peerId.toString()), limit)
+        packetQuery(roomId, " AND d.peer_id=?", arrayOf(peerId.toString()), limit, skipReplaced = true)
 
-    private fun packetQuery(roomId: String, condition: String, arguments: Array<String>, limit: Int): List<FamilyCareOutgoing> {
-        require(limit in 1..1000)
+    private fun packetQuery(roomId: String, condition: String, arguments: Array<String>, limit: Int, skipReplaced: Boolean = false): List<FamilyCareOutgoing> {
+        require(limit in 1..FamilyCareDelta.HISTORY_LIMIT)
+        val replacementFilter = if (skipReplaced) " AND NOT EXISTS(SELECT 1 FROM family_care_replacements r WHERE " +
+            "r.room_id=d.room_id AND r.original_id=d.packet_id AND r.peer_id=d.peer_id)" else ""
+        val priority = if (skipReplaced) "CASE WHEN EXISTS(SELECT 1 FROM family_care_replacements r WHERE " +
+            "r.room_id=d.room_id AND r.replacement_id=d.packet_id AND r.peer_id=d.peer_id) THEN 0 ELSE 1 END," else ""
         return owner.readableDatabase.rawQuery(
             "SELECT p.id,p.child_id,d.peer_id,p.text,p.digest,d.sent_at,d.send_confirmed FROM family_care_deliveries d " +
                 "JOIN family_care_packets p ON d.room_id=p.room_id AND d.packet_id=p.id " +
-                "WHERE d.room_id=? AND d.completed=0$condition ORDER BY p.rowid,d.peer_id LIMIT $limit",
+                "WHERE d.room_id=? AND d.completed=0$condition$replacementFilter ORDER BY ${priority}p.rowid,d.peer_id LIMIT $limit",
             arrayOf(roomId, *arguments)).use { rows -> buildList { while (rows.moveToNext()) add(FamilyCareOutgoing(roomId,
                 rows.getString(0), rows.getLong(1), rows.getLong(2), rows.getString(3), rows.getString(4), rows.getLong(5), rows.getInt(6) == 1)) } }
     }
@@ -220,6 +295,7 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
             "AND EXISTS(SELECT 1 FROM family_care_packets p WHERE p.room_id=? AND p.id=? AND p.digest=?)",
             arrayOf(roomId, packetId, peerId, roomId, packetId, digest))
         pruneCompletedPayload(owner.writableDatabase, roomId, packetId)
+        completeReplacedPackets(owner.writableDatabase, roomId, peerId)
     }
 
     override fun queueReceipt(receipt: FamilyCareReceipt) = transaction {
@@ -430,6 +506,15 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
             db.execSQL("CREATE TABLE family_care_settings (name TEXT PRIMARY KEY,value TEXT NOT NULL)")
             db.execSQL("INSERT INTO family_care_settings(name,value) VALUES('movement_zone',?)", arrayOf(ZoneId.systemDefault().id))
             createOptimizationTables(db)
+            upgradeToV8(db)
+        }
+
+        internal fun upgradeToV8(db: SQLiteDatabase) {
+            db.execSQL("CREATE TABLE IF NOT EXISTS family_care_deltas (room_id TEXT NOT NULL,child_id INTEGER NOT NULL,epoch TEXT NOT NULL," +
+                "revision INTEGER NOT NULL,delta TEXT NOT NULL,PRIMARY KEY(room_id,child_id,epoch,revision))")
+            db.execSQL("CREATE TABLE IF NOT EXISTS family_care_replacements (room_id TEXT NOT NULL,original_id TEXT NOT NULL,peer_id INTEGER NOT NULL," +
+                "replacement_id TEXT NOT NULL,PRIMARY KEY(room_id,original_id,peer_id,replacement_id))")
+            db.execSQL("CREATE INDEX IF NOT EXISTS family_care_replacement_ack ON family_care_replacements(room_id,peer_id,replacement_id)")
         }
 
         /** Schema work is cheap. Old JSON is migrated lazily by state() on the repository IO path. */
@@ -489,10 +574,24 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
             }, "room_id=? AND id=?", arrayOf(roomId, packetId))
         }
 
+        private fun completeReplacedPackets(db: SQLiteDatabase, roomId: String, peerId: Long) {
+            val completed = db.rawQuery("SELECT DISTINCT r.original_id FROM family_care_replacements r WHERE r.room_id=? AND r.peer_id=? " +
+                "AND NOT EXISTS(SELECT 1 FROM family_care_replacements x LEFT JOIN family_care_deliveries d ON " +
+                "d.room_id=x.room_id AND d.packet_id=x.replacement_id AND d.peer_id=x.peer_id WHERE " +
+                "x.room_id=r.room_id AND x.original_id=r.original_id AND x.peer_id=r.peer_id AND (d.completed IS NULL OR d.completed=0))",
+                arrayOf(roomId, peerId.toString())).use { rows -> buildList { while (rows.moveToNext()) add(rows.getString(0)) } }
+            for (originalId in completed) {
+                db.update("family_care_deliveries", ContentValues().apply { put("completed", 1) },
+                    "room_id=? AND packet_id=? AND peer_id=?", arrayOf(roomId, originalId, peerId.toString()))
+                pruneCompletedPayload(db, roomId, originalId)
+                db.delete("family_care_replacements", "room_id=? AND original_id=? AND peer_id=?", arrayOf(roomId, originalId, peerId.toString()))
+            }
+        }
+
         internal fun clearTables(db: SQLiteDatabase) {
             listOf("family_care_states", "family_care_outcomes", "family_care_commands", "family_care_received", "family_care_deliveries", "family_care_packets",
                 "family_care_receipts", "family_care_peer_state", "family_care_chunks", "family_care_errors", "family_care_movement",
-                "family_care_settings", "family_care_event_ids").forEach { db.delete(it, null, null) }
+                "family_care_settings", "family_care_event_ids", "family_care_deltas", "family_care_replacements").forEach { db.delete(it, null, null) }
         }
     }
 }

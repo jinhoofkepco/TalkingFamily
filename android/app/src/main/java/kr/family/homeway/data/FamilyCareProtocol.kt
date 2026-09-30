@@ -44,8 +44,8 @@ object FamilyCareProtocol {
             FamilyChatValidation.botId(json.opt("actorId")) != sender || !edge(room, ownBotId, sender, child)) return null
         val type = json.getString("type")
         when (type) {
-            "command", "sync_request" -> if (ownBotId != child || !FamilyCareValidation.isParent(room, sender)) return null
-            "snapshot_chunk", "outcome", "child_event" -> if (sender != child || !FamilyCareValidation.isParent(room, ownBotId)) return null
+            "command", "sync_request", "care_sync" -> if (ownBotId != child || !FamilyCareValidation.isParent(room, sender)) return null
+            "snapshot_chunk", "outcome", "child_event", "care_delta" -> if (sender != child || !FamilyCareValidation.isParent(room, ownBotId)) return null
             "care_ack" -> Unit
             else -> return null
         }

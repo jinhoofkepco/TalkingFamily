@@ -16,6 +16,8 @@ class FamilyChatExchange(
     private val transport: FamilyTransport? = null,
 ) {
     private val room = FamilyChatValidation.room(room)
+    var receivedAcknowledgements: Int = 0
+        private set
     init { require(this.room.members.any { it.botId == ownBotId }) { "이 휴대폰이 가족 명단에 없어요." } }
 
     /** Used by the repository; inserting locally and snapshotting all recipients is one durable write. */
@@ -37,7 +39,7 @@ class FamilyChatExchange(
             val prior = store.chatMessage(room.id, message.id)
             // Conflicting identities receive no ACK. A retry must never overwrite accepted text.
             if (prior != null && prior.digest != message.digest) return null
-            if (prior != null) transport?.noteReplayedPacket(message.senderId)
+            if (prior != null) transport?.noteReplayedPacket(message.senderId, message.id)
             if (prior == null) store.insertChatMessage(message, emptyList())
             store.queueChatReceipt(FamilyChatReceipt(room.id, message.id, message.senderId, message.digest))
             return message.takeIf { prior == null }
@@ -49,6 +51,8 @@ class FamilyChatExchange(
             if (delivery != null && delivery.sentAt > 0) {
                 store.acknowledgeChat(room.id, receipt.messageId, receipt.peerId)
                 store.setChatPeerRetryAfter(room.id, receipt.peerId, 0)
+                transport?.noteAcknowledgedPacket(receipt.peerId, receipt.messageId)
+                receivedAcknowledgements++
             }
         }
         return null
@@ -65,6 +69,11 @@ class FamilyChatExchange(
                         it.sentAt == 0L || now() - it.sentAt >= 30_000
                     } == true)
         }
+    }
+
+    fun hasReadyReceipts(): Boolean = synchronized(lock) {
+        room.members.any { it.botId != ownBotId && store.chatPeerRetryAfter(room.id, it.botId) <= now() &&
+            store.firstChatReceipt(room.id, it.botId) != null }
     }
 
     /** Each recipient has an independent FIFO and retry deadline; no offline family member blocks another. */
@@ -107,19 +116,21 @@ class FamilyChatExchange(
 
     private fun flushTransport(member: FamilyChatMember, transport: FamilyTransport) {
         val peer = member.botId
-        val receipts = synchronized(lock) { store.chatReceipts(room.id, peer, FamilyTransportProtocol.MAX_PACKETS) }
+        val queuedReceipts = synchronized(lock) { store.chatReceipts(room.id, peer, FamilyTransportProtocol.MAX_PACKETS) }
+        val receipts = queuedReceipts.take(transport.batchableAcknowledgementCount(peer, queuedReceipts.map { it.messageId }))
         if (receipts.isNotEmpty()) transport.send(member, receipts.map(FamilyChatProtocol::receipt),
-            allowBatch = transport.canBatchAcknowledgements(peer), afterSend = { count ->
+            allowBatch = transport.canBatchAcknowledgements(peer, receipts.map { it.messageId }), afterSend = { count ->
             synchronized(lock) { store.transaction { receipts.take(count).forEach(store::removeChatReceipt) } }
         })
         val candidates = synchronized(lock) { store.pendingChatDeliveries(room.id, peer, FamilyTransportProtocol.MAX_PACKETS) }
-        val head = candidates.firstOrNull() ?: return
-        val deliveries = if (head.sentAt == 0L) candidates.takeWhile { it.sentAt == 0L }
-            else if (now() < head.sentAt || now() - head.sentAt >= 30_000) listOf(head) else return
+        if (candidates.isEmpty()) return
+        // A ready head opens a contiguous FIFO window, including attempts saved by older app versions.
+        val deliveries = candidates.takeWhile { it.sentAt == 0L || now() < it.sentAt || now() - it.sentAt >= 30_000 }
+        if (deliveries.isEmpty()) return
         val texts = synchronized(lock) { deliveries.map {
             FamilyChatProtocol.message(checkNotNull(store.chatMessage(room.id, it.messageId)))
         } }
-        transport.send(member, texts, allowBatch = head.sentAt == 0L, beforeSend = { count ->
+        transport.send(member, texts, beforeSend = { count ->
             synchronized(lock) { store.transaction {
                 deliveries.take(count).forEach { store.markChatSent(room.id, it.messageId, peer, now().coerceAtLeast(1)) }
             } }

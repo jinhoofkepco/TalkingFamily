@@ -70,7 +70,8 @@ class TelegramExchangeTest {
         family.child.failCommit = true
         var activity = 0
         val exchange = TelegramExchange(family.childClient, family.child, 202, "guardian", now = { family.time },
-            onNewChatCommitted = { activity++ }, onPollCompleted = { fail("Commit failed") })
+            onNewChatCommitted = { activity++ }, onPollCompleted = { fail("Commit failed") },
+            onPollProgress = { fail("Uncommitted update must not announce backlog progress") })
         assertThrows(IOException::class.java) { exchange.synchronize() }
         assertEquals(0, activity)
         assertEquals(0L, family.child.meta("offset"))
@@ -93,7 +94,8 @@ class TelegramExchangeTest {
             TelegramHttpResponse(200, """{"ok":true,"result":{}}""")
         }
         assertTrue(TelegramExchange(client, store, 202, "guardian",
-            onPollCompleted = { fail("Intentional interruption is not an empty response") }).synchronize(10))
+            onPollCompleted = { fail("Intentional interruption is not an empty response") },
+            onPollProgress = { fail("Intentional interruption is not receive progress") }).synchronize(10))
         assertEquals(listOf("getUpdates", "sendMessage"), methods)
         assertEquals(0L, store.meta("retryAfter"))
         assertEquals(0L, store.meta("offset"))
@@ -141,7 +143,8 @@ class TelegramExchangeTest {
                 assertEquals(message.id, FamilySnapshot.parse(store.cached()).events.single().id)
                 order += "UI"
             }, onNewChatCommitted = { order += "chat committed" },
-            onPollCompleted = { order += "poll complete" }, onReceived = { order += "notification" })
+            onPollCompleted = { order += "poll complete" }, onReceived = { order += "notification" },
+            onPollProgress = { fail("Failed outgoing flush must not bypass its retry deadline") })
         assertThrows(TelegramException::class.java) { exchange.synchronize() }
         assertEquals(listOf("UI", "chat committed", "notification", "poll complete", "receipt HTTP"), order)
     }
@@ -152,6 +155,93 @@ class TelegramExchangeTest {
         family.syncChild()
         assertEquals(2, family.child.receipts().size)
         assertEquals(8, family.telegram.sent.count { it.type == "ack" })
+    }
+
+    @Test fun `full page backlog is announced only after every update and offset is committed`() {
+        val store = MemoryStore()
+        val updates = JSONArray()
+        repeat(100) { index -> updates.put(JSONObject().put("update_id", index + 1)) }
+        val client = TelegramClient("101:${"a".repeat(32)}") { _, method, _, _ ->
+            assertEquals("getUpdates", method)
+            TelegramHttpResponse(200, JSONObject().put("ok", true).put("result", updates).toString())
+        }
+        val progress = mutableListOf<TelegramReceiveProgress>()
+        var commits = 0
+        assertTrue(TelegramExchange(client, store, 0, "guardian", onCommitted = { commits++ },
+            onPollProgress = {
+                assertEquals(101L, store.meta("offset"))
+                assertEquals(100, commits)
+                progress += it
+            }).synchronize())
+        assertEquals(listOf(TelegramReceiveProgress(100)), progress)
+    }
+
+    @Test fun `real pending ACK progress counts once while duplicate ACK and offline pending do not`() {
+        val family = Family()
+        val first = chat("먼저 보낸 대화", "child")
+        family.child.enqueue(first)
+        family.syncChild()
+        family.syncGuardian()
+        family.child.enqueue(chat("다음 대화", "child"))
+        val progress = mutableListOf<TelegramReceiveProgress>()
+        val exchange = TelegramExchange(family.childClient, family.child, 202, "guardian", now = { family.time },
+            onPollProgress = { progress += it })
+        exchange.synchronize()
+        assertEquals(1, progress.last().acknowledgedCount)
+        assertTrue(progress.last().pendingOutgoing)
+        family.guardianClient.send("101", TelegramProtocol.envelope("ack").put("id", first.id).toString())
+        exchange.synchronize()
+        assertEquals(0, progress.last().acknowledgedCount)
+        assertTrue(progress.last().pendingOutgoing)
+        exchange.synchronize()
+        assertEquals(0, progress.last().updateCount)
+        assertEquals(0, progress.last().acknowledgedCount)
+    }
+
+    @Test fun `full replay page below committed offset cannot claim more receive backlog`() {
+        val store = MemoryStore()
+        store.setMeta("offset", 101)
+        val updates = JSONArray()
+        repeat(100) { index -> updates.put(JSONObject().put("update_id", index + 1)) }
+        val client = TelegramClient("101:${"a".repeat(32)}") { _, method, _, _ ->
+            assertEquals("getUpdates", method)
+            TelegramHttpResponse(200, JSONObject().put("ok", true).put("result", updates).toString())
+        }
+        val progress = mutableListOf<TelegramReceiveProgress>()
+        assertTrue(TelegramExchange(client, store, 0, "guardian", onCommitted = { fail("Already committed") },
+            onPollProgress = { progress += it }).synchronize())
+        assertEquals(101L, store.meta("offset"))
+        assertEquals(listOf(TelegramReceiveProgress(0)), progress)
+    }
+
+    @Test fun `remaining ready ACK queue reports backlog and clears after its bounded flush drains`() {
+        val family = Family()
+        repeat(10) { family.child.queueReceipt(UUID.randomUUID().toString()) }
+        val progress = mutableListOf<TelegramReceiveProgress>()
+        val exchange = TelegramExchange(family.childClient, family.child, 202, "guardian", now = { family.time },
+            onPollProgress = { progress += it })
+        exchange.synchronize()
+        assertTrue(progress.last().pendingReceipts)
+        exchange.synchronize()
+        assertFalse(progress.last().pendingReceipts)
+    }
+
+    @Test fun `global Telegram backoff suppresses backlog callbacks and all network until its deadline`() {
+        val family = Family()
+        var progress = 0
+        val exchange = TelegramExchange(family.childClient, family.child, 202, "guardian", now = { family.time },
+            onPollProgress = { progress++ })
+        family.telegram.rateLimitNextPollFor = 101
+        assertThrows(TelegramException::class.java) { exchange.synchronize() }
+        val calls = family.telegram.calls
+        assertEquals(0, progress)
+        family.time += 69_000
+        assertFalse(exchange.synchronize())
+        assertEquals(calls, family.telegram.calls)
+        assertEquals(0, progress)
+        family.time += 1_001
+        assertTrue(exchange.synchronize())
+        assertEquals(1, progress)
     }
 
     @Test fun `ACK keeps retained location and heartbeat received after timeline truncation and restart`() {

@@ -60,6 +60,37 @@ data class FamilyCareOutcome(val roomId: String, val childId: Long, val commandI
     }
 }
 
+/** One committed child revision, independent of the bounded UI and the permanent replay index. */
+data class FamilyCareDelta(val roomId: String, val childId: Long, val epoch: String,
+    val baseRevision: Long, val baseDigest: String, val revision: Long, val resultDigest: String,
+    val event: FamilyEvent) {
+    fun json(): JSONObject = JSONObject().put("epoch", epoch).put("baseRevision", baseRevision)
+        .put("baseDigest", baseDigest).put("revision", revision).put("resultDigest", resultDigest).put("event", event.json())
+    companion object {
+        const val HISTORY_LIMIT = 1024
+        fun projectionDigest(state: FamilyCareState): String = FamilyCareValidation.digest(FamilyCareSnapshots.projection(state.state))
+        fun between(before: FamilyCareState, after: FamilyCareState, event: FamilyEvent): FamilyCareDelta {
+            require(before.roomId == after.roomId && before.childId == after.childId && before.epoch == after.epoch &&
+                after.revision == before.revision + 1)
+            return FamilyCareDelta(after.roomId, after.childId, after.epoch, before.revision, projectionDigest(before),
+                after.revision, projectionDigest(after), event)
+        }
+        fun parse(roomId: String, childId: Long, body: JSONObject): FamilyCareDelta {
+            FamilyChatValidation.keys(body, setOf("epoch", "baseRevision", "baseDigest", "revision", "resultDigest", "event"))
+            val base = FamilyCareValidation.counter(body.opt("baseRevision"))
+            val revision = FamilyCareValidation.counter(body.opt("revision"))
+            require(revision == base + 1)
+            val event = TelegramLedger.validate(FamilyEvent.parse(body.getJSONObject("event")))
+            require((event.kind in FamilyCareValidation.parentKinds && event.sender == "guardian") ||
+                (event.kind in FamilyCareValidation.childKinds + FamilyCareValidation.telemetryKinds && event.sender == "child"))
+            require(event.delivery == "relayed")
+            return FamilyCareDelta(roomId, childId, FamilyChatValidation.identifier(body.getString("epoch")), base,
+                FamilyCareValidation.hash(body.getString("baseDigest")), revision,
+                FamilyCareValidation.hash(body.getString("resultDigest")), event)
+        }
+    }
+}
+
 object FamilyCareValidation {
     val parentRelationships = setOf("mother", "father")
     val childRelationships = setOf("son", "daughter")
@@ -110,6 +141,11 @@ object FamilyCareSnapshots {
     const val MAX_BYTES = 2 * 1024 * 1024
     const val CHUNK_SIZE = 2400
     const val MAX_CHUNKS = 1400
+    fun validateSize(source: FamilyCareState) {
+        require(source.copy(authoritative = false, state = projection(source.state)).json().toString().toByteArray(Charsets.UTF_8).size <= MAX_BYTES) {
+            "칭찬판 기록이 너무 커요. 완료한 사용 요청을 정리해 주세요."
+        }
+    }
     fun projection(state: JSONObject): JSONObject {
         val result = JSONObject().put("stickerBalance", state.optInt("stickerBalance"))
             .put("sharingEnabled", state.optBoolean("sharingEnabled")).put("transport", "telegram").put("pushConfigured", false)

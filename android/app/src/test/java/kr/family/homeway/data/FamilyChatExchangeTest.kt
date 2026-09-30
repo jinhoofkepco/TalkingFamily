@@ -389,6 +389,7 @@ class FamilyChatExchangeTest {
         var dropBatchFrom: Long? = null
         var dropAckFrom: Long? = null
         var rateLimitSendFrom: Long? = null
+        var failCapabilityFrom: Long? = null
         var requireKnownRecipients = false
         val knownPeers = mutableSetOf<Pair<Long, Long>>()
         val usernameIds = listOf(101L, 202L, 303L, 404L).associateBy { "@member${it}_bot" }.toMutableMap()
@@ -435,6 +436,10 @@ class FamilyChatExchangeTest {
                     if (requireKnownRecipients && (from to to) !in knownPeers) return chatNotFound()
                     val text = body.getString("text")
                     val type = JSONObject(text).getString("type")
+                    if (type == "capabilities" && failCapabilityFrom == from) {
+                        failCapabilityFrom = null
+                        return TelegramHttpResponse(400, "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: temporary capability failure\"}")
+                    }
                     if (type == "batch" && dropBatchFrom == from) dropBatchFrom = null
                     else if (type == "chat_ack" && dropAckFrom == from) dropAckFrom = null else inject(from, to, text)
                     if (type == "chat" && loseChatResponseFrom == from) { loseChatResponseFrom = null; throw IOException("lost response") }

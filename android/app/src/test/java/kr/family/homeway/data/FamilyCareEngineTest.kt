@@ -532,6 +532,112 @@ class FamilyCareEngineTest {
             f.engine(parent).currentSnapshot(303)!!.revision)
     }
 
+    @Test fun `malformed authenticated conditional sync is rejected without throwing outside receive loop`() {
+        val f = Family(); f.drain(); f.deltas = true
+        for (field in listOf("epoch", "digest")) {
+            val current = f.engine(303).currentSnapshot(303)!!
+            val body = JSONObject().put("epoch", current.epoch).put("revision", current.revision)
+                .put("digest", FamilyCareDelta.projectionDigest(current)).put(field, 123)
+            val packet = FamilyCareProtocol.envelope(f.room, 101, 303, "care_sync", body)
+            f.stores.getValue(303).transaction { f.engine(303).processUpdate(update(101, packet.toString())) }
+            assertEquals(5, f.engine(303).currentSnapshot(303)!!.snapshot.stickerBalance)
+            assertFalse(f.stores.getValue(303).receipts(f.room.id).any { it.packetId == packet.getString("id") })
+        }
+    }
+
+    @Test fun `unchanged delta capable sync sends no whole board`() {
+        val f = Family(); f.drain(); f.deltas = true; f.http.sent.clear()
+        f.engine(101).requestSync(303); f.drain()
+        assertTrue(f.http.sent.any { JSONObject(it.third).optString("type") == "care_sync" })
+        assertFalse(f.http.sent.any { JSONObject(it.third).optString("type") in setOf("care_delta", "snapshot_chunk") })
+        assertTrue(f.stores.getValue(101).pendingPackets(f.room.id).isEmpty())
+    }
+
+    @Test fun `new parents receive only committed financial changes and identical reward versions`() {
+        val f = Family(); f.drain(); f.deltas = true; f.http.sent.clear()
+        f.engine(101).enqueueCommand(303, "reward_upsert", reward(f.rewardId, "영화", 4)); f.drain()
+        assertEquals(2, f.http.sent.count { JSONObject(it.third).optString("type") == "care_delta" })
+        assertFalse(f.http.sent.any { JSONObject(it.third).optString("type") == "snapshot_chunk" })
+        for (id in listOf(101L, 202L)) {
+            assertEquals("영화", f.engine(id).currentSnapshot(303)!!.snapshot.rewards.single().name)
+            assertEquals(f.engine(303).currentSnapshot(303)!!.rewardVersion(f.rewardId), f.engine(id).currentSnapshot(303)!!.rewardVersion(f.rewardId))
+            assertEquals(FamilyCareDelta.projectionDigest(f.engine(303).currentSnapshot(303)!!), FamilyCareDelta.projectionDigest(f.engine(id).currentSnapshot(303)!!))
+        }
+    }
+
+    @Test fun `missing mixed telemetry and financial revisions repair only missing history`() {
+        val f = Family(); f.drain(); f.deltas = true
+        val position = location(); f.engine(303).emitChildEvent(position)
+        f.engine(202).enqueueCommand(303, "sticker_award", award()); f.sync(202); f.sync(303)
+        f.stores.getValue(303).discardOutgoing(101)
+        // Remove HTTP records already delivered to this paused parent, leaving its projection at revision zero.
+        f.http.discardInbox(101)
+        f.http.sent.clear(); f.engine(101).requestSync(303); f.drain()
+        val repaired = f.http.sent.filter { it.first == 303L && it.second == 101L }.map { JSONObject(it.third).optString("type") }
+        assertEquals(2, repaired.count { it == "care_delta" })
+        assertFalse(repaired.contains("snapshot_chunk"))
+        assertEquals(6, f.engine(101).currentSnapshot(303)!!.snapshot.stickerBalance)
+        assertTrue(f.stores.getValue(101).archived.any { it.second.id == position.id })
+        assertEquals(f.engine(303).currentSnapshot(303)!!.revision, f.engine(101).currentSnapshot(303)!!.revision)
+    }
+
+    @Test fun `history gap falls back to a whole snapshot without losing the committed balance`() {
+        val f = Family(); f.drain(); f.deltas = true
+        repeat(3) { f.engine(202).enqueueCommand(303, "sticker_award", award()); f.sync(202); f.sync(303) }
+        f.stores.getValue(303).discardOutgoing(101); f.http.discardInbox(101)
+        f.stores.getValue(303).discardDelta(1)
+        f.http.sent.clear(); f.engine(101).requestSync(303); f.drain()
+        assertTrue(f.http.sent.any { it.second == 101L && JSONObject(it.third).optString("type") == "snapshot_chunk" })
+        assertEquals(8, f.engine(101).currentSnapshot(303)!!.snapshot.stickerBalance)
+        assertEquals(3L, f.engine(101).currentSnapshot(303)!!.revision)
+    }
+
+    @Test fun `conflicting delta result never applies money and requests a whole checkpoint`() {
+        val f = Family(); f.drain(); f.deltas = true
+        f.engine(202).enqueueCommand(303, "sticker_award", award()); f.sync(202); f.sync(303)
+        val original = f.stores.getValue(303).pendingPackets(f.room.id).first { it.peerId == 101L && JSONObject(it.text).optString("type") == "care_delta" }
+        val changed = JSONObject(original.text).put("id", UUID.randomUUID().toString())
+        changed.getJSONObject("body").put("resultDigest", "0".repeat(64))
+        f.stores.getValue(101).transaction { f.engine(101).processUpdate(update(303, changed.toString())) }
+        assertEquals(5, f.engine(101).currentSnapshot(303)!!.snapshot.stickerBalance)
+        assertEquals(0L, f.engine(101).currentSnapshot(303)!!.revision)
+        assertTrue(f.stores.getValue(101).pendingPackets(f.room.id).any { JSONObject(it.text).optString("type") == "sync_request" })
+        f.drain(); assertEquals(6, f.engine(101).currentSnapshot(303)!!.snapshot.stickerBalance)
+    }
+
+    @Test fun `delta transaction failure rolls back financial state identities and receive cursor`() {
+        val f = Family(); f.drain(); f.deltas = true
+        f.engine(202).enqueueCommand(303, "sticker_award", award()); f.sync(202); f.sync(303)
+        val parent = f.stores.getValue(101); val cursor = parent.meta("offset")
+        parent.failCommit = true
+        assertThrows(IOException::class.java) { f.sync(101) }
+        assertEquals(cursor, parent.meta("offset")); assertEquals(5, f.engine(101).currentSnapshot(303)!!.snapshot.stickerBalance)
+        f.drain(); assertEquals(6, f.engine(101).currentSnapshot(303)!!.snapshot.stickerBalance)
+    }
+
+    @Test fun `old parent continues using ordinary snapshots when other parent supports deltas`() {
+        val f = Family(); f.drain(); f.deltas = true; f.oldCarePeers += 101L; f.http.sent.clear()
+        f.engine(202).enqueueCommand(303, "sticker_award", award()); f.drain()
+        assertTrue(f.http.sent.any { it.second == 202L && JSONObject(it.third).optString("type") == "care_delta" })
+        assertTrue(f.http.sent.any { it.second == 101L && JSONObject(it.third).optString("type") == "snapshot_chunk" })
+        assertFalse(f.http.sent.any { it.second == 101L && JSONObject(it.third).optString("type") == "care_delta" })
+        assertEquals(6, f.engine(101).currentSnapshot(303)!!.snapshot.stickerBalance)
+    }
+
+    @Test fun `pending financial delta downgrades to an acknowledged whole checkpoint without losing originals`() {
+        val f = Family(); f.drain(); f.deltas = true
+        f.engine(202).enqueueCommand(303, "sticker_award", award()); f.sync(202); f.sync(303)
+        val original = f.stores.getValue(303).pendingPackets(f.room.id).first { it.peerId == 101L && JSONObject(it.text).optString("type") == "care_delta" }
+        f.http.discardInbox(101); f.oldCarePeers += 101L; f.batching = true; f.http.sent.clear()
+        f.sync(303)
+        assertNotNull(f.stores.getValue(303).pendingPacket(f.room.id, original.packetId, 101))
+        assertTrue(f.stores.getValue(303).hasReplacement(f.room.id, original.packetId, 101))
+        f.drain(rounds = 150)
+        assertEquals(6, f.engine(101).currentSnapshot(303)!!.snapshot.stickerBalance)
+        assertNull(f.stores.getValue(303).pendingPacket(f.room.id, original.packetId, 101))
+        assertTrue(f.http.sent.any { it.second == 101L && JSONObject(it.third).optString("type") == "snapshot_chunk" })
+    }
+
     private class Family(bootstrap: Boolean = true) {
         val ids = listOf(101L, 202L, 303L, 404L)
         val room = FamilyChatRoom.create("우리집", ids.mapIndexed { index, id -> FamilyChatMember(id, "@care${id}_bot",
@@ -541,7 +647,9 @@ class FamilyCareEngineTest {
         val http = FakeTelegram()
         var time = Instant.parse("2026-09-22T12:00:00Z").toEpochMilli()
         var batching = false
+        var deltas = false
         val oldPeers = mutableSetOf<Long>()
+        val oldCarePeers = mutableSetOf<Long>()
         init {
             if (bootstrap) {
                 val seed = TelegramLedger.emptyState().put("stickerBalance", 5)
@@ -551,7 +659,8 @@ class FamilyCareEngineTest {
             }
         }
         private fun client(id: Long) = TelegramClient("$id:${"x".repeat(32)}", http)
-        fun engine(id: Long, transport: FamilyTransport? = null) = FamilyCareEngine(client(id), stores.getValue(id), room, id, now = { time }, transport = transport)
+        fun engine(id: Long, transport: FamilyTransport? = null) = FamilyCareEngine(client(id), stores.getValue(id), room, id, now = { time }, transport = transport,
+            canSyncDeltas = { deltas && it !in oldCarePeers })
         fun sync(id: Long): Boolean {
             val transport = if (batching && id !in oldPeers) FamilyTransport(client(id), stores.getValue(id), room, id, now = { time }) else null
             return TelegramExchange(client(id), stores.getValue(id), 0, "child", now = { time }, familyCare = engine(id, transport), transport = transport).synchronize()
@@ -573,6 +682,7 @@ class FamilyCareEngineTest {
         fun inject(from: Long, to: Long, text: String) {
             inbox.getOrPut(to) { mutableListOf() }.add(update(from, text).put("update_id", ++sequence))
         }
+        fun discardInbox(id: Long) { inbox.remove(id) }
         override fun execute(token: String, method: String, json: String, timeoutSeconds: Int): TelegramHttpResponse {
             val own = token.substringBefore(':').toLong(); val body = JSONObject(json)
             val result: Any = when (method) {
@@ -612,6 +722,8 @@ class FamilyCareEngineTest {
         private var retry = linkedMapOf<Pair<String, Long>, Long>()
         private var chunks = mutableListOf<FamilyCareChunk>()
         private var errors = linkedMapOf<Pair<String, Long>, String>()
+        private var deltaHistory = mutableListOf<FamilyCareDelta>()
+        private var replacements = linkedMapOf<Triple<String, String, Long>, List<String>>()
         var archived = mutableListOf<Pair<Long, FamilyEvent>>()
         private var meta = linkedMapOf<String, Long>()
         private var legacy = TelegramLedger.emptyState()
@@ -622,6 +734,8 @@ class FamilyCareEngineTest {
             val r = LinkedHashMap(received); val q = outgoing.toMutableList(); val a = receipts.toMutableList()
             val retryCopy = LinkedHashMap(retry); val parts = chunks.toMutableList(); val e = LinkedHashMap(errors)
             val movement = archived.toMutableList(); val m = LinkedHashMap(meta); val l = JSONObject(legacy.toString())
+            val history = deltaHistory.toMutableList()
+            val mappings = LinkedHashMap(replacements)
             try {
                 val value = block()
                 if (failCommit) { failCommit = false; throw IOException("commit failed") }
@@ -629,11 +743,27 @@ class FamilyCareEngineTest {
             } catch (error: Throwable) {
                 states = s; outcomes = o; commands = c; received = r; outgoing = q; receipts = a
                 retry = retryCopy; chunks = parts; errors = e; archived = movement; meta = m; legacy = l
+                deltaHistory = history
+                replacements = mappings
                 throw error
             }
         }
         override fun state(roomId: String, childId: Long) = states[roomId to childId]?.let { it.copy(state = JSONObject(it.state.toString())) }
         override fun saveState(state: FamilyCareState) { states[state.roomId to state.childId] = state.copy(state = JSONObject(state.state.toString())) }
+        override fun saveDelta(delta: FamilyCareDelta) { deltaHistory.add(delta); deltaHistory.removeAll { it.roomId == delta.roomId && it.childId == delta.childId && (it.epoch != delta.epoch || it.revision <= delta.revision - FamilyCareDelta.HISTORY_LIMIT) } }
+        override fun deltas(roomId: String, childId: Long, epoch: String, afterRevision: Long, limit: Int) =
+            deltaHistory.filter { it.roomId == roomId && it.childId == childId && it.epoch == epoch && it.revision > afterRevision }.sortedBy { it.revision }.take(limit)
+        fun discardDelta(revision: Long) { deltaHistory.removeAll { it.revision == revision } }
+        fun discardOutgoing(peer: Long) { outgoing.removeAll { it.peerId == peer } }
+        override fun replacePacket(original: FamilyCareOutgoing, replacements: List<FamilyCareOutgoing>) {
+            this.replacements[Triple(original.roomId, original.packetId, original.peerId)] = replacements.map { it.packetId }
+        }
+        override fun hasReplacement(roomId: String, packetId: String, peerId: Long) = replacements.containsKey(Triple(roomId, packetId, peerId))
+        override fun pendingPackets(roomId: String, peerId: Long, limit: Int): List<FamilyCareOutgoing> {
+            val targets = replacements.filterKeys { it.first == roomId && it.third == peerId }.values.flatten().toSet()
+            return outgoing.filter { it.roomId == roomId && it.peerId == peerId && !hasReplacement(roomId, it.packetId, peerId) }
+                .sortedBy { if (it.packetId in targets) 0 else 1 }.take(limit)
+        }
         override fun outcome(roomId: String, commandId: String) = outcomes[roomId to commandId]
         override fun saveOutcome(outcome: FamilyCareOutcome) { val key = outcome.roomId to outcome.commandId; require(outcomes[key] == null || outcomes[key] == outcome); outcomes[key] = outcome }
         override fun outcomes(roomId: String, childId: Long) = outcomes.values.filter { it.roomId == roomId && it.childId == childId }
@@ -656,6 +786,9 @@ class FamilyCareEngineTest {
         override fun acknowledge(roomId: String, packetId: String, peerId: Long, digest: String) {
             if (failAcknowledge) { failAcknowledge = false; throw IOException("acknowledgement storage failed") }
             outgoing.removeAll { it.roomId == roomId && it.packetId == packetId && it.peerId == peerId && it.digest == digest && it.sentAt > 0 }
+            val completed = replacements.filter { (key, ids) -> key.first == roomId && key.third == peerId &&
+                ids.none { replacementId -> outgoing.any { it.roomId == roomId && it.peerId == peerId && it.packetId == replacementId } } }.keys
+            completed.forEach { key -> outgoing.removeAll { it.roomId == roomId && it.peerId == peerId && it.packetId == key.second }; replacements.remove(key) }
         }
         override fun queueReceipt(receipt: FamilyCareReceipt) { if (receipt !in receipts) receipts.add(receipt) }
         override fun receipts(roomId: String) = receipts.filter { it.roomId == roomId }

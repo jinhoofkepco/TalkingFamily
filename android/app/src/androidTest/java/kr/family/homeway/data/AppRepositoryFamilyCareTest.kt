@@ -92,6 +92,47 @@ class AppRepositoryFamilyCareTest {
             .putBoolean("sharingEnabled", sharing).commit()
     }
 
+    @Test fun preparingCareUsesPersistedNegotiationAndKnownVersionWithoutNetworkCalls() = runBlocking {
+        savedPair(101, "guardian", 103)
+        val known = FamilyCareState(activeRoom.id, 103, UUID.randomUUID().toString(), 8, false,
+            FamilyCareSnapshots.projection(TelegramLedger.emptyState()))
+        store.transaction {
+            store.familyChat.setActiveRoom(activeRoom)
+            store.familyCare.saveState(known)
+            val incoming = JSONObject().put("message", JSONObject()
+                .put("from", JSONObject().put("id", 103).put("is_bot", true))
+                .put("chat", JSONObject().put("id", 103).put("type", "private"))
+                .put("text", FamilyTransportProtocol.careCapability(42, false)))
+            val transport = FamilyTransport(TelegramClient(token(101), fake), store, activeRoom, 101)
+            assertTrue(transport.incoming(incoming)!!.isEmpty())
+        }
+        // Recreate the repository: the decision must come from durable authenticated metadata.
+        newRepository().prepareCare()
+        val packets = store.familyCare.pendingPackets(activeRoom.id).map { JSONObject(it.text) }
+        val son = packets.single { it.getLong("childId") == 103L }
+        assertEquals("care_sync", son.getString("type"))
+        assertEquals(known.epoch, son.getJSONObject("body").getString("epoch"))
+        assertEquals(known.revision, son.getJSONObject("body").getLong("revision"))
+        assertEquals(FamilyCareValidation.digest(FamilyCareSnapshots.projection(known.state)),
+            son.getJSONObject("body").getString("digest"))
+        assertEquals("sync_request", packets.single { it.getLong("childId") == 104L }.getString("type"))
+        assertTrue(fake.methods.isEmpty())
+        assertFalse(repo.sharingEnabled)
+    }
+
+    @Test fun preparingCareKeepsOriginalRequestForPeerWithoutDeltaNegotiation() = runBlocking {
+        savedPair(101, "guardian", 103)
+        store.transaction {
+            store.familyChat.setActiveRoom(activeRoom)
+            store.familyCare.saveState(FamilyCareState(activeRoom.id, 103, UUID.randomUUID().toString(), 8, false,
+                FamilyCareSnapshots.projection(TelegramLedger.emptyState())))
+        }
+        repo.prepareCare()
+        val packets = store.familyCare.pendingPackets(activeRoom.id).map { JSONObject(it.text) }
+        assertTrue(packets.all { it.getString("type") == "sync_request" && it.getJSONObject("body").length() == 0 })
+        assertTrue(fake.methods.isEmpty())
+    }
+
     @Test fun roomOnlyParentsAndChildrenUseTheirRosterRoleAndFamilyMemberHasNoCareAccess() = runBlocking {
         members.forEach { own ->
             clearAccount()

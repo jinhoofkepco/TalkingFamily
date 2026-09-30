@@ -85,6 +85,94 @@ class TelegramDeliverySchedulingTest {
         assertEquals(4_900L, schedule.delayMillis(20_200))
     }
 
+    @Test fun fullPagesAndFinalPartialPageDrainWithoutConsumingTheSavedIdleInterval() {
+        val schedule = TelegramChatReceiveSchedule(false, 0)
+        schedule.onPollCompleted(schedule.beginPoll(), 60_000)
+        schedule.onPollProgress(TelegramReceiveProgress(100), 60_000)
+        assertEquals(1_000L, schedule.delayMillis(60_000))
+        assertTrue(schedule.beginPoll().catchingUp)
+        for ((time, count) in listOf(61_000L to 100, 62_000L to 8, 63_000L to 0, 64_000L to 0)) {
+            schedule.onPollCompleted(schedule.beginPoll(), time)
+            schedule.onPollProgress(TelegramReceiveProgress(count), time)
+        }
+        assertFalse(schedule.catchUpState(64_000).active)
+        assertEquals(56_000L, schedule.delayMillis(64_000))
+        assertEquals(30_000L, schedule.catchUpState(64_000).cooldownRemainingMillis)
+    }
+
+    @Test fun offlineOutgoingAndUnrelatedTelemetryDoNotStartFastReceivePolling() {
+        val schedule = TelegramChatReceiveSchedule(false, 0)
+        schedule.onPollCompleted(schedule.beginPoll(), 60_000)
+        schedule.onPollProgress(TelegramReceiveProgress(0, pendingOutgoing = true), 60_000)
+        schedule.onPollProgress(TelegramReceiveProgress(1, pendingOutgoing = true), 60_001)
+        assertFalse(schedule.catchUpState(60_001).active)
+        assertEquals(59_999L, schedule.delayMillis(60_001))
+    }
+
+    @Test fun confirmationProgressWithRemainingWorkStartsCatchUpButTheFinalAckAloneDoesNot() {
+        val schedule = TelegramChatReceiveSchedule(false, 0)
+        schedule.onPollProgress(TelegramReceiveProgress(1, acknowledgedCount = 1), 60_000)
+        assertFalse(schedule.catchUpState(60_000).active)
+        schedule.onPollProgress(TelegramReceiveProgress(1, acknowledgedCount = 1, pendingOutgoing = true), 60_001)
+        assertTrue(schedule.catchUpState(60_001).active)
+        assertEquals(1_000L, schedule.delayMillis(60_001))
+    }
+
+    @Test fun readyReceiptsDrainQuicklyButNoMoreThanTwentyPollsBeforeCooldown() {
+        val schedule = TelegramChatReceiveSchedule(false, 0)
+        schedule.onPollCompleted(schedule.beginPoll(), 60_000)
+        repeat(TelegramChatReceiveSchedule.CATCH_UP_MAX_POLLS) { round ->
+            val now = 60_000L + round * 1_000L
+            schedule.onPollCompleted(schedule.beginPoll(), now)
+            schedule.onPollProgress(TelegramReceiveProgress(0, pendingReceipts = true), now)
+        }
+        assertFalse(schedule.catchUpState(79_000).active)
+        assertEquals(TelegramChatReceiveSchedule.CATCH_UP_MAX_POLLS, schedule.catchUpState(79_000).polls)
+        schedule.onPollProgress(TelegramReceiveProgress(100), 80_000)
+        assertFalse(schedule.catchUpState(80_000).active)
+        assertEquals(40_000L, schedule.delayMillis(80_000))
+        schedule.onPollProgress(TelegramReceiveProgress(100), 109_000)
+        assertTrue(schedule.catchUpState(109_000).active)
+        assertEquals(1_000L, schedule.delayMillis(109_000))
+    }
+
+    @Test fun slowRequestsOrTelegramBackoffCannotExtendTheThirtySecondCatchUpWindow() {
+        val schedule = TelegramChatReceiveSchedule(false, 0)
+        schedule.onPollCompleted(schedule.beginPoll(), 60_000)
+        schedule.onPollProgress(TelegramReceiveProgress(100), 60_000)
+        assertTrue(schedule.catchUpState(89_999).active)
+        schedule.onPollProgress(TelegramReceiveProgress(100), 90_000)
+        assertFalse(schedule.catchUpState(90_000).active)
+        assertEquals(30_000L, schedule.delayMillis(90_000))
+    }
+
+    @Test fun newChatDuringBacklogKeepsItsFiveSecondDeadlineForAfterTheDrain() {
+        val schedule = TelegramChatReceiveSchedule(false, 0)
+        schedule.onPollCompleted(schedule.beginPoll(), 60_000)
+        schedule.onPollProgress(TelegramReceiveProgress(100), 60_000)
+        schedule.onNewChatCommitted(61_000)
+        for ((time, count) in listOf(62_000L to 3, 63_000L to 0, 64_000L to 0)) {
+            schedule.onPollCompleted(schedule.beginPoll(), time)
+            schedule.onPollProgress(TelegramReceiveProgress(count), time)
+        }
+        assertEquals(2_000L, schedule.delayMillis(64_000))
+        schedule.onPollCompleted(schedule.beginPoll(), 66_000)
+        assertEquals(10_000L, schedule.delayMillis(66_000))
+    }
+
+    @Test fun openAndCloseDuringCatchUpPreserveTheNewBackgroundTransition() {
+        val schedule = TelegramChatReceiveSchedule(false, 0)
+        schedule.onPollProgress(TelegramReceiveProgress(100), 60_000)
+        val stale = schedule.beginPoll()
+        schedule.onVisibilityChanged(true, 60_500)
+        schedule.onVisibilityChanged(false, 61_000)
+        schedule.onPollCompleted(stale, 61_100)
+        schedule.onPollProgress(TelegramReceiveProgress(0), 62_000)
+        schedule.onPollProgress(TelegramReceiveProgress(0), 63_000)
+        assertFalse(schedule.catchUpState(63_000).active)
+        assertEquals(3_000L, schedule.delayMillis(63_000))
+    }
+
     @Test fun workerProcessesTheAckAndNextMessageInOneBoundedRun() = runBlocking {
         var remaining = 3
         var now = 0L

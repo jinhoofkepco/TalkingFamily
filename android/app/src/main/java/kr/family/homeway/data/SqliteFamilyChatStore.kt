@@ -99,6 +99,10 @@ class SqliteFamilyChatStore internal constructor(private val owner: LocalStore) 
             "SELECT 1 FROM family_chat_receipts WHERE room_id=? LIMIT 1", arrayOf(roomId, roomId)
     ).use { it.moveToFirst() }
 
+    fun hasPendingDeliveries(roomId: String): Boolean = owner.readableDatabase.rawQuery(
+        "SELECT 1 FROM family_chat_deliveries WHERE room_id=? AND completed=0 LIMIT 1", arrayOf(roomId)
+    ).use { it.moveToFirst() }
+
     fun pendingPeers(roomId: String): List<Long> = owner.readableDatabase.rawQuery(
         "SELECT peer_id FROM family_chat_deliveries WHERE room_id=? AND completed=0 UNION " +
             "SELECT peer_id FROM family_chat_receipts WHERE room_id=?", arrayOf(roomId, roomId)

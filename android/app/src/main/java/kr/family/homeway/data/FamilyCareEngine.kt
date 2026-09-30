@@ -15,10 +15,13 @@ class FamilyCareEngine(
     private val now: () -> Long = System::currentTimeMillis,
     private val checkActive: () -> Unit = {},
     private val transport: FamilyTransport? = null,
+    private val canSyncDeltas: (Long) -> Boolean = { false },
 ) {
     private val room = FamilyChatValidation.room(room)
     private val parents get() = room.members.filter { FamilyCareValidation.isParent(room, it.botId) }.map { it.botId }
     init { require(this.room.members.any { it.botId == ownBotId }) }
+    var receivedAcknowledgements: Int = 0
+        private set
 
     fun currentSnapshot(childId: Long): FamilyCareState? = synchronized(lock) {
         store.state(room.id, childId)?.let { it.copy(state = JSONObject(it.state.toString())) }
@@ -98,8 +101,11 @@ class FamilyCareEngine(
             }
             val next = current.copy(revision = nextRevision(current), state = TelegramLedger.apply(current.state, event))
             val body = JSONObject().put("epoch", next.epoch).put("revision", next.revision).put("event", event.json())
+            val delta = FamilyCareDelta.between(current, next, event)
+            // Live telemetry keeps its established v4 form; history can repair financial gaps with deltas.
             val packets = parents.map { FamilyCareProtocol.outgoing(room, ownBotId, ownBotId, it, "child_event", body) }
             store.saveState(next)
+            store.saveDelta(delta)
             store.archiveEvent(room.id, ownBotId, event)
             packets.forEach(store::queuePacket)
             next
@@ -126,9 +132,11 @@ class FamilyCareEngine(
             val nextState = TelegramLedger.apply(current.state, event)
             bumpRewardVersion(nextState, event.kind, event.payload)
             val next = current.copy(revision = nextRevision(current), state = nextState)
-            val chunks = FamilyCareSnapshots.chunks(next)
+            FamilyCareSnapshots.validateSize(next)
             store.saveState(next)
-            queueSnapshot(chunks, parents)
+            val delta = FamilyCareDelta.between(current, next, event)
+            store.saveDelta(delta)
+            queueCommittedChange(next, delta)
             return true
         } catch (_: IllegalArgumentException) {
             store.setError(room.id, ownBotId, "기존 1:1 칭찬 기록과 가족 칭찬판이 달라요. 기존 연결의 미전달 기록을 확인해 주세요.")
@@ -150,12 +158,14 @@ class FamilyCareEngine(
             if (pending != null && pending.childId == packet.childId && pending.digest == digest && pending.sentAt > 0) {
                 store.acknowledge(room.id, packet.id, packet.actorId, digest)
                 store.setRetryAfter(room.id, packet.actorId, 0)
+                transport?.noteAcknowledgedPacket(packet.actorId, packet.id)
+                receivedAcknowledgements++
             }
             return
         }
         val prior = store.receivedDigest(room.id, packet.id)
         if (prior != null && prior != packet.digest) return
-        if (prior != null) transport?.noteReplayedPacket(packet.actorId)
+        if (prior != null) transport?.noteReplayedPacket(packet.actorId, packet.id)
         if (prior == null) {
             val accepted = try {
                 when (packet.type) {
@@ -173,6 +183,8 @@ class FamilyCareEngine(
                         require(state.authoritative)
                         queueSnapshot(FamilyCareSnapshots.chunks(state), listOf(packet.actorId))
                     }
+                    "care_sync" -> receiveSyncRequest(packet)
+                    "care_delta" -> receiveDelta(FamilyCareDelta.parse(room.id, packet.childId, packet.body))
                     "snapshot_chunk" -> receiveChunk(FamilyCareSnapshots.parseChunk(room.id, packet.childId, packet.body))
                     "outcome" -> {
                         val outcome = FamilyCareOutcome.parse(packet.body)
@@ -225,7 +237,7 @@ class FamilyCareEngine(
         }
         val current = store.state(room.id, input.childId) ?: ensureAuthority()
         require(input.childId == ownBotId && current.authoritative)
-        var chunks: List<FamilyCareChunk>? = null
+        var delta: FamilyCareDelta? = null
         var next: FamilyCareState? = null
         val failure = try {
             val command = FamilyCareValidation.command(room, input)
@@ -237,7 +249,8 @@ class FamilyCareEngine(
             val nextState = if (alreadyApplied) current.state else TelegramLedger.apply(current.state, event)
             if (!alreadyApplied) bumpRewardVersion(nextState, event.kind, event.payload)
             next = current.copy(revision = if (alreadyApplied) current.revision else nextRevision(current), state = nextState)
-            chunks = FamilyCareSnapshots.chunks(next!!)
+            FamilyCareSnapshots.validateSize(next!!)
+            if (!alreadyApplied) delta = FamilyCareDelta.between(current, next!!, event)
             null
         } catch (error: IllegalArgumentException) { error.message?.take(240) ?: "이 요청을 처리할 수 없어요." }
         catch (_: org.json.JSONException) { "요청 형식을 확인하지 못했어요. 칭찬판에서 다시 시도해 주세요." }
@@ -245,11 +258,12 @@ class FamilyCareEngine(
             current.epoch, next?.revision?.takeIf { failure == null } ?: current.revision, failure == null, failure)
         if (failure == null) {
             store.saveState(next!!)
+            delta?.let(store::saveDelta)
             store.setError(room.id, input.childId, null)
         }
         store.saveOutcome(outcome)
         queueOutcome(outcome)
-        if (failure == null) queueSnapshot(chunks!!, parents)
+        if (failure == null) queueCommittedChange(next!!, delta)
         return outcome
     }
 
@@ -308,15 +322,107 @@ class FamilyCareEngine(
         store.saveState(current.copy(revision = revision, state = if (duplicate) current.state else TelegramLedger.apply(current.state, event)))
     }
 
+    private fun receiveSyncRequest(packet: FamilyCareProtocol.Packet) {
+        FamilyChatValidation.keys(packet.body, setOf("epoch", "revision", "digest"))
+        val epoch = packet.body.opt("epoch").let { if (it == JSONObject.NULL) null else { require(it is String); FamilyChatValidation.identifier(it) } }
+        val revision = FamilyCareValidation.counter(packet.body.opt("revision"))
+        val digest = packet.body.opt("digest").let { if (it == JSONObject.NULL) null else { require(it is String); FamilyCareValidation.hash(it) } }
+        require((epoch == null) == (digest == null) && (epoch != null || revision == 0L))
+        val state = store.state(room.id, ownBotId) ?: ensureAuthority()
+        require(state.authoritative)
+        val currentDigest = FamilyCareDelta.projectionDigest(state)
+        if (epoch == state.epoch && revision == state.revision && digest == currentDigest) return
+        val missing = state.revision - revision
+        val history = if (canSyncDeltas(packet.actorId) && epoch == state.epoch && missing in 1..FamilyCareDelta.HISTORY_LIMIT.toLong())
+            store.deltas(room.id, ownBotId, state.epoch, revision, FamilyCareDelta.HISTORY_LIMIT) else emptyList()
+        var expectedRevision = revision
+        var expectedDigest = digest
+        val contiguous = history.size.toLong() == missing && history.all { delta ->
+            val matches = delta.baseRevision == expectedRevision && delta.baseDigest == expectedDigest
+            expectedRevision = delta.revision
+            expectedDigest = delta.resultDigest
+            matches
+        } && expectedRevision == state.revision && expectedDigest == currentDigest
+        val packets = if (contiguous) history.map { deltaPacket(it, packet.actorId) } else emptyList()
+        if (contiguous && packets.all { it != null }) packets.forEach { store.queuePacket(requireNotNull(it)) }
+        else queueSnapshot(FamilyCareSnapshots.chunks(state), listOf(packet.actorId))
+    }
+
+    private fun receiveDelta(delta: FamilyCareDelta) {
+        val current = store.state(room.id, delta.childId)
+        require(current?.authoritative != true)
+        if (current == null) { queueSync(delta.childId, forceSnapshot = true); return }
+        if (current.epoch != delta.epoch) { epochError(delta.childId); return }
+        if (delta.revision <= current.revision) {
+            // A full snapshot may have overtaken an older delta; its authenticated timeline is still useful.
+            alreadyApplied(current, delta.event)
+            if (delta.revision == current.revision && FamilyCareDelta.projectionDigest(current) != delta.resultDigest) {
+                store.setError(room.id, delta.childId, "같은 순서의 칭찬 기록이 달라요. 가족 연결을 확인해 주세요.")
+                queueSync(delta.childId, forceSnapshot = true)
+                return
+            }
+            store.recordEventDigest(room.id, delta.childId, delta.event.id, TelegramLedger.eventDigest(delta.event))
+            store.archiveEvent(room.id, delta.childId, delta.event)
+            return
+        }
+        if (delta.baseRevision != current.revision) { queueSync(delta.childId); return }
+        if (delta.baseDigest != FamilyCareDelta.projectionDigest(current)) {
+            store.setError(room.id, delta.childId, "칭찬판의 기준 기록이 달라요. 전체 기록을 다시 확인하고 있어요.")
+            queueSync(delta.childId, forceSnapshot = true)
+            return
+        }
+        if (alreadyApplied(current, delta.event)) {
+            store.setError(room.id, delta.childId, "이미 반영한 변경 기록의 순서가 달라요. 전체 기록을 다시 확인하고 있어요.")
+            queueSync(delta.childId, forceSnapshot = true)
+            return
+        }
+        val applied = TelegramLedger.apply(current.state, delta.event)
+        bumpRewardVersion(applied, delta.event.kind, delta.event.payload)
+        val projected = FamilyCareSnapshots.projection(applied)
+        if (FamilyCareValidation.digest(projected) != delta.resultDigest) {
+            store.setError(room.id, delta.childId, "변경 기록의 결과가 달라요. 전체 기록을 다시 확인하고 있어요.")
+            queueSync(delta.childId, forceSnapshot = true)
+            return
+        }
+        // Replay identities are persisted separately, even though the parent projection is bounded.
+        projected.put("appliedEventIds", applied.optJSONObject("appliedEventIds") ?: JSONObject())
+        store.saveState(current.copy(revision = delta.revision, state = projected))
+        store.recordEventDigest(room.id, delta.childId, delta.event.id, TelegramLedger.eventDigest(delta.event))
+        store.archiveEvent(room.id, delta.childId, delta.event)
+        store.setError(room.id, delta.childId, null)
+    }
+
     private fun archiveProjection(state: FamilyCareState) {
         state.snapshot.events.filter { it.kind in FamilyCareValidation.telemetryKinds }.distinctBy { it.id }
             .forEach { store.archiveEvent(room.id, state.childId, it) }
     }
 
-    private fun queueSync(childId: Long) {
+    private fun queueSync(childId: Long, forceSnapshot: Boolean = false) {
         require(FamilyCareValidation.isParent(room, ownBotId) && FamilyCareValidation.isChild(room, childId))
         if (store.hasPendingKind(room.id, childId, "sync_request")) return
-        store.queuePacket(FamilyCareProtocol.outgoing(room, ownBotId, childId, childId, "sync_request", JSONObject()))
+        if (!forceSnapshot && canSyncDeltas(childId)) {
+            if (store.hasPendingKind(room.id, childId, "care_sync")) return
+            val current = store.state(room.id, childId)
+            val body = JSONObject().put("epoch", current?.epoch ?: JSONObject.NULL).put("revision", current?.revision ?: 0L)
+                .put("digest", current?.let(FamilyCareDelta::projectionDigest) ?: JSONObject.NULL)
+            store.queuePacket(FamilyCareProtocol.outgoing(room, ownBotId, childId, childId, "care_sync", body))
+        } else store.queuePacket(FamilyCareProtocol.outgoing(room, ownBotId, childId, childId, "sync_request", JSONObject()))
+    }
+
+    private fun deltaPacket(delta: FamilyCareDelta, peer: Long): FamilyCareOutgoing? = runCatching {
+        FamilyCareProtocol.outgoing(room, ownBotId, delta.childId, peer, "care_delta", delta.json())
+    }.getOrNull()
+
+    private fun queueCommittedChange(state: FamilyCareState, delta: FamilyCareDelta?) {
+        var chunks: List<FamilyCareChunk>? = null
+        for (peer in parents) {
+            val packet = delta?.takeIf { canSyncDeltas(peer) }?.let { deltaPacket(it, peer) }
+            if (packet != null) store.queuePacket(packet)
+            else {
+                if (chunks == null) chunks = FamilyCareSnapshots.chunks(state)
+                queueSnapshot(requireNotNull(chunks), listOf(peer))
+            }
+        }
     }
 
     private fun queueSnapshot(chunks: List<FamilyCareChunk>, recipients: List<Long>) {
@@ -378,6 +484,10 @@ class FamilyCareEngine(
         }
     }
 
+    fun hasReadyReceipts(): Boolean = synchronized(lock) {
+        store.pendingPeers(room.id).any { peer -> store.retryAfter(room.id, peer) <= now() && store.firstReceipt(room.id, peer) != null }
+    }
+
     /** Confirmed HTTP sends may await ACK together; an ambiguous attempt blocks everything after it. */
     private fun nextSendable(packets: List<FamilyCareOutgoing>, sentThisFlush: Set<String> = emptySet()): FamilyCareOutgoing? {
         for (packet in packets.take(MAX_UNACKNOWLEDGED_PER_PEER)) {
@@ -428,17 +538,20 @@ class FamilyCareEngine(
 
     private fun flushTransport(member: FamilyChatMember, transport: FamilyTransport) {
         val peer = member.botId
-        val receipts = synchronized(lock) { store.receipts(room.id, peer, FamilyTransportProtocol.MAX_PACKETS) }
+        synchronized(lock) { store.transaction { prepareCompatibilityFallbacks(peer, transport) } }
+        val queuedReceipts = synchronized(lock) { store.receipts(room.id, peer, FamilyTransportProtocol.MAX_PACKETS) }
+        val receipts = queuedReceipts.take(transport.batchableAcknowledgementCount(peer, queuedReceipts.map { it.packetId }))
         if (receipts.isNotEmpty()) transport.send(member, receipts.map { FamilyCareProtocol.receipt(room, ownBotId, it) },
-            allowBatch = transport.canBatchAcknowledgements(peer), afterSend = { count ->
+            allowBatch = transport.canBatchAcknowledgements(peer, receipts.map { it.packetId }), afterSend = { count ->
             synchronized(lock) { store.transaction { receipts.take(count).forEach(store::removeReceipt) } }
         })
         val candidates = synchronized(lock) { store.pendingPackets(room.id, peer, MAX_UNACKNOWLEDGED_PER_PEER) }
         val first = nextSendable(candidates) ?: return
-        // Previously attempted envelopes retry separately: an old/downgraded app must never lose them.
-        val packets = if (first.sentAt == 0L) candidates.dropWhile { it.packetId != first.packetId }.takeWhile { it.sentAt == 0L }
-            else listOf(first)
-        transport.send(member, packets.map { it.text }, allowBatch = first.sentAt == 0L, beforeSend = { count ->
+        // Preserve FIFO, but include every due original in a retry batch. The transport independently
+        // falls back for peers that stop acknowledging batches, without changing original identities.
+        val packets = candidates.dropWhile { it.packetId != first.packetId }
+            .takeWhile { it.sentAt == 0L || now() - it.sentAt >= RETRY_MILLIS }
+        transport.send(member, packets.map { it.text }, allowBatch = true, beforeSend = { count ->
             synchronized(lock) { store.transaction {
                 packets.take(count).forEach { store.markSent(room.id, it.packetId, peer, now().coerceAtLeast(1)) }
             } }
@@ -447,6 +560,33 @@ class FamilyCareEngine(
                 packets.take(count).forEach { store.markSendConfirmed(room.id, it.packetId, peer) }
             } }
         })
+    }
+
+    private fun prepareCompatibilityFallbacks(peer: Long, transport: FamilyTransport) {
+        val originals = store.packetsNeedingCompatibility(room.id, peer, FamilyCareDelta.HISTORY_LIMIT)
+            .filter { !canSyncDeltas(peer) || (it.sentAt > 0 && now() - it.sentAt >= RETRY_MILLIS && transport.shouldFallbackCarePacket(peer, it.packetId)) }
+        if (originals.isEmpty()) return
+        transport.noteCareDeltaFallback(peer)
+        val checkpoints = mutableMapOf<Long, List<FamilyCareOutgoing>>()
+        for (original in originals) {
+            val json = JSONObject(original.text)
+            val replacements = if (json.optString("type") == "care_sync") {
+                listOf(FamilyCareProtocol.outgoing(room, ownBotId, original.childId, peer, "sync_request", JSONObject()))
+            } else {
+                val delta = FamilyCareDelta.parse(room.id, original.childId, json.getJSONObject("body"))
+                if (delta.event.kind in FamilyCareValidation.telemetryKinds) {
+                    listOf(FamilyCareProtocol.outgoing(room, ownBotId, delta.childId, peer, "child_event", JSONObject()
+                        .put("epoch", delta.epoch).put("revision", delta.revision).put("event", delta.event.json())))
+                } else checkpoints.getOrPut(delta.childId) {
+                    val state = requireNotNull(store.state(room.id, delta.childId))
+                    require(state.authoritative && state.epoch == delta.epoch && state.revision >= delta.revision)
+                    FamilyCareSnapshots.chunks(state).map { chunk -> FamilyCareProtocol.outgoing(room, ownBotId,
+                        delta.childId, peer, "snapshot_chunk", FamilyCareSnapshots.chunkJson(chunk)) }
+                }
+            }
+            replacements.forEach(store::queuePacket)
+            store.replacePacket(original, replacements)
+        }
     }
 
     companion object {

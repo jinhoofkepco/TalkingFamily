@@ -10,7 +10,7 @@ import java.time.LocalDate
 import java.time.ZoneId
 
 class LocalStore internal constructor(context: Context, databaseName: String = "homeway.db") :
-    SQLiteOpenHelper(context, databaseName, null, 7), TelegramExchangeStore {
+    SQLiteOpenHelper(context, databaseName, null, 8), TelegramExchangeStore {
     val familyChat = SqliteFamilyChatStore(this)
     val familyCare = SqliteFamilyCareStore(this)
     override fun onCreate(db: SQLiteDatabase) {
@@ -61,6 +61,7 @@ class LocalStore internal constructor(context: Context, databaseName: String = "
         else if (oldVersion < 6) db.execSQL("ALTER TABLE family_care_deliveries ADD COLUMN " +
             "send_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(send_confirmed IN (0,1))")
         if (oldVersion < 7) SqliteFamilyCareStore.upgradeToV7(db)
+        if (oldVersion < 8) SqliteFamilyCareStore.upgradeToV8(db)
     }
     private fun createTelegramTables(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE telegram_receipts (id TEXT PRIMARY KEY)")
@@ -113,6 +114,12 @@ class LocalStore internal constructor(context: Context, databaseName: String = "
     }
     fun hasPendingLegacy(): Boolean = readableDatabase.rawQuery(
         "SELECT 1 FROM outbox WHERE status='pending' UNION ALL SELECT 1 FROM telegram_receipts LIMIT 1", null
+    ).use { it.moveToFirst() }
+    fun hasQueuedLegacyReceipts(): Boolean = readableDatabase.rawQuery(
+        "SELECT 1 FROM telegram_receipts LIMIT 1", null
+    ).use { it.moveToFirst() }
+    fun hasQueuedLegacyEvents(): Boolean = readableDatabase.rawQuery(
+        "SELECT 1 FROM outbox WHERE status='pending' LIMIT 1", null
     ).use { it.moveToFirst() }
     fun localEvents(): List<FamilyEvent> = readableDatabase.rawQuery("SELECT event,status,error FROM outbox ORDER BY rowid", null).use { c ->
         buildList { while (c.moveToNext()) add(FamilyEvent.parse(JSONObject(c.getString(0))).copy(

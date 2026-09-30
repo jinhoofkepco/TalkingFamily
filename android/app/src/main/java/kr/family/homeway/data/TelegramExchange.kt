@@ -37,6 +37,8 @@ internal class TelegramExchange(
     private val onPollCompleted: () -> Unit = {},
     private val pollAllowed: () -> Boolean = { true },
     private val transport: FamilyTransport? = null,
+    private val onPollProgress: (TelegramReceiveProgress) -> Unit = {},
+    private val pendingOutgoingWork: () -> Boolean = { store.pending().isNotEmpty() },
 ) {
     private val legacyWindow = TelegramLegacyWindow(store, now)
     /** Caller serializes network runs; returns false when the persisted Telegram backoff is still active. */
@@ -64,6 +66,10 @@ internal class TelegramExchange(
                 JSONArray()
             }
             checkActive()
+            val acknowledgementsBefore = (familyChat?.receivedAcknowledgements ?: 0) +
+                (familyCare?.receivedAcknowledgements ?: 0)
+            var legacyAcknowledgements = 0
+            var committedUpdates = 0
             for (i in 0 until updates.length()) {
                 checkActive()
                 val update = updates.getJSONObject(i)
@@ -113,6 +119,7 @@ internal class TelegramExchange(
                                     }
                                     store.cache(state)
                                     legacyWindow.acknowledge(packet.id!!)
+                                    legacyAcknowledgements++
                                 }
                             }
                         }
@@ -122,7 +129,10 @@ internal class TelegramExchange(
                         committed = true
                     }
                 }
-                if (committed) onCommitted()
+                if (committed) {
+                    committedUpdates++
+                    onCommitted()
+                }
                 // Notify at the commit boundary: a later notification or receipt failure must not
                 // erase the new-message deadline. Duplicates and non-chat packets do not reset it.
                 if (received.any { it.kind == "chat" } || chatReceived.isNotEmpty()) onNewChatCommitted()
@@ -131,6 +141,17 @@ internal class TelegramExchange(
             }
             if (!interrupted) onPollCompleted()
             flushAll()
+            if (!interrupted) {
+                val progress = synchronized(lock) {
+                    TelegramReceiveProgress(committedUpdates, legacyAcknowledgements +
+                        (familyChat?.receivedAcknowledgements ?: 0) + (familyCare?.receivedAcknowledgements ?: 0) -
+                        acknowledgementsBefore,
+                        pendingReceipts = (peerId > 0 && store.meta("legacyRetryAfter") <= now() && store.receipts().isNotEmpty()) ||
+                            familyChat?.hasReadyReceipts() == true || familyCare?.hasReadyReceipts() == true,
+                        pendingOutgoing = pendingOutgoingWork())
+                }
+                onPollProgress(progress)
+            }
             return true
         } catch (error: TelegramException) {
             recordBackoff(error)
