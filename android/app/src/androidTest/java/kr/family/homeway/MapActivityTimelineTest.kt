@@ -8,7 +8,6 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.width
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.test.platform.app.InstrumentationRegistry
 import android.graphics.Bitmap
 import java.io.File
@@ -172,11 +171,14 @@ class MapActivityTimelineTest {
     }
 
     private fun saveTimelinePreview(name: String) {
-        val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val image = compose.onRoot().captureToImage().asAndroidBitmap()
-        File(context.getExternalFilesDir(null), "timeline-$name-0.6.10.png").outputStream().use {
-            check(image.compress(Bitmap.CompressFormat.PNG, 100, it))
-        }
+        compose.waitForIdle()
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val image = checkNotNull(instrumentation.uiAutomation.takeScreenshot()) { "Synthetic timeline screenshot is unavailable." }
+        try {
+            File(instrumentation.targetContext.getExternalFilesDir(null), "timeline-$name-0.6.10.png").outputStream().use {
+                check(image.compress(Bitmap.CompressFormat.PNG, 100, it))
+            }
+        } finally { image.recycle() }
     }
 
     @Test fun verticalWithoutGpsStillHasVisibleTimeControlsAndDoesNotPretendToHaveALocation() {
