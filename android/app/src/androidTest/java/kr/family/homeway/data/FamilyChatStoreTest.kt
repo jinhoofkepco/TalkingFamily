@@ -62,7 +62,7 @@ class FamilyChatStoreTest {
             db.version = 3
         }
         val migrated = store()
-        assertEquals(7, migrated.readableDatabase.version)
+        assertEquals(8, migrated.readableDatabase.version)
         assertEquals(cached.toString(), migrated.cached()!!.toString())
         assertEquals(8492L, migrated.meta("offset"))
         assertEquals(129L, migrated.meta("sentAt"))
