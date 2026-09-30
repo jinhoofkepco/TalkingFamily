@@ -7,6 +7,91 @@ import java.io.IOException
 import java.util.UUID
 
 class FamilyTransportTest {
+    @Test fun `large backlog uses one bounded document and acknowledges every original`() {
+        val h = Harness(); h.confirmFiles()
+        val messages = (1..128).map { h.enqueue("압축 파일 기록 $it") }
+        h.sync(101); h.sync(202)
+        assertEquals(1, h.telegram.documentRequests.count { it.sender == 101L })
+        val document = h.telegram.documentRequests.single { it.sender == 101L }
+        assertEquals(128, JSONObject(document.caption).getInt("count"))
+        assertEquals(messages.map { it.id }.toSet(), h.stores.getValue(202).chatHistory(h.room.id, limit = 200).messages.map { it.id }.toSet())
+        repeat(12) { h.advance(); h.sync(101); h.sync(202) }
+        assertTrue(h.stores.getValue(101).pendingChatDeliveries(h.room.id).isEmpty())
+        assertEquals(128, h.notifications.size)
+        assertTrue(h.telegram.sendRequests.none { it.sender == 101L && JSONObject(it.text).optString("type") == "chat" })
+    }
+
+    @Test fun `downgraded document peer falls back to original texts after bounded missing ACKs`() {
+        val h = Harness(); h.confirmFiles()
+        val messages = (1..40).map { h.enqueue("파일을 모르는 구버전 $it") }
+        h.oldPeer = true
+        repeat(200) { h.sync(101); h.sync(202); h.advance() }
+        assertEquals(2, h.telegram.documentRequests.count { it.sender == 101L })
+        assertTrue(h.stores.getValue(101).pendingChatDeliveries(h.room.id).isEmpty())
+        assertEquals(messages.map { it.id }.toSet(), h.stores.getValue(202).chatHistory(h.room.id).messages.map { it.id }.toSet())
+        assertEquals(messages.map { it.digest }, h.telegram.sendRequests.filter {
+            it.sender == 101L && JSONObject(it.text).optString("type") == "chat"
+        }.map { FamilyChatMessage.parse(JSONObject(it.text).getJSONObject("message")).digest })
+    }
+
+    @Test fun `document fallback survives per-original bookkeeping eviction`() {
+        val h = Harness(); h.confirmFiles()
+        val member = h.room.members.single { it.botId == 202L }
+        val texts = (1..128).map { FamilyChatProtocol.message(h.enqueue("원본 슬롯 $it")) }
+        assertEquals(128, h.transport(101).send(member, texts))
+        h.time += 31_000
+        assertEquals(128, h.transport(101).send(member, texts))
+        val transport = h.transport(101)
+        repeat(128) { transport.noteReplayedPacket(202, UUID.randomUUID().toString()) }
+        h.time += 31_000
+        val recovered = h.transport(101)
+        assertTrue(recovered.send(member, texts) in 1..16)
+        assertFalse(recovered.supportsFiles(202))
+        assertEquals(2, h.telegram.documentRequests.count { it.sender == 101L })
+    }
+
+    @Test fun `healthy incoming files cannot cancel missing outbound ACK fallback`() {
+        val h = Harness(); h.confirmFiles()
+        val member = h.room.members.single { it.botId == 202L }
+        val texts = (1..40).map { FamilyChatProtocol.message(h.enqueue("외부 수신 확인 $it")) }
+        assertEquals(40, h.transport(101).send(member, texts))
+        h.time += 31_000
+        assertEquals(40, h.transport(101).send(member, texts))
+        val incoming = FamilyDocumentProtocol.encode(List(17) { FamilyChatProtocol.message(FamilyChatMessage(
+            UUID.randomUUID().toString(), h.room.id, 202, "반대 방향 파일 $it", "2026-09-29T12:00:00Z")) }, h.room.id, 202, 101)!!
+        val update = update(202, "").also { it.getJSONObject("message").apply {
+            remove("text"); put("caption", incoming.caption); put("document", JSONObject().put("file_id", "inbound_file").put("file_size", incoming.bytes.size))
+        } }
+        fun receiveProof() {
+            val transport = h.transport(101)
+            val prepared = transport.prepareDocument(update)!!
+            val originals = FamilyDocumentProtocol.decode(prepared, incoming.bytes, h.room, 101)
+            h.stores.getValue(101).transaction { transport.noteDownloadedDocument(prepared, originals) }
+        }
+        receiveProof()
+        h.time += 31_000
+        val transport = h.transport(101)
+        assertTrue(transport.send(member, texts) in 1..16)
+        assertFalse(transport.supportsFiles(202))
+        receiveProof()
+        assertFalse(h.transport(101).supportsFiles(202))
+        assertEquals(2, h.telegram.documentRequests.count { it.sender == 101L })
+    }
+
+    @Test fun `backwards wall clock cannot strand unacknowledged document fallback`() {
+        val h = Harness(); h.confirmFiles()
+        val member = h.room.members.single { it.botId == 202L }
+        val texts = (1..17).map { FamilyChatProtocol.message(h.enqueue("시계 변경 뒤에도 $it")) }
+        assertEquals(17, h.transport(101).send(member, texts))
+        h.time -= 10_000
+        assertEquals(17, h.transport(101).send(member, texts))
+        h.advance()
+        val transport = h.transport(101)
+        assertTrue(transport.send(member, texts) in 1..16)
+        assertFalse(transport.supportsFiles(202))
+        assertEquals(2, h.telegram.documentRequests.count { it.sender == 101L })
+    }
+
     @Test fun `ten queued chats use one batch and one ack batch with original identities`() {
         val h = Harness(); h.confirm()
         val messages = (1..10).map { h.enqueue("메시지 $it") }
@@ -327,6 +412,16 @@ class FamilyTransportTest {
                 transport.flushControls(true)
             }
             advance(); sync(101); sync(202); advance(); telegram.sendRequests.clear()
+        }
+        fun confirmFiles() {
+            for ((own, peer) in listOf(101L to 202L, 202L to 101L)) {
+                for (control in listOf(FamilyTransportProtocol.capability(42, false), FamilyTransportProtocol.careCapability(43, false),
+                    FamilyTransportProtocol.fileCapability(44, false), FamilyTransportProtocol.latestCapability(45, false))) {
+                    val transport = transport(own)
+                    transport.incoming(update(peer, control)); transport.flushControls(true); advance()
+                }
+            }
+            sync(101); sync(202); advance(); telegram.sendRequests.clear(); telegram.documentRequests.clear()
         }
     }
     companion object {

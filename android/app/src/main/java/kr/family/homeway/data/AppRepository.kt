@@ -74,6 +74,8 @@ class AppRepository internal constructor(context: Context, private val clientFac
         FamilyCareEngine(client, store.familyCare, active, selfBotId, lock = dataLock, checkActive = checkActive,
             transport = transport, canSyncDeltas = { peer ->
                 FamilyTransport.supportsCareDeltas(store, active.id, peer, System.currentTimeMillis())
+            }, canSendLatestLocation = { peer ->
+                FamilyTransport.supportsLatestLocation(store, active.id, peer, System.currentTimeMillis())
             })
     fun careSnapshot(childId: Long? = selectedCareChildId): FamilySnapshot? = synchronized(dataLock) {
         val active = room ?: return@synchronized null
@@ -122,6 +124,9 @@ class AppRepository internal constructor(context: Context, private val clientFac
             carePending = selected?.let { engine!!.hasPending(it) } ?: false,
             careStatus = selected?.let { engine!!.status(it) },
             sharingEnabled = sharingEnabled, trackingStatus = trackingStatus, connectionError = connectionError,
+            latestLocation = if (useCare && selected != null) store.familyCare.latestLocationHead(active!!.id, selected)?.event?.copy(
+                roomId = active.id, senderId = selected,
+                senderName = active.members.firstOrNull { it.botId == selected }?.displayName) else null,
         )
     }
     fun carePending(childId: Long? = selectedCareChildId): Boolean = synchronized(dataLock) {
@@ -302,6 +307,9 @@ class AppRepository internal constructor(context: Context, private val clientFac
                 },
                 onPollCompleted = { poll?.let(TelegramChatReceiveCadence::onPollCompleted) },
                 onPollProgress = TelegramChatReceiveCadence::onPollProgress,
+                onInvalidDocument = {
+                    AppDiagnostics.record(app, "telegram.document_invalid", "압축 기록 수신을 완료하지 못해 원본 재전송을 기다립니다.")
+                },
                 pendingOutgoingWork = { synchronized(dataLock) {
                     store.hasQueuedLegacyEvents() || activeRoom?.let { active ->
                         store.familyChat.hasPendingDeliveries(active.id) || store.familyCare.hasPendingPackets(active.id)

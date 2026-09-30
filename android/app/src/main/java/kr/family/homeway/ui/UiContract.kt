@@ -17,6 +17,7 @@ data class UiState(
     val notice: String? = null,
     val events: List<FamilyEvent> = emptyList(),
     val locationHistory: List<FamilyEvent> = emptyList(),
+    val latestLocation: FamilyEvent? = null,
     val historyDays: List<String> = emptyList(),
     val historyDay: String = LocalDate.now().toString(),
     val historyHasMore: Boolean = false,

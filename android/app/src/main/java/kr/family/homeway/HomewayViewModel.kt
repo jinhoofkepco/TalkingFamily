@@ -18,6 +18,7 @@ import kr.family.homeway.data.MovementHistoryDates
 import kr.family.homeway.tracking.CurrentLocationProvider
 import kr.family.homeway.tracking.TrackingService
 import kr.family.homeway.ui.UiState
+import kr.family.homeway.ui.LocationMapDisplay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -156,7 +157,8 @@ class HomewayViewModel internal constructor(
                             ?: FamilySnapshot.parse(kr.family.homeway.data.TelegramLedger.emptyState()) else snapshot
                         LocalProjection(local, snapshot, visible,
                             if (local.demoMode) visible.events else visible.events.filter { it.kind != "chat" },
-                            FamilyNotifications.soundEnabled(getApplication()), soundRevision)
+                            FamilyNotifications.soundEnabled(getApplication()), soundRevision,
+                            LocationMapDisplay.latest(visible.events, local.latestLocation))
                     }
                     if (generation == projectionGeneration && requestedRevision == projectionRequestRevision && uiActive) {
                         applyProjection(projection, errorForRead, forcePrivate, forceRoom)
@@ -187,6 +189,7 @@ class HomewayViewModel internal constructor(
         val events: List<FamilyEvent>,
         val soundEnabled: Boolean,
         val soundRevision: Long,
+        val latestLocation: FamilyEvent?,
     )
 
     private fun applyProjection(projection: LocalProjection, error: String?, forcePrivateChat: Boolean, forceRoomChat: Boolean) {
@@ -215,6 +218,7 @@ class HomewayViewModel internal constructor(
             botUsername=local.botUsername, peerBotUsername=local.peerBotUsername,
             events=if (identityChanged) emptyList() else old.events,
             locationHistory=if (identityChanged) emptyList() else old.locationHistory,
+            latestLocation=projection.latestLocation,
             historyDays=if (identityChanged) emptyList() else old.historyDays,
             stickerBalance=visible.stickerBalance, redemptions=visible.redemptions,
             paired=local.paired || local.demoMode, room=activeRoom, selfBotId=local.selfBotId,
@@ -415,7 +419,7 @@ class HomewayViewModel internal constructor(
         eventsGeneration++; eventsJob?.cancel()
         baseEvents = emptyList()
         mutableState.update { it.copy(events = emptyList(), rewards = emptyList(), redemptions = emptyList(),
-            stickerBalance = 0, careReady = false, carePending = false, careStatus = null) }
+            latestLocation = null, stickerBalance = 0, careReady = false, carePending = false, careStatus = null) }
         resetHistorySelection()
     }
     fun sendChat(text:String) {

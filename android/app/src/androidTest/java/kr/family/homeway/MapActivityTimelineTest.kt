@@ -3,6 +3,8 @@ package kr.family.homeway
 import androidx.activity.ComponentActivity
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.semantics.SemanticsActions
 import kr.family.homeway.data.FamilyEvent
 import kr.family.homeway.ui.HomewayApp
 import kr.family.homeway.ui.UiActions
@@ -14,6 +16,54 @@ import org.junit.Test
 /** Synthetic local records only; no account, sensors, or Telegram transport is started. */
 class MapActivityTimelineTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
+
+    @Test fun liveLocationIsVisibleWhileHistoricalPageIsStillLoading() {
+        compose.setContent {
+            HomewayApp(UiState(role = "guardian", configured = true, demoMode = true, needsOnboarding = false,
+                latestLocation = record("live", 15, "walking"), historyLoading = true,
+                historyDay = "2026-09-22"), noActions())
+        }
+        compose.onNodeWithTag("location-list").performScrollToNode(hasTestTag("map-timeline-controls"))
+        compose.onNodeWithTag("embedded-location-map").assertExists()
+        compose.onNodeWithTag("map-selected-activity").assertTextEquals("걷는 중 추정")
+        compose.onNodeWithTag("map-vertical-no-location").assertDoesNotExist()
+    }
+
+    @Test fun manualHistoricalSelectionStaysFixedWhenANewerLivePointArrives() {
+        val shown = mutableStateOf(UiState(role = "guardian", configured = true, demoMode = true,
+            needsOnboarding = false, locationHistory = listOf(record("five", 5, "still"), record("ten", 10, "still")),
+            latestLocation = record("live", 15, "walking"), historyDay = "2026-09-22"))
+        compose.setContent { HomewayApp(shown.value, noActions()) }
+        compose.onNodeWithTag("location-list").performScrollToNode(hasTestTag("map-timeline-controls"))
+        compose.onNodeWithContentDescription("이전 시각의 위치").performClick()
+        compose.onNodeWithTag("map-selected-activity").assertTextEquals("정지 추정 · 약 10분")
+        compose.runOnIdle { shown.value = shown.value.copy(latestLocation = record("new-live", 20, "running")) }
+        compose.onNodeWithTag("map-selected-activity").assertTextEquals("정지 추정 · 약 10분")
+        compose.onNodeWithText("최신", useUnmergedTree = true).performClick()
+        compose.onNodeWithTag("map-selected-activity").assertTextEquals("달리는 중 추정")
+    }
+
+    @Test fun manuallyPinnedLivePointSurvivesAnEmptyHistoryRefreshAndANewerLiveHead() {
+        val shown = mutableStateOf(UiState(role = "guardian", configured = true, demoMode = true,
+            needsOnboarding = false, locationHistory = listOf(record("old", 5, "still")),
+            latestLocation = record("live", 15, "walking"), historyDay = "2026-09-22"))
+        compose.setContent { HomewayApp(shown.value, noActions()) }
+        compose.onNodeWithTag("location-list").performScrollToNode(hasTestTag("map-timeline-controls"))
+        // A continuous slider value rounds to the visible live record without selecting an older point.
+        compose.onNodeWithTag("map-time-slider").performSemanticsAction(SemanticsActions.SetProgress) { it(0.9f) }
+        compose.onNodeWithTag("map-selected-activity").assertTextEquals("걷는 중 추정")
+        compose.runOnIdle { shown.value = shown.value.copy(locationHistory = emptyList(), historyLoading = true,
+            latestLocation = record("new-live", 20, "running")) }
+        compose.onNodeWithTag("embedded-location-map").assertExists()
+        compose.onNodeWithTag("map-selected-activity").assertTextEquals("걷는 중 추정")
+        compose.onNodeWithText("최신", useUnmergedTree = true).performClick()
+        compose.onNodeWithTag("map-selected-activity").assertTextEquals("달리는 중 추정")
+    }
+
+    private fun noActions() = UiActions(configure = { _, _, _ -> }, startDemo = {}, sendChat = {},
+        shareCurrentLocation = {}, awardSticker = {}, requestRedemption = {}, saveReward = { _, _, _ -> },
+        deleteReward = {}, approveRedemption = { _, _ -> }, setSharing = {}, refresh = {}, clearNotice = {},
+        resetConfiguration = {}, switchDemoRole = {})
 
     @Test fun selectedHistoricalRecordControlsDwellAndMovingStateInsideMap() {
         val records = listOf(record("five", 5, "still"), record("ten", 10, "still"), record("moving", 15, "walking"))

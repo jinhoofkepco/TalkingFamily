@@ -47,8 +47,8 @@ android {
         applicationId = "kr.family.homeway"
         minSdk = 26
         targetSdk = 35
-        versionCode = 21
-        versionName = "0.6.8"
+        versionCode = 22
+        versionName = "0.6.9"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     signingConfigs {

@@ -39,6 +39,7 @@ internal class TelegramExchange(
     private val transport: FamilyTransport? = null,
     private val onPollProgress: (TelegramReceiveProgress) -> Unit = {},
     private val pendingOutgoingWork: () -> Boolean = { store.pending().isNotEmpty() },
+    private val onInvalidDocument: () -> Unit = {},
 ) {
     private val legacyWindow = TelegramLegacyWindow(store, now)
     /** Caller serializes network runs; returns false when the persisted Telegram backoff is still active. */
@@ -66,20 +67,62 @@ internal class TelegramExchange(
                 JSONArray()
             }
             checkActive()
+            // A later authenticated live location can be displayed even when an earlier history
+            // document is temporarily unavailable. This never advances the receive cursor or board.
+            if (familyCare != null) for (i in 0 until updates.length()) {
+                checkActive()
+                val update = updates.getJSONObject(i)
+                if (update.optLong("update_id", -1) < synchronized(lock) { store.meta("offset") }) continue
+                val previews = transport?.latestPreviewUpdates(update) ?: listOf(update).filter(::isLatestPreview)
+                for (preview in previews) {
+                    val changed = synchronized(lock) { store.transaction { familyCare.processLatestPreview(preview) } }
+                    if (changed) onCommitted()
+                }
+            }
             val acknowledgementsBefore = (familyChat?.receivedAcknowledgements ?: 0) +
                 (familyCare?.receivedAcknowledgements ?: 0)
             var legacyAcknowledgements = 0
             var committedUpdates = 0
+            var downloadedDocuments = 0
+            var hasMoreUpdates = false
             for (i in 0 until updates.length()) {
                 checkActive()
                 val update = updates.getJSONObject(i)
                 val updateId = update.optLong("update_id", -1)
+                if (updateId < synchronized(lock) { store.meta("offset") }) continue
+                // No file request, decompression or JSON parsing may hold the SQLite/data lock.
+                val prepared = transport?.prepareDocument(update)
+                if (prepared != null && downloadedDocuments >= MAX_DOCUMENTS_PER_EXCHANGE) {
+                    hasMoreUpdates = (i until updates.length()).any { index ->
+                        updates.getJSONObject(index).optLong("update_id", -1) >= synchronized(lock) { store.meta("offset") }
+                    }
+                    break
+                }
+                var documentRejected = false
+                val downloaded = if (prepared == null) null else {
+                    downloadedDocuments++
+                    try { checkNotNull(transport).downloadDocument(prepared) }
+                    catch (_: InvalidFamilyDocumentException) { documentRejected = true; null }
+                    catch (error: TelegramException) {
+                        // A permanently unavailable history file must not hide later plaintext
+                        // fallback forever. The sender keeps every original until its own ACK.
+                        if (!recordBlockedDownloadFailure(updateId, error)) throw error
+                        documentRejected = true
+                        null
+                    }
+                }
+                checkActive()
                 val received = mutableListOf<FamilyEvent>()
                 val chatReceived = mutableListOf<FamilyChatMessage>()
                 var committed = false
                 synchronized(lock) {
                     if (updateId >= store.meta("offset")) store.transaction {
-                        val originals = if (transport == null) listOf(update) else transport.incoming(update).orEmpty()
+                        val originals = if (prepared != null) {
+                            if (downloaded == null) emptyList() else {
+                                checkNotNull(transport).noteDownloadedDocument(prepared, downloaded)
+                                downloaded
+                            }
+                        } else if (transport == null) listOf(update) else transport.incoming(update).orEmpty()
                         for (original in originals) {
                         familyChat?.processUpdate(original)?.let(chatReceived::add)
                         familyCare?.processUpdate(original)
@@ -126,12 +169,14 @@ internal class TelegramExchange(
                         }
                         // Persist state, dedup identities, receipt and offset as one atomic write.
                         store.setMeta("offset", updateId + 1)
+                        clearPastBlockedDownload()
                         committed = true
                     }
                 }
                 if (committed) {
                     committedUpdates++
                     onCommitted()
+                    if (documentRejected) onInvalidDocument()
                 }
                 // Notify at the commit boundary: a later notification or receipt failure must not
                 // erase the new-message deadline. Duplicates and non-chat packets do not reset it.
@@ -148,7 +193,7 @@ internal class TelegramExchange(
                         acknowledgementsBefore,
                         pendingReceipts = (peerId > 0 && store.meta("legacyRetryAfter") <= now() && store.receipts().isNotEmpty()) ||
                             familyChat?.hasReadyReceipts() == true || familyCare?.hasReadyReceipts() == true,
-                        pendingOutgoing = pendingOutgoingWork())
+                        pendingOutgoing = pendingOutgoingWork(), hasMoreUpdates = hasMoreUpdates)
                 }
                 onPollProgress(progress)
             }
@@ -176,8 +221,43 @@ internal class TelegramExchange(
         store.setMeta("retryAfter", now() + (error.retryAfterSeconds ?: 15).toLong() * 1000)
     }
 
+    /** Only eligible file-I/O failures consume this one durable retry slot. */
+    private fun recordBlockedDownloadFailure(updateId: Long, error: TelegramException): Boolean {
+        if (error.operation !in setOf(TelegramOperation.FILE_INFO, TelegramOperation.FILE_DOWNLOAD) ||
+            (error.errorCode != 0 && error.errorCode !in 500..599)) return false
+        checkActive()
+        return synchronized(lock) {
+            store.transaction {
+                if (updateId < store.meta("offset")) return@transaction false
+                val prior = if (store.meta(BLOCKED_DOCUMENT_UPDATE) == updateId) store.meta(BLOCKED_DOCUMENT_FAILURES) else 0
+                val failures = (prior.coerceIn(0, MAX_BLOCKED_DOCUMENT_FAILURES.toLong()) + 1)
+                    .coerceAtMost(MAX_BLOCKED_DOCUMENT_FAILURES.toLong())
+                store.setMeta(BLOCKED_DOCUMENT_UPDATE, updateId)
+                store.setMeta(BLOCKED_DOCUMENT_FAILURES, failures)
+                failures >= MAX_BLOCKED_DOCUMENT_FAILURES
+            }
+        }
+    }
+
+    /** Runs in the same transaction as the advancing receive cursor. */
+    private fun clearPastBlockedDownload() {
+        if (store.meta(BLOCKED_DOCUMENT_FAILURES) > 0 && store.meta(BLOCKED_DOCUMENT_UPDATE) < store.meta("offset")) {
+            store.setMeta(BLOCKED_DOCUMENT_UPDATE, 0)
+            store.setMeta(BLOCKED_DOCUMENT_FAILURES, 0)
+        }
+    }
+
+    private fun isLatestPreview(update: JSONObject): Boolean = runCatching {
+        val text = update.optJSONObject("message")?.opt("text") as? String ?: return false
+        if (text.length > 4096) return false
+        val packet = JSONObject(text)
+        packet.optString("app") == "TalkingFamily" && packet.opt("v") == 4 &&
+            packet.optString("type") == "care_location_head"
+    }.getOrDefault(false)
+
     private fun flushAll() {
             transport?.flushControls(repliesOnly = true)
+            familyCare?.flushLatestLocations()
             familyChat?.flush()
             if (synchronized(lock) { store.meta("legacyRetryAfter") <= now() }) {
                 try { flushLegacy() }
@@ -229,5 +309,12 @@ internal class TelegramExchange(
             synchronized(lock) { store.transaction { legacyWindow.markConfirmed(pending.id) } }
             sentThisFlush += pending.id
         }
+    }
+
+    companion object {
+        const val MAX_DOCUMENTS_PER_EXCHANGE = 2
+        internal const val BLOCKED_DOCUMENT_UPDATE = "documentBlockedUpdate"
+        internal const val BLOCKED_DOCUMENT_FAILURES = "documentBlockedFailures"
+        const val MAX_BLOCKED_DOCUMENT_FAILURES = 3
     }
 }

@@ -382,6 +382,7 @@ class FamilyChatExchangeTest {
 
     internal class FakeTelegram : TelegramHttpTransport {
         data class SendRequest(val sender: Long, val target: Any, val text: String)
+        data class DocumentRequest(val sender: Long, val peer: Long, val caption: String, val bytes: ByteArray)
         var calls = 0
         var blockedRecipient: Long? = null
         var loseChatResponseFrom: Long? = null
@@ -396,6 +397,9 @@ class FamilyChatExchangeTest {
         val unresolvableUsernames = mutableSetOf<String>()
         val resolutionRequests = mutableListOf<Pair<Long, String>>()
         val sendRequests = mutableListOf<SendRequest>()
+        val documentRequests = mutableListOf<DocumentRequest>()
+        var dropDocumentFrom: Long? = null
+        private val documents = mutableMapOf<String, ByteArray>()
         val destinations = mutableListOf<Long>()
         private val inbox = mutableMapOf<Long, MutableList<JSONObject>>()
         private val nextUpdate = mutableMapOf<Long, Long>()
@@ -407,11 +411,43 @@ class FamilyChatExchangeTest {
             inbox.getOrPut(to) { mutableListOf() }.add(JSONObject().put("update_id", id).put("message", JSONObject().put("text", text)
                 .put("from", JSONObject().put("id", from).put("is_bot", true)).put("chat", JSONObject().put("id", from).put("type", "private"))))
         }
+        override fun uploadDocument(token: String, fields: String, filename: String, bytes: ByteArray): TelegramHttpResponse {
+            calls++
+            val from = token.substringBefore(':').toLong()
+            val body = JSONObject(fields)
+            val to = body.getLong("chat_id")
+            if (rateLimitSendFrom == from) { rateLimitSendFrom = null; return TelegramHttpResponse(429,
+                JSONObject().put("ok", false).put("error_code", 429).put("parameters", JSONObject().put("retry_after", 30)).toString()) }
+            if (blockedRecipient == to) return TelegramHttpResponse(403, "{\"ok\":false,\"error_code\":403}")
+            if (requireKnownRecipients && (from to to) !in knownPeers) return chatNotFound()
+            val id = "file_${documents.size + 1}"
+            documents[id] = bytes.copyOf()
+            documentRequests += DocumentRequest(from, to, body.getString("caption"), bytes.copyOf())
+            if (dropDocumentFrom == from) dropDocumentFrom = null else {
+                inject(from, to, body.getString("caption"))
+                inbox.getValue(to).last().getJSONObject("message").apply {
+                    remove("text"); put("caption", body.getString("caption"))
+                    put("document", JSONObject().put("file_id", id).put("file_size", bytes.size).put("file_name", filename))
+                }
+            }
+            return ok(JSONObject().put("chat", JSONObject().put("id", to).put("type", "private")))
+        }
+        override fun downloadFile(token: String, filePath: String, maxBytes: Int, checkActive: () -> Unit): ByteArray {
+            calls++; checkActive()
+            val bytes = documents[filePath.removePrefix("documents/")] ?: throw TelegramException(404, operation = TelegramOperation.FILE_DOWNLOAD)
+            check(bytes.size <= maxBytes)
+            return bytes.copyOf()
+        }
         override fun execute(token: String, method: String, json: String, timeoutSeconds: Int): TelegramHttpResponse {
             calls++
             val from = token.substringBefore(':').toLong()
             val body = JSONObject(json)
             return when (method) {
+                "getFile" -> {
+                    val id = body.getString("file_id")
+                    val bytes = documents[id] ?: return TelegramHttpResponse(404, "{\"ok\":false,\"error_code\":404}")
+                    ok(JSONObject().put("file_id", id).put("file_path", "documents/$id").put("file_size", bytes.size))
+                }
                 "getUpdates" -> {
                     val queue = inbox.getOrPut(from) { mutableListOf() }
                     queue.removeAll { it.getLong("update_id") < body.getLong("offset") }

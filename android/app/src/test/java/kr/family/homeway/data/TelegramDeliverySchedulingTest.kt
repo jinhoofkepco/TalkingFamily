@@ -173,6 +173,29 @@ class TelegramDeliverySchedulingTest {
         assertEquals(3_000L, schedule.delayMillis(63_000))
     }
 
+    @Test fun deferredFetchedDocumentsKeepCatchUpWithoutPretendingAnOfflinePeerHasUpdates() {
+        val schedule = TelegramChatReceiveSchedule(false, 0)
+        schedule.onPollCompleted(schedule.beginPoll(), 60_000)
+        schedule.onPollProgress(TelegramReceiveProgress(2, hasMoreUpdates = true), 60_000)
+        assertTrue(schedule.catchUpState(60_000).active)
+        assertEquals(1_000L, schedule.delayMillis(60_000))
+        schedule.onPollProgress(TelegramReceiveProgress(0, hasMoreUpdates = true), 61_000)
+        schedule.onPollProgress(TelegramReceiveProgress(0, hasMoreUpdates = true), 62_000)
+        assertTrue(schedule.catchUpState(62_000).active)
+        schedule.onPollProgress(TelegramReceiveProgress(0), 63_000)
+        schedule.onPollProgress(TelegramReceiveProgress(0), 64_000)
+        assertFalse(schedule.catchUpState(64_000).active)
+        assertEquals(56_000L, schedule.delayMillis(64_000))
+    }
+
+    @Test fun consumedOrStalePageWithoutDeferredFreshUpdatesDoesNotEnterCatchUp() {
+        val schedule = TelegramChatReceiveSchedule(false, 0)
+        schedule.onPollCompleted(schedule.beginPoll(), 60_000)
+        schedule.onPollProgress(TelegramReceiveProgress(0, pendingOutgoing = true, hasMoreUpdates = false), 60_000)
+        assertFalse(schedule.catchUpState(60_000).active)
+        assertEquals(60_000L, schedule.delayMillis(60_000))
+    }
+
     @Test fun workerProcessesTheAckAndNextMessageInOneBoundedRun() = runBlocking {
         var remaining = 3
         var now = 0L

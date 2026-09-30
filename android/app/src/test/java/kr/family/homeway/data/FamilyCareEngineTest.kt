@@ -638,6 +638,150 @@ class FamilyCareEngineTest {
         assertTrue(f.http.sent.any { it.second == 101L && JSONObject(it.third).optString("type") == "snapshot_chunk" })
     }
 
+    @Test fun `latest location preview bypasses financial revision and never completes historic delivery`() {
+        val f = Family(); f.drain()
+        val known = f.engine(101).currentSnapshot(303)!!
+        val event = location()
+        val packet = FamilyCareProtocol.envelope(f.room, 303, 303, "care_location_head",
+            FamilyCareLocationHead(f.room.id, 303, known.epoch, 100, event.copy(delivery = "relayed")).json())
+        val parent = f.stores.getValue(101); val cursor = parent.meta("offset")
+        assertTrue(parent.transaction { f.engine(101).processLatestPreview(update(303, packet.toString())) })
+        assertEquals(cursor, parent.meta("offset"))
+        assertEquals(0L, f.engine(101).currentSnapshot(303)!!.revision)
+        assertEquals(5, f.engine(101).currentSnapshot(303)!!.snapshot.stickerBalance)
+        assertNull(parent.eventDigest(f.room.id, 303, event.id))
+        assertTrue(parent.receipts(f.room.id).isEmpty())
+        assertEquals(event.id, f.engine(101).latestLocation(303)!!.id)
+        // The original revision still applies the location; the preview must not mark it already applied.
+        val historical = FamilyCareProtocol.envelope(f.room, 303, 303, "child_event", JSONObject()
+            .put("epoch", known.epoch).put("revision", 1).put("event", event.copy(delivery = "relayed").json()))
+        parent.transaction { f.engine(101).processUpdate(update(303, historical.toString())) }
+        assertEquals(1L, f.engine(101).currentSnapshot(303)!!.revision)
+        assertEquals(event.id, f.engine(101).currentSnapshot(303)!!.snapshot.events.last().id)
+    }
+
+    @Test fun `latest summary slots coalesce while every original position stays durable and history keeps send turns`() {
+        val f = Family(); f.drain(); f.latest = true
+        repeat(10) { f.engine(303).emitChildEvent(location()) }
+        val child = f.stores.getValue(303)
+        assertEquals(20, child.pendingPackets(f.room.id).size)
+        assertEquals(2, child.pendingLatestLocationHeads(f.room.id).size)
+        assertTrue(child.pendingLatestLocationHeads(f.room.id).all { JSONObject(it.text).getJSONObject("body").getLong("revision") == 10L })
+        // Model already negotiated peers so independent capability controls do not consume this fairness turn.
+        for (peer in listOf(101L, 202L)) for (feature in listOf("supportedUntil", "careSupportedUntil", "fileSupportedUntil", "latestSupportedUntil"))
+            child.setMeta("transport:${f.room.id}:$peer:$feature", f.time + 21_600_000)
+        val transport = f.transport(303); val engine = f.engine(303, transport)
+        f.http.sent.clear(); engine.flushLatestLocations()
+        assertEquals("care_location_head", JSONObject(f.http.sent.first().third).getString("type"))
+        f.time += 1101; engine.flushLatestLocations()
+        val headsBefore = f.http.sent.count { JSONObject(it.third).optString("type") == "care_location_head" }
+        f.time += 1101; f.engine(303).emitChildEvent(location())
+        engine.flushLatestLocations(); engine.flush()
+        assertEquals(headsBefore, f.http.sent.count { JSONObject(it.third).optString("type") == "care_location_head" })
+        assertTrue(f.http.sent.any { JSONObject(it.third).optString("type") in setOf("child_event", "batch", "file_batch") })
+        assertEquals(22, child.pendingPackets(f.room.id).size)
+    }
+
+    @Test fun `latest head unsent and superseded acknowledgements cannot remove the current summary or history`() {
+        val f = Family(); f.drain(); f.latest = true
+        f.engine(303).emitChildEvent(location())
+        val child = f.stores.getValue(303)
+        val old = child.pendingLatestLocationHeads(f.room.id).first { it.peerId == 101L }
+        fun ack(packet: FamilyCareOutgoing) = update(101, FamilyCareProtocol.envelope(f.room, 101, 303, "care_ack",
+            JSONObject().put("digest", packet.digest), packet.packetId).toString())
+        child.transaction { f.engine(303).processUpdate(ack(old)) }
+        assertNotNull(child.pendingLatestLocationHead(f.room.id, old.packetId, 101))
+        child.markLatestLocationSent(f.room.id, old.packetId, 101, f.time)
+        f.engine(303).emitChildEvent(location())
+        val current = child.pendingLatestLocationHeads(f.room.id).first { it.peerId == 101L }
+        child.transaction { f.engine(303).processUpdate(ack(old)); f.engine(303).processUpdate(ack(current)) }
+        assertNotNull(child.pendingLatestLocationHead(f.room.id, current.packetId, 101))
+        child.markLatestLocationSent(f.room.id, current.packetId, 101, f.time)
+        child.transaction { f.engine(303).processUpdate(ack(current)) }
+        assertNull(child.pendingLatestLocationHead(f.room.id, current.packetId, 101))
+        assertEquals(4, child.pendingPackets(f.room.id).size)
+    }
+
+    @Test fun `new latest capability sends a previously measured point before backlog and acknowledged seed stays quiet`() {
+        val f = Family(); f.drain()
+        val event = location(); f.engine(303).emitChildEvent(event)
+        val child = f.stores.getValue(303)
+        assertTrue(child.pendingLatestLocationHeads(f.room.id).isEmpty())
+        assertEquals(2, child.pendingPackets(f.room.id).size)
+        f.latest = true
+        for (peer in listOf(101L, 202L)) for (feature in listOf("supportedUntil", "careSupportedUntil", "fileSupportedUntil", "latestSupportedUntil"))
+            child.setMeta("transport:${f.room.id}:$peer:$feature", f.time + 21_600_000)
+        val transport = f.transport(303); val engine = f.engine(303, transport)
+        f.http.sent.clear(); engine.flushLatestLocations(); engine.flush()
+        assertEquals("care_location_head", JSONObject(f.http.sent.first().third).getString("type"))
+        assertEquals(event.id, FamilyCareLocationHead.parse(f.room.id, 303,
+            JSONObject(f.http.sent.first().third).getJSONObject("body")).event.id)
+        f.time += 1101; engine.flushLatestLocations()
+        for (packet in child.pendingLatestLocationHeads(f.room.id)) {
+            assertTrue(packet.sentAt > 0)
+            child.transaction { engine.processUpdate(update(packet.peerId, FamilyCareProtocol.envelope(f.room, packet.peerId, 303,
+                "care_ack", JSONObject().put("digest", packet.digest), packet.packetId).toString())) }
+        }
+        assertTrue(child.pendingLatestLocationHeads(f.room.id).isEmpty())
+        assertNotNull(child.acknowledgedLatestLocationHead(f.room.id, 303, 101))
+        f.engine(303).emitChildEvent(FamilyEvent(UUID.randomUUID().toString(), "heartbeat",
+            JSONObject().put("recordedAt", "2026-09-22T12:01:00Z"), "child", "2026-09-22T12:01:00Z", "pending"))
+        f.time += 31_000; f.http.sent.clear()
+        f.engine(303, f.transport(303)).flushLatestLocations()
+        assertTrue(child.pendingLatestLocationHeads(f.room.id).isEmpty())
+        assertTrue(f.http.sent.isEmpty())
+        assertEquals(4, child.pendingPackets(f.room.id).size)
+    }
+
+    @Test fun `upgrade state seeds its stored latest point without requiring a new GPS fix`() {
+        val f = Family(bootstrap = false); val event = location().copy(delivery = "relayed")
+        f.engine(303).ensureAuthority(TelegramLedger.apply(TelegramLedger.emptyState(), event))
+        val child = f.stores.getValue(303)
+        assertNull(child.latestLocationHead(f.room.id, 303))
+        f.latest = true
+        for (peer in listOf(101L, 202L)) for (feature in listOf("supportedUntil", "careSupportedUntil", "fileSupportedUntil", "latestSupportedUntil"))
+            child.setMeta("transport:${f.room.id}:$peer:$feature", f.time + 21_600_000)
+        f.engine(303, f.transport(303)).flushLatestLocations()
+        assertEquals("care_location_head", JSONObject(f.http.sent.first().third).getString("type"))
+        assertEquals(event.id, child.latestLocationHead(f.room.id, 303)!!.event.id)
+        assertEquals(0L, child.stateMetadata(f.room.id, 303)!!.revision)
+        assertEquals(2, child.pendingLatestLocationHeads(f.room.id).size)
+    }
+
+    @Test fun `stale different epoch sibling and conflicting equal revision heads do not replace a trusted location`() {
+        val f = Family(); f.drain()
+        val known = f.engine(101).currentSnapshot(303)!!
+        val original = location().copy(delivery = "relayed")
+        fun preview(event: FamilyEvent, revision: Long = 10, epoch: String = known.epoch, sender: Long = 303) =
+            f.stores.getValue(101).transaction { f.engine(101).processLatestPreview(update(sender,
+                FamilyCareProtocol.envelope(f.room, sender, 303, "care_location_head", FamilyCareLocationHead(f.room.id, 303, epoch, revision, event).json()).toString())) }
+        assertTrue(preview(original))
+        assertFalse(preview(location().copy(delivery = "relayed"), revision = 9))
+        assertFalse(preview(original.copy(payload = JSONObject(original.payload.toString()).put("latitude", 38.0))))
+        assertFalse(preview(location().copy(delivery = "relayed"), epoch = UUID.randomUUID().toString()))
+        assertFalse(preview(location().copy(delivery = "relayed"), sender = 404))
+        assertEquals(original.id, f.engine(101).latestLocation(303)!!.id)
+        assertEquals(37.0, f.engine(101).latestLocation(303)!!.payload.getDouble("latitude"), 0.0)
+        assertEquals(0L, f.engine(101).currentSnapshot(303)!!.revision)
+    }
+
+    @Test fun `large historical care backlog uses files beyond sixteen originals and preserves every point and revision`() {
+        // Capability probes are demand driven; negotiate while initial authority snapshots are sent.
+        val f = Family(); f.batching = true; f.files = true; f.drain()
+        assertTrue(f.transport(303).supportsFiles(101))
+        assertTrue(f.transport(303).supportsFiles(202))
+        val events = (0 until 100).map { location() }
+        events.forEach { f.engine(303).emitChildEvent(it) }
+        f.http.sent.clear(); f.drain(rounds = 150)
+        assertTrue(f.http.filePacketCounts.any { it > 16 })
+        assertTrue(f.http.filePacketCounts.all { it <= FamilyTransportProtocol.MAX_FILE_PACKETS })
+        for (parent in listOf(101L, 202L)) {
+            assertEquals(100L, f.engine(parent).currentSnapshot(303)!!.revision)
+            assertTrue(f.stores.getValue(parent).archived.map { it.second.id }.containsAll(events.map { it.id }))
+        }
+        assertTrue(f.stores.getValue(303).pendingPackets(f.room.id).isEmpty())
+    }
+
     private class Family(bootstrap: Boolean = true) {
         val ids = listOf(101L, 202L, 303L, 404L)
         val room = FamilyChatRoom.create("우리집", ids.mapIndexed { index, id -> FamilyChatMember(id, "@care${id}_bot",
@@ -647,7 +791,9 @@ class FamilyCareEngineTest {
         val http = FakeTelegram()
         var time = Instant.parse("2026-09-22T12:00:00Z").toEpochMilli()
         var batching = false
+        var files = false
         var deltas = false
+        var latest = false
         val oldPeers = mutableSetOf<Long>()
         val oldCarePeers = mutableSetOf<Long>()
         init {
@@ -660,8 +806,10 @@ class FamilyCareEngineTest {
         }
         private fun client(id: Long) = TelegramClient("$id:${"x".repeat(32)}", http)
         fun engine(id: Long, transport: FamilyTransport? = null) = FamilyCareEngine(client(id), stores.getValue(id), room, id, now = { time }, transport = transport,
-            canSyncDeltas = { deltas && it !in oldCarePeers })
+            canSyncDeltas = { deltas && it !in oldCarePeers }, canSendLatestLocation = { latest && it !in oldCarePeers })
+        fun transport(id: Long) = FamilyTransport(client(id), stores.getValue(id), room, id, now = { time })
         fun sync(id: Long): Boolean {
+            http.acceptFiles = files
             val transport = if (batching && id !in oldPeers) FamilyTransport(client(id), stores.getValue(id), room, id, now = { time }) else null
             return TelegramExchange(client(id), stores.getValue(id), 0, "child", now = { time }, familyCare = engine(id, transport), transport = transport).synchronize()
         }
@@ -679,18 +827,46 @@ class FamilyCareEngineTest {
         var pauseBeforeType: Pair<Long, String>? = null
         var onSuccessfulSend: () -> Unit = {}
         val polls = mutableListOf<Long>()
+        var acceptFiles = false
+        val filePacketCounts = mutableListOf<Int>()
+        private val uploaded = mutableMapOf<String, ByteArray>()
         fun inject(from: Long, to: Long, text: String) {
+            if (!acceptFiles && JSONObject(text).optString("type") == "file_capabilities") return
             inbox.getOrPut(to) { mutableListOf() }.add(update(from, text).put("update_id", ++sequence))
         }
         fun discardInbox(id: Long) { inbox.remove(id) }
+        override fun uploadDocument(token: String, fields: String, filename: String, bytes: ByteArray): TelegramHttpResponse {
+            val own = token.substringBefore(':').toLong(); val body = JSONObject(fields); val peer = body.getLong("chat_id")
+            val caption = body.getString("caption"); val fileId = UUID.randomUUID().toString()
+            uploaded[fileId] = bytes.copyOf()
+            filePacketCounts += java.util.zip.GZIPInputStream(java.io.ByteArrayInputStream(bytes)).use { input ->
+                JSONArray(String(input.readBytes(), Charsets.UTF_8)).length()
+            }
+            sent.add(Triple(own, peer, caption))
+            val document = JSONObject().put("file_id", fileId).put("file_unique_id", fileId).put("file_size", bytes.size)
+                .put("file_name", filename).put("mime_type", "application/gzip")
+            val incoming = update(own, caption).put("update_id", ++sequence)
+            incoming.getJSONObject("message").remove("text")
+            incoming.getJSONObject("message").put("caption", caption).put("document", document)
+            inbox.getOrPut(peer) { mutableListOf() }.add(incoming)
+            return TelegramHttpResponse(200, JSONObject().put("ok", true).put("result", JSONObject().put("chat",
+                JSONObject().put("id", peer).put("type", "private"))).toString())
+        }
+        override fun downloadFile(token: String, filePath: String, maxBytes: Int, checkActive: () -> Unit): ByteArray {
+            checkActive(); val bytes = uploaded.getValue(filePath.substringAfterLast('/').removeSuffix(".gz"))
+            require(bytes.size <= maxBytes); return bytes.copyOf()
+        }
         override fun execute(token: String, method: String, json: String, timeoutSeconds: Int): TelegramHttpResponse {
             val own = token.substringBefore(':').toLong(); val body = JSONObject(json)
             val result: Any = when (method) {
                 "getUpdates" -> {
                     polls.add(own)
                     JSONArray(inbox[own].orEmpty().filter { it.getLong("update_id") >= body.getLong("offset") }
-                        .takeWhile { pauseBeforeType != (own to JSONObject(it.getJSONObject("message").getString("text")).optString("type")) }.take(100))
+                        .takeWhile { pauseBeforeType != (own to JSONObject(it.getJSONObject("message").let { message ->
+                            message.optString("text").ifBlank { message.getString("caption") } }).optString("type")) }.take(100))
                 }
+                "getFile" -> body.getString("file_id").let { fileId -> JSONObject().put("file_id", fileId)
+                    .put("file_size", uploaded.getValue(fileId).size).put("file_path", "documents/$fileId.gz") }
                 "sendMessage" -> {
                     val peer = body.getLong("chat_id"); val text = body.getString("text")
                     sent.add(Triple(own, peer, text))
@@ -712,7 +888,7 @@ class FamilyCareEngineTest {
         }
     }
 
-    private class MemoryStore : FamilyCareStore, TelegramExchangeStore {
+    internal class MemoryStore : FamilyCareStore, TelegramExchangeStore {
         private var states = linkedMapOf<Pair<String, Long>, FamilyCareState>()
         private var outcomes = linkedMapOf<Pair<String, String>, FamilyCareOutcome>()
         private var commands = linkedMapOf<Pair<String, String>, FamilyCareCommand>()
@@ -724,6 +900,10 @@ class FamilyCareEngineTest {
         private var errors = linkedMapOf<Pair<String, Long>, String>()
         private var deltaHistory = mutableListOf<FamilyCareDelta>()
         private var replacements = linkedMapOf<Triple<String, String, Long>, List<String>>()
+        private var latestHeads = linkedMapOf<Pair<String, Long>, FamilyCareLocationHead>()
+        private var liveOutgoing = linkedMapOf<Triple<String, Long, Long>, FamilyCareOutgoing>()
+        private var completedLive = linkedSetOf<Triple<String, Long, Long>>()
+        private var latestSent = linkedMapOf<Pair<String, Long>, Long>()
         var archived = mutableListOf<Pair<Long, FamilyEvent>>()
         private var meta = linkedMapOf<String, Long>()
         private var legacy = TelegramLedger.emptyState()
@@ -736,6 +916,8 @@ class FamilyCareEngineTest {
             val movement = archived.toMutableList(); val m = LinkedHashMap(meta); val l = JSONObject(legacy.toString())
             val history = deltaHistory.toMutableList()
             val mappings = LinkedHashMap(replacements)
+            val heads = LinkedHashMap(latestHeads); val slots = LinkedHashMap(liveOutgoing); val headTimes = LinkedHashMap(latestSent)
+            val completedHeads = LinkedHashSet(completedLive)
             try {
                 val value = block()
                 if (failCommit) { failCommit = false; throw IOException("commit failed") }
@@ -745,11 +927,65 @@ class FamilyCareEngineTest {
                 retry = retryCopy; chunks = parts; errors = e; archived = movement; meta = m; legacy = l
                 deltaHistory = history
                 replacements = mappings
+                latestHeads = heads; liveOutgoing = slots; latestSent = headTimes
+                completedLive = completedHeads
                 throw error
             }
         }
         override fun state(roomId: String, childId: Long) = states[roomId to childId]?.let { it.copy(state = JSONObject(it.state.toString())) }
-        override fun saveState(state: FamilyCareState) { states[state.roomId to state.childId] = state.copy(state = JSONObject(state.state.toString())) }
+        override fun saveState(state: FamilyCareState) {
+            states[state.roomId to state.childId] = state.copy(state = JSONObject(state.state.toString()))
+            if (latestHeads[state.roomId to state.childId]?.epoch?.let { it != state.epoch } == true) latestHeads.remove(state.roomId to state.childId)
+        }
+        override fun latestLocationHead(roomId: String, childId: Long) = latestHeads[roomId to childId]
+            ?.takeIf { states[roomId to childId]?.epoch?.let { epoch -> epoch == it.epoch } != false }
+            ?.let { FamilyCareLocationHead.parse(roomId, childId, JSONObject(it.json().toString())) }
+        override fun saveLatestLocationHead(head: FamilyCareLocationHead): Boolean {
+            val known = states[head.roomId to head.childId]
+            if (known != null && known.epoch != head.epoch) return false
+            val old = latestHeads[head.roomId to head.childId]
+            if (old != null && old.epoch != head.epoch && known == null) return false
+            if (old != null && old.epoch == head.epoch) {
+                if (head.revision < old.revision) return false
+                if (head.revision == old.revision) { require(head.eventDigest == old.eventDigest); return false }
+                if (Instant.parse(head.event.measuredAt) < Instant.parse(old.event.measuredAt)) return false
+            }
+            latestHeads[head.roomId to head.childId] = FamilyCareLocationHead.parse(head.roomId, head.childId, JSONObject(head.json().toString()))
+            return true
+        }
+        override fun queueLatestLocationHead(packet: FamilyCareOutgoing) {
+            val key = Triple(packet.roomId, packet.childId, packet.peerId)
+            val head = FamilyCareLocationHead.parse(packet.roomId, packet.childId, JSONObject(packet.text).getJSONObject("body"))
+            liveOutgoing[key]?.let { prior ->
+                val old = FamilyCareLocationHead.parse(prior.roomId, prior.childId, JSONObject(prior.text).getJSONObject("body"))
+                require(head.epoch == old.epoch)
+                if (head.revision < old.revision) return
+                require(head.revision != old.revision || head.eventDigest == old.eventDigest)
+                if (head.eventDigest == old.eventDigest) return
+            }
+            liveOutgoing[key] = packet; completedLive.remove(key)
+        }
+        override fun pendingLatestLocationHeads(roomId: String) = liveOutgoing.filterKeys { it !in completedLive }.values.filter { it.roomId == roomId }
+        override fun markLatestLocationSent(roomId: String, packetId: String, peerId: Long, sentAt: Long) {
+            liveOutgoing.replaceAll { key, packet -> if (key !in completedLive && packet.roomId == roomId && packet.packetId == packetId && packet.peerId == peerId) {
+                latestSent[roomId to peerId] = sentAt; packet.copy(sentAt = sentAt, sendConfirmed = false)
+            } else packet }
+        }
+        override fun markLatestLocationConfirmed(roomId: String, packetId: String, peerId: Long) {
+            liveOutgoing.replaceAll { key, packet -> if (key !in completedLive && packet.roomId == roomId && packet.packetId == packetId && packet.peerId == peerId && packet.sentAt > 0) packet.copy(sendConfirmed = true) else packet }
+        }
+        override fun acknowledgeLatestLocationHead(roomId: String, packetId: String, peerId: Long, digest: String) {
+            liveOutgoing.filter { (_, packet) -> packet.roomId == roomId && packet.packetId == packetId && packet.peerId == peerId && packet.digest == digest && packet.sentAt > 0 }
+                .keys.forEach { completedLive.add(it) }
+        }
+        override fun acknowledgedLatestLocationHead(roomId: String, childId: Long, peerId: Long): FamilyCareLocationHead? {
+            val key = Triple(roomId, childId, peerId)
+            return liveOutgoing[key]?.takeIf { key in completedLive }?.let {
+                FamilyCareLocationHead.parse(roomId, childId, JSONObject(it.text).getJSONObject("body"))
+            }
+        }
+        override fun latestLocationSentAt(roomId: String, peerId: Long) = latestSent[roomId to peerId] ?: 0L
+        override fun movementEventDigest(roomId: String, childId: Long, eventId: String) = archived.firstOrNull { it.first == childId && it.second.id == eventId }?.second?.let(TelegramLedger::eventDigest)
         override fun saveDelta(delta: FamilyCareDelta) { deltaHistory.add(delta); deltaHistory.removeAll { it.roomId == delta.roomId && it.childId == delta.childId && (it.epoch != delta.epoch || it.revision <= delta.revision - FamilyCareDelta.HISTORY_LIMIT) } }
         override fun deltas(roomId: String, childId: Long, epoch: String, afterRevision: Long, limit: Int) =
             deltaHistory.filter { it.roomId == roomId && it.childId == childId && it.epoch == epoch && it.revision > afterRevision }.sortedBy { it.revision }.take(limit)

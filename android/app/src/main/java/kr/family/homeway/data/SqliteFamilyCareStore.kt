@@ -43,8 +43,104 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
             put("epoch", state.epoch); put("revision", state.revision); put("authoritative", if (state.authoritative) 1 else 0)
             put("state_digest", stateDigest)
         }, SQLiteDatabase.CONFLICT_REPLACE)
+        // A first verified board pins the epoch of a provisional location received before initial sync.
+        db.delete("family_care_live", "room_id=? AND child_id=? AND epoch<>?", arrayOf(state.roomId, state.childId.toString(), state.epoch))
         Unit
     }
+
+    override fun latestLocationHead(roomId: String, childId: Long): FamilyCareLocationHead? = owner.readableDatabase.rawQuery(
+        "SELECT l.head FROM family_care_live l WHERE l.room_id=? AND l.child_id=? AND NOT EXISTS(" +
+            "SELECT 1 FROM family_care_states s WHERE s.room_id=l.room_id AND s.child_id=l.child_id AND s.epoch IS NOT NULL AND s.epoch<>l.epoch)",
+        arrayOf(roomId, childId.toString())
+    ).use { if (it.moveToFirst()) FamilyCareLocationHead.parse(roomId, childId, JSONObject(it.getString(0))) else null }
+
+    override fun saveLatestLocationHead(head: FamilyCareLocationHead): Boolean = transaction {
+        FamilyCareLocationHead.parse(head.roomId, head.childId, head.json())
+        val known = stateMetadata(head.roomId, head.childId)
+        if (known != null && known.epoch != head.epoch) return@transaction false
+        val old = latestLocationHead(head.roomId, head.childId)
+        if (old != null) {
+            if (old.epoch != head.epoch && known == null) return@transaction false
+            if (old.epoch == head.epoch) {
+                if (head.revision < old.revision) return@transaction false
+                if (head.revision == old.revision) {
+                    require(head.eventDigest == old.eventDigest) { "같은 순서의 현재 위치가 달라요." }
+                    return@transaction false
+                }
+                if (Instant.parse(head.event.measuredAt) < Instant.parse(old.event.measuredAt)) return@transaction false
+            }
+        }
+        owner.writableDatabase.insertWithOnConflict("family_care_live", null, ContentValues().apply {
+            put("room_id", head.roomId); put("child_id", head.childId); put("epoch", head.epoch)
+            put("revision", head.revision); put("head", head.json().toString())
+        }, SQLiteDatabase.CONFLICT_REPLACE)
+        true
+    }
+
+    override fun queueLatestLocationHead(packet: FamilyCareOutgoing) = transaction {
+        val json = JSONObject(packet.text)
+        require(json.optString("type") == "care_location_head" && json.getString("roomId") == packet.roomId &&
+            json.getLong("childId") == packet.childId && json.getLong("actorId") == packet.childId &&
+            json.getString("id") == packet.packetId && FamilyCareValidation.digest(json) == packet.digest)
+        val head = FamilyCareLocationHead.parse(packet.roomId, packet.childId, json.getJSONObject("body"))
+        val old = owner.readableDatabase.rawQuery("SELECT text FROM family_care_live_outgoing WHERE room_id=? AND child_id=? AND peer_id=?",
+            arrayOf(packet.roomId, packet.childId.toString(), packet.peerId.toString())).use { if (it.moveToFirst()) it.getString(0) else null }
+        if (old != null) {
+            val prior = FamilyCareLocationHead.parse(packet.roomId, packet.childId, JSONObject(old).getJSONObject("body"))
+            require(head.epoch == prior.epoch) { "현재 위치의 기준 정보가 달라요." }
+            if (head.revision < prior.revision) return@transaction
+            require(head.revision != prior.revision || head.eventDigest == prior.eventDigest) { "같은 순서의 현재 위치가 달라요." }
+            if (head.eventDigest == prior.eventDigest) return@transaction
+        }
+        // Only this summary slot is replaced. family_care_packets and movement history are untouched.
+        owner.writableDatabase.insertWithOnConflict("family_care_live_outgoing", null, ContentValues().apply {
+            put("room_id", packet.roomId); put("child_id", packet.childId); put("peer_id", packet.peerId)
+            put("packet_id", packet.packetId); put("text", packet.text); put("digest", packet.digest)
+            put("sent_at", 0); put("send_confirmed", 0); put("completed", 0)
+        }, SQLiteDatabase.CONFLICT_REPLACE)
+        Unit
+    }
+
+    override fun pendingLatestLocationHeads(roomId: String): List<FamilyCareOutgoing> = owner.readableDatabase.rawQuery(
+        "SELECT packet_id,child_id,peer_id,text,digest,sent_at,send_confirmed FROM family_care_live_outgoing WHERE room_id=? AND completed=0 ORDER BY peer_id,child_id",
+        arrayOf(roomId)).use { rows -> buildList { while (rows.moveToNext()) add(FamilyCareOutgoing(roomId, rows.getString(0),
+        rows.getLong(1), rows.getLong(2), rows.getString(3), rows.getString(4), rows.getLong(5), rows.getInt(6) == 1)) } }
+
+    override fun markLatestLocationSent(roomId: String, packetId: String, peerId: Long, sentAt: Long) = transaction {
+        require(sentAt > 0)
+        val db = owner.writableDatabase
+        val changed = db.update("family_care_live_outgoing", ContentValues().apply { put("sent_at", sentAt); put("send_confirmed", 0) },
+            "room_id=? AND packet_id=? AND peer_id=? AND completed=0", arrayOf(roomId, packetId, peerId.toString()))
+        if (changed > 0) db.insertWithOnConflict("family_care_live_peer", null, ContentValues().apply {
+            put("room_id", roomId); put("peer_id", peerId); put("last_sent", sentAt)
+        }, SQLiteDatabase.CONFLICT_REPLACE)
+        Unit
+    }
+
+    override fun markLatestLocationConfirmed(roomId: String, packetId: String, peerId: Long) {
+        owner.writableDatabase.update("family_care_live_outgoing", ContentValues().apply { put("send_confirmed", 1) },
+            "room_id=? AND packet_id=? AND peer_id=? AND sent_at>0 AND completed=0", arrayOf(roomId, packetId, peerId.toString()))
+    }
+
+    override fun acknowledgeLatestLocationHead(roomId: String, packetId: String, peerId: Long, digest: String) {
+        owner.writableDatabase.update("family_care_live_outgoing", ContentValues().apply { put("completed", 1) },
+            "room_id=? AND packet_id=? AND peer_id=? AND digest=? AND sent_at>0 AND completed=0",
+            arrayOf(roomId, packetId, peerId.toString(), digest))
+    }
+
+    override fun latestLocationSentAt(roomId: String, peerId: Long): Long = owner.readableDatabase.rawQuery(
+        "SELECT last_sent FROM family_care_live_peer WHERE room_id=? AND peer_id=?", arrayOf(roomId, peerId.toString())
+    ).use { if (it.moveToFirst()) it.getLong(0) else 0L }
+
+    override fun acknowledgedLatestLocationHead(roomId: String, childId: Long, peerId: Long): FamilyCareLocationHead? =
+        owner.readableDatabase.rawQuery("SELECT text FROM family_care_live_outgoing WHERE room_id=? AND child_id=? AND peer_id=? AND completed=1",
+            arrayOf(roomId, childId.toString(), peerId.toString())).use {
+            if (it.moveToFirst()) FamilyCareLocationHead.parse(roomId, childId, JSONObject(it.getString(0)).getJSONObject("body")) else null
+        }
+
+    override fun movementEventDigest(roomId: String, childId: Long, eventId: String): String? = owner.readableDatabase.rawQuery(
+        "SELECT event FROM family_care_movement WHERE room_id=? AND child_id=? AND id=?", arrayOf(roomId, childId.toString(), eventId)
+    ).use { if (it.moveToFirst()) TelegramLedger.eventDigest(FamilyEvent.parse(JSONObject(it.getString(0)))) else null }
 
     private data class StateMetadata(val epoch: String, val revision: Long, val authoritative: Boolean, val digest: String)
 
@@ -401,6 +497,9 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
             for (input in batch) {
                 val measuredAt = MovementHistoryDates.epoch(input) ?: continue
                 val saved = old[input.id]
+                require(saved == null || TelegramLedger.eventDigest(saved) == TelegramLedger.eventDigest(input)) {
+                    "같은 이동 기록의 내용이 달라요."
+                }
                 val event = if (saved != null && MovementHistoryDates.deliveryRank(saved.delivery) > MovementHistoryDates.deliveryRank(input.delivery)) {
                     input.copy(delivery = saved.delivery, deliveryError = saved.deliveryError)
                 } else input
@@ -507,6 +606,17 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
             db.execSQL("INSERT INTO family_care_settings(name,value) VALUES('movement_zone',?)", arrayOf(ZoneId.systemDefault().id))
             createOptimizationTables(db)
             upgradeToV8(db)
+            upgradeToV9(db)
+        }
+
+        internal fun upgradeToV9(db: SQLiteDatabase) {
+            db.execSQL("CREATE TABLE IF NOT EXISTS family_care_live (room_id TEXT NOT NULL,child_id INTEGER NOT NULL,epoch TEXT NOT NULL," +
+                "revision INTEGER NOT NULL,head TEXT NOT NULL,PRIMARY KEY(room_id,child_id))")
+            db.execSQL("CREATE TABLE IF NOT EXISTS family_care_live_outgoing (room_id TEXT NOT NULL,child_id INTEGER NOT NULL,peer_id INTEGER NOT NULL," +
+                "packet_id TEXT NOT NULL,text TEXT NOT NULL,digest TEXT NOT NULL,sent_at INTEGER NOT NULL DEFAULT 0," +
+                "send_confirmed INTEGER NOT NULL DEFAULT 0,completed INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(room_id,child_id,peer_id))")
+            db.execSQL("CREATE TABLE IF NOT EXISTS family_care_live_peer (room_id TEXT NOT NULL,peer_id INTEGER NOT NULL,last_sent INTEGER NOT NULL," +
+                "PRIMARY KEY(room_id,peer_id))")
         }
 
         internal fun upgradeToV8(db: SQLiteDatabase) {
@@ -591,7 +701,8 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
         internal fun clearTables(db: SQLiteDatabase) {
             listOf("family_care_states", "family_care_outcomes", "family_care_commands", "family_care_received", "family_care_deliveries", "family_care_packets",
                 "family_care_receipts", "family_care_peer_state", "family_care_chunks", "family_care_errors", "family_care_movement",
-                "family_care_settings", "family_care_event_ids", "family_care_deltas", "family_care_replacements").forEach { db.delete(it, null, null) }
+                "family_care_settings", "family_care_event_ids", "family_care_deltas", "family_care_replacements", "family_care_live",
+                "family_care_live_outgoing", "family_care_live_peer").forEach { db.delete(it, null, null) }
         }
     }
 }

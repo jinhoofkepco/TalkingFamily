@@ -238,10 +238,12 @@ class HomewayViewModelChatRefreshTest {
                 "sendMessage" -> {
                     val envelope = JSONObject(body.getString("text"))
                     val type = envelope.getString("type")
-                    assertTrue(type in setOf("hello", "chat", "chat_ack", "capabilities", "care_capabilities"))
-                    if (type in setOf("capabilities", "care_capabilities")) {
+                    val features = mapOf("capabilities" to "batch", "care_capabilities" to "delta",
+                        "file_capabilities" to "file", "latest_capabilities" to "latest")
+                    assertTrue(type in setOf("hello", "chat", "chat_ack") || type in features)
+                    if (type in features) {
                         assertEquals(5, envelope.getInt("v"))
-                        assertEquals(1, envelope.getInt(if (type == "capabilities") "batch" else "delta"))
+                        assertEquals(1, envelope.getInt(features.getValue(type)))
                         assertTrue(envelope.getLong("nonce") > 0)
                     }
                     if (type == "hello") assertEquals("@refresh_peer_bot", body.getString("chat_id"))

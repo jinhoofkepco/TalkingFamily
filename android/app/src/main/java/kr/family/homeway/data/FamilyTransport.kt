@@ -15,12 +15,17 @@ import java.util.zip.GZIPOutputStream
 internal object FamilyTransportProtocol {
     const val MAX_PACKETS = 16
     const val MAX_BYTES = 65_536
+    const val MAX_FILE_PACKETS = FamilyDocumentProtocol.MAX_PACKETS
     private fun envelope(type: String) = JSONObject().put("app", "TalkingFamily").put("v", 5).put("type", type)
     fun capability(nonce: Long, reply: Boolean): String = envelope("capabilities")
         .put("batch", 1).put("nonce", nonce).put("reply", reply).toString()
     // A separate control preserves the strict, unchanged 0.6.7 batch-capability envelope.
     fun careCapability(nonce: Long, reply: Boolean): String = envelope("care_capabilities")
         .put("delta", 1).put("nonce", nonce).put("reply", reply).toString()
+    fun fileCapability(nonce: Long, reply: Boolean): String = envelope("file_capabilities")
+        .put("file", 1).put("nonce", nonce).put("reply", reply).toString()
+    fun latestCapability(nonce: Long, reply: Boolean): String = envelope("latest_capabilities")
+        .put("latest", 1).put("nonce", nonce).put("reply", reply).toString()
 
     fun batch(texts: List<String>): String {
         require(texts.size in 2..MAX_PACKETS && texts.all { it.length <= 4096 })
@@ -73,11 +78,29 @@ class FamilyTransport(
     private fun put(peer: Long, name: String, value: Long) = store.setMeta(key(peer, name), value)
     private var incomingBatchIds = emptySet<String>()
     private val recordSlots = mutableMapOf<Long, MutableMap<Long, Int>>()
+    private enum class Feature(val prefix: String, val type: String, val flag: String, val supported: String) {
+        BATCH("batch", "capabilities", "batch", "supportedUntil"),
+        CARE("care", "care_capabilities", "delta", "careSupportedUntil"),
+        FILE("file", "file_capabilities", "file", "fileSupportedUntil"),
+        LATEST("latest", "latest_capabilities", "latest", "latestSupportedUntil"),
+    }
     fun supportsBatch(peer: Long): Boolean = synchronized(lock) {
         meta(peer, "supportedUntil") > now() && meta(peer, "batchFallbackUntil") <= now()
     }
     fun supportsCareDeltas(peer: Long): Boolean = synchronized(lock) {
         supportsCareDeltas(store, room.id, peer, now())
+    }
+    fun supportsFiles(peer: Long): Boolean = synchronized(lock) {
+        meta(peer, "fileSupportedUntil") > now() && meta(peer, "fileFallbackUntil") <= now()
+    }
+    fun supportsLatestLocation(peer: Long): Boolean = synchronized(lock) {
+        supportsLatestLocation(store, room.id, peer, now())
+    }
+    private fun supported(peer: Long, feature: Feature): Boolean = when (feature) {
+        Feature.BATCH -> supportsBatch(peer)
+        Feature.CARE -> supportsCareDeltas(peer)
+        Feature.FILE -> supportsFiles(peer)
+        Feature.LATEST -> supportsLatestLocation(peer)
     }
 
     /** Fixed slots bound transport bookkeeping even when a location stream runs for years. */
@@ -93,7 +116,7 @@ class FamilyTransport(
             ?: (0 until RECORD_SLOTS).minBy { meta(peer, "record:$it:lastUsed") }
         val slot = "record:$index"
         if (meta(peer, "$slot:id") != fingerprint) {
-            listOf("batchAt", "batchAttempts", "batchProof", "careAt", "careAttempts", "replays", "individualAckUntil")
+            listOf("batchAt", "batchAttempts", "batchProof", "fileAt", "fileAttempts", "fileProof", "latestAt", "careAt", "careAttempts", "replays", "individualAckUntil")
                 .forEach { put(peer, "$slot:$it", 0) }
             slots.entries.removeAll { it.value == index }
             slots[fingerprint] = index
@@ -136,8 +159,18 @@ class FamilyTransport(
             put(peer, "supportedUntil", now() + CAPABILITY_TTL_MILLIS)
             put(peer, "batchFallbackUntil", 0)
         }
+        if (meta(peer, "$slot:fileAt") > 0) {
+            put(peer, "fileSupportedUntil", now() + CAPABILITY_TTL_MILLIS)
+            put(peer, "fileFallbackUntil", 0)
+            put(peer, "fileAttempts", 0); put(peer, "fileUnacknowledgedSince", 0)
+        }
+        if (meta(peer, "$slot:latestAt") > 0) {
+            put(peer, "latestAttempts", 0); put(peer, "latestUnacknowledgedSince", 0)
+        }
         put(peer, "$slot:batchAt", 0); put(peer, "$slot:batchAttempts", 0)
         put(peer, "$slot:careAt", 0); put(peer, "$slot:careAttempts", 0)
+        put(peer, "$slot:fileAt", 0); put(peer, "$slot:fileAttempts", 0)
+        put(peer, "$slot:latestAt", 0)
     }
 
     fun shouldFallbackCarePacket(peer: Long, packetId: String): Boolean = synchronized(lock) {
@@ -154,6 +187,17 @@ class FamilyTransport(
         put(peer, "care:retryAt", now() + 30_000)
     }
 
+    /** A coalesced head gets a new ID, so its compatibility attempt window is peer-wide. */
+    fun shouldFallbackLatestLocation(peer: Long): Boolean = synchronized(lock) {
+        val since = meta(peer, "latestUnacknowledgedSince")
+        meta(peer, "latestAttemptProof") == meta(peer, "latestProof") && meta(peer, "latestAttempts") >= MAX_BATCH_ATTEMPTS &&
+            since > 0 && (now() < since || now() - since >= 30_000)
+    }
+    fun noteLatestLocationFallback(peer: Long) = synchronized(lock) {
+        put(peer, "latestSupportedUntil", 0)
+        put(peer, "latest:probeWanted", 1); put(peer, "latest:probeAt", 0); put(peer, "latest:retryAt", now() + 30_000)
+    }
+
     private fun originalId(text: String): String? = runCatching {
         val json = JSONObject(text)
         when {
@@ -163,23 +207,22 @@ class FamilyTransport(
         }
     }.getOrNull()
 
-    private fun probeReady(peer: Long, care: Boolean): Boolean {
-        val prefix = if (care) "care" else "batch"
-        val supported = if (care) supportsCareDeltas(peer) else supportsBatch(peer)
+    private fun probeReady(peer: Long, feature: Feature): Boolean {
+        val prefix = feature.prefix
         val at = meta(peer, "$prefix:probeAt")
-        return !supported && meta(peer, "$prefix:probeWanted") != 0L && meta(peer, "$prefix:retryAt") <= now() &&
+        return !supported(peer, feature) && meta(peer, "$prefix:probeWanted") != 0L && meta(peer, "$prefix:retryAt") <= now() &&
             (at == 0L || now() < at || now() - at >= CAPABILITY_TTL_MILLIS)
     }
 
-    private fun controlReady(peer: Long, care: Boolean, repliesOnly: Boolean): Boolean {
-        val prefix = if (care) "care" else "batch"
+    private fun controlReady(peer: Long, feature: Feature, repliesOnly: Boolean): Boolean {
+        val prefix = feature.prefix
         if (meta(peer, "$prefix:replyNonce") != 0L) return meta(peer, "$prefix:retryAt") <= now()
-        return !repliesOnly && probeReady(peer, care)
+        return !repliesOnly && probeReady(peer, feature)
     }
 
     private fun deferControlTurn(peer: Long): Boolean = synchronized(lock) {
         if (meta(peer, "controlTurn") != 0L &&
-            (controlReady(peer, false, false) || controlReady(peer, true, false))) {
+            Feature.values().any { controlReady(peer, it, false) }) {
             deferredUntilMillis = minOf(deferredUntilMillis ?: Long.MAX_VALUE,
                 maxOf(now() + GLOBAL_INTERVAL_MILLIS, meta(peer, "nextSend"), store.meta("transport:nextSend")))
             true
@@ -204,8 +247,15 @@ class FamilyTransport(
                 put(peer, "batch:probeAt", 0)
                 put(peer, "batch:retryAt", now() + 30_000)
             }
-            if (!supportsBatch(peer)) put(peer, "batch:probeWanted", 1)
-            if (!supportsCareDeltas(peer)) put(peer, "care:probeWanted", 1)
+            val missingFileSince = meta(peer, "fileUnacknowledgedSince")
+            val missingFileAttempts = if (meta(peer, "fileAttemptProof") == meta(peer, "fileProof")) meta(peer, "fileAttempts") else 0
+            if (allowBatch && supportsFiles(peer) && ids.any { it != null } &&
+                missingFileAttempts >= MAX_BATCH_ATTEMPTS && missingFileSince > 0 &&
+                (now() < missingFileSince || now() - missingFileSince >= 30_000)) {
+                put(peer, "fileSupportedUntil", 0); put(peer, "fileFallbackUntil", now() + BATCH_FALLBACK_MILLIS)
+                put(peer, "file:probeAt", 0); put(peer, "file:retryAt", now() + 30_000)
+            }
+            Feature.values().filter { !supported(peer, it) }.forEach { put(peer, "${it.prefix}:probeWanted", 1) }
         } }
         if (deferControlTurn(peer)) {
             if (ids.any { it != null }) synchronized(lock) { put(peer, "dataTurnUntil", now() + 5_000) }
@@ -218,7 +268,10 @@ class FamilyTransport(
         }
         var count = 1
         var wire = texts.first()
-        if (allowBatch && supportsBatch(member.botId)) {
+        val document = if (allowBatch && supportsFiles(peer)) FamilyDocumentProtocol.encode(texts, room.id, ownBotId, peer) else null
+        if (document != null) {
+            count = document.count
+        } else if (allowBatch && supportsBatch(member.botId)) {
             for (size in minOf(texts.size, FamilyTransportProtocol.MAX_PACKETS) downTo 2) {
                 val candidate = runCatching { FamilyTransportProtocol.batch(texts.take(size)) }.getOrNull() ?: continue
                 count = size; wire = candidate; break
@@ -235,18 +288,38 @@ class FamilyTransport(
                 val slot = record(peer, id)
                 val priorAttempts = if (meta(peer, "$slot:batchProof") == meta(peer, "batchProof"))
                     meta(peer, "$slot:batchAttempts") else 0
-                put(peer, "$slot:batchAt", if (count > 1) now().coerceAtLeast(1) else 0)
-                put(peer, "$slot:batchAttempts", if (count > 1) priorAttempts + 1 else 0)
+                put(peer, "$slot:batchAt", if (count > 1 && document == null) now().coerceAtLeast(1) else 0)
+                put(peer, "$slot:batchAttempts", if (count > 1 && document == null) priorAttempts + 1 else 0)
                 put(peer, "$slot:batchProof", meta(peer, "batchProof"))
-                if (runCatching { JSONObject(texts[index]).optString("type") in setOf("care_sync", "care_delta") }.getOrDefault(false)) {
+                val fileAttempts = if (meta(peer, "$slot:fileProof") == meta(peer, "fileProof")) meta(peer, "$slot:fileAttempts") else 0
+                put(peer, "$slot:fileAt", if (document != null) now().coerceAtLeast(1) else 0)
+                put(peer, "$slot:fileAttempts", if (document != null) fileAttempts + 1 else 0)
+                put(peer, "$slot:fileProof", meta(peer, "fileProof"))
+                val type = runCatching { JSONObject(texts[index]).optString("type") }.getOrDefault("")
+                if (type == "care_location_head") {
+                    put(peer, "$slot:latestAt", now().coerceAtLeast(1))
+                    val sameProof = meta(peer, "latestAttemptProof") == meta(peer, "latestProof")
+                    val attempts = if (sameProof) meta(peer, "latestAttempts") else 0
+                    put(peer, "latestAttempts", attempts + 1); put(peer, "latestAttemptProof", meta(peer, "latestProof"))
+                    if (attempts == 0L) put(peer, "latestUnacknowledgedSince", now().coerceAtLeast(1))
+                }
+                if (type in setOf("care_sync", "care_delta")) {
                     put(peer, "$slot:careAt", now().coerceAtLeast(1))
                     put(peer, "$slot:careAttempts", meta(peer, "$slot:careAttempts") + 1)
                 }
             } }
-            if (controlReady(peer, false, false) || controlReady(peer, true, false)) put(peer, "controlTurn", 1)
+            if (document != null && ids.take(count).any { it != null }) {
+                val sameProof = meta(peer, "fileAttemptProof") == meta(peer, "fileProof")
+                val attempts = if (sameProof) meta(peer, "fileAttempts") else 0
+                put(peer, "fileAttempts", attempts + 1)
+                put(peer, "fileAttemptProof", meta(peer, "fileProof"))
+                if (attempts == 0L) put(peer, "fileUnacknowledgedSince", now().coerceAtLeast(1))
+            }
+            if (Feature.values().any { controlReady(peer, it, false) }) put(peer, "controlTurn", 1)
             if (!acknowledgements) put(peer, "dataTurnUntil", 0)
         } }
-        client.sendToFamilyMember(member, wire, checkActive)
+        if (document == null) client.sendToFamilyMember(member, wire, checkActive)
+        else client.sendDocumentToFamilyMember(member, document.caption, document.bytes, checkActive)
         afterSend(count)
         return count
     }
@@ -280,7 +353,7 @@ class FamilyTransport(
         val text = message.opt("text") as? String ?: return listOf(update)
         val json = runCatching { JSONObject(text) }.getOrNull() ?: return listOf(update)
         if (json.optString("app") != "TalkingFamily" || json.opt("v") != 5) return listOf(update)
-        data class Control(val sender: Long, val nonce: Long, val reply: Boolean, val care: Boolean)
+        data class Control(val sender: Long, val nonce: Long, val reply: Boolean, val feature: Feature)
         var control: Control? = null
         var batchSender: Long? = null
         val originals = runCatching {
@@ -292,13 +365,12 @@ class FamilyTransport(
                 chat.optString("type") == "private" && FamilyChatValidation.botId(chat.opt("id")) == sender &&
                 !message.has("forward_origin") && !message.has("forward_from") && !message.has("sender_chat"))
             when (json.getString("type")) {
-                "capabilities", "care_capabilities" -> {
-                    val care = json.getString("type") == "care_capabilities"
-                    val feature = if (care) "delta" else "batch"
-                    FamilyChatValidation.keys(json, setOf("app", "v", "type", feature, "nonce", "reply"))
-                    require(json.opt(feature) == 1 && json.opt("reply") is Boolean)
+                "capabilities", "care_capabilities", "file_capabilities", "latest_capabilities" -> {
+                    val feature = Feature.values().single { it.type == json.getString("type") }
+                    FamilyChatValidation.keys(json, setOf("app", "v", "type", feature.flag, "nonce", "reply"))
+                    require(json.opt(feature.flag) == 1 && json.opt("reply") is Boolean)
                     val nonce = FamilyChatValidation.botId(json.opt("nonce"))
-                    control = Control(sender, nonce, json.getBoolean("reply"), care)
+                    control = Control(sender, nonce, json.getBoolean("reply"), feature)
                     emptyList()
                 }
                 "batch" -> {
@@ -314,17 +386,21 @@ class FamilyTransport(
                 else -> null
             }
         }.getOrNull() ?: return null
-        control?.let { (sender, nonce, reply, care) ->
-            val prefix = if (care) "care" else "batch"
+        control?.let { (sender, nonce, reply, feature) ->
+            val prefix = feature.prefix
             if (reply && (meta(sender, "$prefix:challenge") != nonce ||
                 now() - meta(sender, "$prefix:challengeAt") !in 0..CAPABILITY_TTL_MILLIS)) return null
             // Storage failures must roll back the enclosing receive transaction and its offset.
             if (!reply) put(sender, "$prefix:replyNonce", nonce)
-            put(sender, if (care) "careSupportedUntil" else "supportedUntil", now() + CAPABILITY_TTL_MILLIS)
-            if (!care) {
+            put(sender, feature.supported, now() + CAPABILITY_TTL_MILLIS)
+            if (feature == Feature.BATCH) {
                 put(sender, "batchFallbackUntil", 0)
                 put(sender, "batchProof", meta(sender, "batchProof") + 1)
             }
+            if (feature == Feature.FILE) {
+                put(sender, "fileFallbackUntil", 0); put(sender, "fileProof", meta(sender, "fileProof") + 1)
+            }
+            if (feature == Feature.LATEST) put(sender, "latestProof", meta(sender, "latestProof") + 1)
         }
         batchSender?.let { sender ->
             // A fully validated batch is fresh evidence, including after an app upgrade or downgrade.
@@ -336,18 +412,55 @@ class FamilyTransport(
         return originals
     }
 
+    /** Metadata validation only; the exchange calls downloadDocument before taking its DB lock. */
+    fun prepareDocument(update: JSONObject): PreparedFamilyDocument? = FamilyDocumentProtocol.prepare(update, room, ownBotId)
+
+    fun downloadDocument(prepared: PreparedFamilyDocument): List<JSONObject> {
+        checkActive()
+        val bytes = client.downloadFamilyDocument(prepared.fileId, prepared.compressedBytes, checkActive)
+        val originals = FamilyDocumentProtocol.decode(prepared, bytes, room, ownBotId)
+        checkActive()
+        return originals
+    }
+
+    /** Inbound capability and replay context commit with originals; outbound ACK proof stays separate. */
+    fun noteDownloadedDocument(prepared: PreparedFamilyDocument, originals: List<JSONObject>) {
+        require(prepared.roomId == room.id && prepared.receiverId == ownBotId && originals.size == prepared.count)
+        put(prepared.actorId, "fileSupportedUntil", now() + CAPABILITY_TTL_MILLIS)
+        // A peer uploading a valid file does not prove it downloaded our originals. Inbound
+        // traffic must not reset the bounded outbound attempts or cancel an active fallback.
+        incomingBatchIds = originals.mapNotNull { it.optJSONObject("message")?.optString("text")?.let(::originalId) }.toSet()
+    }
+
+    /** Pure receive prepass: latest display data can precede history without mutating transport state. */
+    fun latestPreviewUpdates(update: JSONObject): List<JSONObject> = runCatching {
+        val message = update.optJSONObject("message") ?: return emptyList()
+        val text = message.opt("text") as? String ?: return emptyList()
+        val json = JSONObject(text)
+        if (json.optString("app") != "TalkingFamily") return emptyList()
+        if (json.opt("v") != 5) return listOf(update).filter { FamilyCareProtocol.receive(it, room, ownBotId)?.type == "care_location_head" }
+        if (json.optString("type") != "batch") return emptyList()
+        require(text.length <= 4096)
+        val actor = FamilyChatValidation.botId(message.getJSONObject("from").opt("id"))
+        require(actor != ownBotId && room.members.any { it.botId == actor } && message.getJSONObject("from").opt("is_bot") == true &&
+            message.getJSONObject("chat").optString("type") == "private" &&
+            FamilyChatValidation.botId(message.getJSONObject("chat").opt("id")) == actor &&
+            !message.has("forward_origin") && !message.has("forward_from") && !message.has("sender_chat"))
+        val originals = FamilyTransportProtocol.unpack(json).map { original ->
+            JSONObject().put("message", JSONObject(message.toString()).put("text", original))
+        }
+        require(originals.all { FamilyChatProtocol.receive(it, room, ownBotId) != null || FamilyCareProtocol.receive(it, room, ownBotId) != null })
+        originals.filter { FamilyCareProtocol.receive(it, room, ownBotId)?.type == "care_location_head" }
+    }.getOrDefault(emptyList())
+
     /** Responses are one-way. A legacy peer ignores the bounded probe and still receives v3/v4 data. */
     fun flushControls(repliesOnly: Boolean) {
         for (member in room.members.filter { it.botId != ownBotId }) {
             checkActive()
             val peer = member.botId
-            // One control per peer per pass; batch negotiation precedes optional care deltas.
-            val care = synchronized(lock) { when {
-                controlReady(peer, false, repliesOnly) -> false
-                controlReady(peer, true, repliesOnly) -> true
-                else -> null
-            } } ?: continue
-            val prefix = if (care) "care" else "batch"
+            // One eligible control per peer per pass, without blocking another feature's retry.
+            val feature = synchronized(lock) { Feature.values().firstOrNull { controlReady(peer, it, repliesOnly) } } ?: continue
+            val prefix = feature.prefix
             val reply = synchronized(lock) { meta(peer, "$prefix:replyNonce") }
             val probe = reply == 0L
             if (!reserve(peer)) continue
@@ -356,8 +469,12 @@ class FamilyTransport(
                 put(peer, "$prefix:challenge", nonce); put(peer, "$prefix:challengeAt", now())
             } }
             try {
-                val text = if (care) FamilyTransportProtocol.careCapability(nonce, reply != 0L)
-                    else FamilyTransportProtocol.capability(nonce, reply != 0L)
+                val text = when (feature) {
+                    Feature.BATCH -> FamilyTransportProtocol.capability(nonce, reply != 0L)
+                    Feature.CARE -> FamilyTransportProtocol.careCapability(nonce, reply != 0L)
+                    Feature.FILE -> FamilyTransportProtocol.fileCapability(nonce, reply != 0L)
+                    Feature.LATEST -> FamilyTransportProtocol.latestCapability(nonce, reply != 0L)
+                }
                 client.sendToFamilyMember(member, text, checkActive)
                 synchronized(lock) {
                     if (reply != 0L) put(peer, "$prefix:replyNonce", 0)
@@ -382,5 +499,8 @@ class FamilyTransport(
         fun supportsCareDeltas(store: TelegramExchangeStore, roomId: String, peer: Long,
             nowMillis: Long = System.currentTimeMillis()): Boolean =
             store.meta("transport:$roomId:$peer:careSupportedUntil") > nowMillis
+        fun supportsLatestLocation(store: TelegramExchangeStore, roomId: String, peer: Long,
+            nowMillis: Long = System.currentTimeMillis()): Boolean =
+            store.meta("transport:$roomId:$peer:latestSupportedUntil") > nowMillis
     }
 }

@@ -8,6 +8,20 @@ interface FamilyCareStore {
         FamilyCareStateMetadata(it.epoch, it.revision, it.authoritative)
     }
     fun saveState(state: FamilyCareState)
+    fun latestLocationHead(roomId: String, childId: Long): FamilyCareLocationHead? = null
+    /** Monotonic current-location cache; does not write the care replay index or board revision. */
+    fun saveLatestLocationHead(head: FamilyCareLocationHead): Boolean = false
+    /** At most one disposable current-location summary per parent; historical originals stay intact. */
+    fun queueLatestLocationHead(packet: FamilyCareOutgoing) = Unit
+    fun pendingLatestLocationHeads(roomId: String): List<FamilyCareOutgoing> = emptyList()
+    fun pendingLatestLocationHead(roomId: String, packetId: String, peerId: Long): FamilyCareOutgoing? =
+        pendingLatestLocationHeads(roomId).firstOrNull { it.packetId == packetId && it.peerId == peerId }
+    fun markLatestLocationSent(roomId: String, packetId: String, peerId: Long, sentAt: Long) = Unit
+    fun markLatestLocationConfirmed(roomId: String, packetId: String, peerId: Long) = Unit
+    fun acknowledgeLatestLocationHead(roomId: String, packetId: String, peerId: Long, digest: String) = Unit
+    fun latestLocationSentAt(roomId: String, peerId: Long): Long = 0
+    fun acknowledgedLatestLocationHead(roomId: String, childId: Long, peerId: Long): FamilyCareLocationHead? = null
+    fun movementEventDigest(roomId: String, childId: Long, eventId: String): String? = null
     /** Bounded repair history; permanent event identities must never be pruned with it. */
     fun saveDelta(delta: FamilyCareDelta) = Unit
     fun deltas(roomId: String, childId: Long, epoch: String, afterRevision: Long, limit: Int): List<FamilyCareDelta> = emptyList()

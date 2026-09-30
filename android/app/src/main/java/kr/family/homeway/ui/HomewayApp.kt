@@ -53,6 +53,7 @@ import kr.family.homeway.data.ServiceNotificationSettings
 import kr.family.homeway.R
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
@@ -384,10 +385,18 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
         while (true) { delay(30_000); value = Instant.now() }
     }
     val readings = state.locationHistory
-    val careScope = careScopeKey(state)
-    var selectedRecordId by rememberSaveable(careScope, state.historyDay) { mutableStateOf<String?>(null) }
-    var focusRequest by rememberSaveable(careScope, state.historyDay) { mutableIntStateOf(0) }
-    val timeline = remember(readings) { EmbeddedMapTimeline.from(readings) }
+    val careScope = "${careScopeKey(state)}/${state.selfBotId}/${state.botUsername}/${state.peerBotUsername}/${state.demoMode}"
+    var followingLatest by rememberSaveable(careScope) { mutableStateOf(true) }
+    var selectedRecordId by rememberSaveable(careScope) { mutableStateOf<String?>(null) }
+    var pinnedRecordJson by rememberSaveable(careScope) { mutableStateOf<String?>(null) }
+    var focusRequest by rememberSaveable(careScope) { mutableIntStateOf(0) }
+    val pinnedRecord = remember(pinnedRecordJson) {
+        pinnedRecordJson?.let { runCatching { FamilyEvent.parse(JSONObject(it)) }.getOrNull() }
+    }
+    val displayedReadings = remember(readings, state.latestLocation, followingLatest, state.historyDay, pinnedRecord) {
+        LocationMapDisplay.history(readings, state.latestLocation, followingLatest, state.historyDay, pinned = pinnedRecord)
+    }
+    val timeline = remember(displayedReadings) { EmbeddedMapTimeline.from(displayedReadings) }
     val records = timeline.records
     val historyPoints = timeline.locations
     val selectedIndex = records.indexOfFirst { it.event.id == selectedRecordId }.takeIf { it >= 0 } ?: records.lastIndex
@@ -404,15 +413,25 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
     var timelineInset by remember { mutableIntStateOf(132) }
     val selectPoint: (Int) -> Unit = { index ->
         records.getOrNull(index)?.event?.let { event ->
+            followingLatest = false
+            // One bounded captured record keeps a live point selectable until its history arrives.
+            pinnedRecordJson = event.json().toString().takeIf { it.length <= 4096 }
             if (selectedRecordId != event.id) { selectedRecordId = event.id; focusRequest++ }
         }
+    }
+    val selectDay: (String) -> Unit = { day ->
+        followingLatest = false
+        selectedRecordId = null
+        pinnedRecordJson = null
+        focusRequest++
+        actions.selectHistoryDay(day)
     }
     val dayIndex = state.historyDays.indexOf(state.historyDay)
     LazyColumn(Modifier.fillMaxSize().testTag("location-list"), state = listState, contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         if (state.careEnabled) item(key = "care-child-selector") { CareChildSelector(state, actions) }
         item(key = "history-day") {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton({ state.historyDays.getOrNull(dayIndex + 1)?.let(actions.selectHistoryDay) }, enabled = dayIndex >= 0 && dayIndex + 1 < state.historyDays.size) { Icon(Icons.Outlined.ChevronLeft, "이전 기록 날짜") }
+                IconButton({ state.historyDays.getOrNull(dayIndex + 1)?.let(selectDay) }, enabled = dayIndex >= 0 && dayIndex + 1 < state.historyDays.size) { Icon(Icons.Outlined.ChevronLeft, "이전 기록 날짜") }
                 Box(Modifier.weight(1f)) {
                     OutlinedButton({ dateMenu = true }, Modifier.fillMaxWidth().testTag("history-date-selector"), enabled = state.historyDays.isNotEmpty()) {
                         Icon(Icons.Outlined.CalendarMonth, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp))
@@ -420,11 +439,11 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
                     }
                     DropdownMenu(dateMenu, { dateMenu = false }, modifier = Modifier.heightIn(max = 320.dp)) {
                         state.historyDays.forEach { day ->
-                            DropdownMenuItem(text = { Text(historyDateLabel(day)) }, onClick = { dateMenu = false; actions.selectHistoryDay(day) })
+                            DropdownMenuItem(text = { Text(historyDateLabel(day)) }, onClick = { dateMenu = false; selectDay(day) })
                         }
                     }
                 }
-                IconButton({ state.historyDays.getOrNull(dayIndex - 1)?.let(actions.selectHistoryDay) }, enabled = dayIndex > 0) { Icon(Icons.Outlined.ChevronRight, "다음 기록 날짜") }
+                IconButton({ state.historyDays.getOrNull(dayIndex - 1)?.let(selectDay) }, enabled = dayIndex > 0) { Icon(Icons.Outlined.ChevronRight, "다음 기록 날짜") }
             }
             if (state.historyLoading) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Forest)
         }
@@ -472,8 +491,9 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
                                         Icon(Icons.Outlined.ChevronRight, "다음 시각의 위치")
                                     }
                                     TextButton({
-                                        selectedRecordId = null; focusRequest++
-                                        val latestDay = state.historyDays.firstOrNull()
+                                        followingLatest = true; selectedRecordId = null; pinnedRecordJson = null; focusRequest++
+                                        val latestDay = LocationMapDisplay.latestDay(LocationMapDisplay.latest(readings, state.latestLocation))
+                                            ?: state.historyDays.firstOrNull()
                                         if (latestDay != null && latestDay != state.historyDay) actions.selectHistoryDay(latestDay)
                                     }, contentPadding = PaddingValues(horizontal = 4.dp)) { Text("최신") }
                                 }
@@ -534,7 +554,9 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
             item(key = "hour-$hour") { Text(hour, fontWeight = FontWeight.Bold, color = Forest, modifier = Modifier.padding(top = 8.dp)) }
             items(events, key = { it.id }) { event ->
                 TimelineCard(event, selected = event.id == selected?.id, onSelect = if (records.any { it.event.id == event.id }) ({
+                    followingLatest = false
                     selectedRecordId = event.id
+                    pinnedRecordJson = event.json().toString().takeIf { it.length <= 4096 }
                     focusRequest++
                     scope.launch { listState.animateScrollToItem(if (state.careEnabled) 2 else 1) }
                 }) else null)

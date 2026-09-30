@@ -91,6 +91,22 @@ data class FamilyCareDelta(val roomId: String, val childId: Long, val epoch: Str
     }
 }
 
+/** Current map position is independent of ordered financial state and the durable historical lane. */
+data class FamilyCareLocationHead(val roomId: String, val childId: Long, val epoch: String,
+    val revision: Long, val event: FamilyEvent) {
+    val eventDigest: String get() = FamilyCareValidation.digest(event.json())
+    fun json(): JSONObject = JSONObject().put("epoch", epoch).put("revision", revision).put("event", event.json())
+    companion object {
+        fun parse(roomId: String, childId: Long, body: JSONObject): FamilyCareLocationHead {
+            FamilyChatValidation.keys(body, setOf("epoch", "revision", "event"))
+            val event = TelegramLedger.validate(FamilyEvent.parse(body.getJSONObject("event")))
+            require(event.kind == "location" && event.sender == "child" && event.delivery == "relayed")
+            return FamilyCareLocationHead(roomId, childId, FamilyChatValidation.identifier(body.getString("epoch")),
+                FamilyCareValidation.counter(body.opt("revision")), event)
+        }
+    }
+}
+
 object FamilyCareValidation {
     val parentRelationships = setOf("mother", "father")
     val childRelationships = setOf("son", "daughter")

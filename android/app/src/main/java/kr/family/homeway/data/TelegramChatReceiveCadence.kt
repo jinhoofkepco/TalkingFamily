@@ -6,6 +6,7 @@ internal data class TelegramReceiveProgress(
     val acknowledgedCount: Int = 0,
     val pendingReceipts: Boolean = false,
     val pendingOutgoing: Boolean = false,
+    val hasMoreUpdates: Boolean = false,
 )
 
 /** Monotonic normal deadlines with a separate, bounded backlog drain. */
@@ -63,7 +64,7 @@ internal class TelegramChatReceiveSchedule(initiallyVisible: Boolean, nowMillis:
     /** A full page proves more may be waiting. A queued outgoing record alone proves nothing. */
     fun onPollProgress(progress: TelegramReceiveProgress, nowMillis: Long) {
         expireCatchUp(nowMillis)
-        val backlog = progress.updateCount >= TELEGRAM_PAGE_SIZE || progress.pendingReceipts ||
+        val backlog = progress.hasMoreUpdates || progress.updateCount >= TELEGRAM_PAGE_SIZE || progress.pendingReceipts ||
             (progress.acknowledgedCount > 0 && progress.pendingOutgoing)
         if (catchUpStartedAt == null) {
             if (!backlog || nowMillis < catchUpCooldownUntil) return
@@ -72,7 +73,7 @@ internal class TelegramChatReceiveSchedule(initiallyVisible: Boolean, nowMillis:
             emptyCatchUpPolls = 0
         }
         catchUpPolls++
-        if (progress.updateCount == 0 && !progress.pendingReceipts) emptyCatchUpPolls++
+        if (progress.updateCount == 0 && !progress.pendingReceipts && !progress.hasMoreUpdates) emptyCatchUpPolls++
         else emptyCatchUpPolls = 0
         // Allow one extra empty request for an ACK in flight, then restore the saved normal cadence.
         if (catchUpPolls >= CATCH_UP_MAX_POLLS || emptyCatchUpPolls >= CATCH_UP_MAX_EMPTY_POLLS) {

@@ -204,7 +204,14 @@ class HomewayViewModelProjectionTest {
     }
 
     @Test fun slowPreviousChildProjectionCannotPaintOverANewChildSelection() = runBlocking {
+        val board = store.familyCare.state(room.id, 202)!!
+        val at = "2026-09-30T10:00:00Z"
+        val point = FamilyEvent(UUID.randomUUID().toString(), "location", org.json.JSONObject()
+            .put("latitude", 37.0).put("longitude", 127.0).put("accuracy", 12.0)
+            .put("capturedAt", at).put("source", "automatic"), "child", at, "relayed")
+        store.familyCare.saveLatestLocationHead(FamilyCareLocationHead(room.id, 202, board.epoch, 80, point))
         createModel(); awaitReady()
+        assertEquals(point.id, model.state.value.latestLocation!!.id)
         val gate = blockNextRead()
         val observed = Collections.synchronizedList(mutableListOf<Pair<Long?, Int>>())
         val collect = launch(Dispatchers.Default) {
@@ -216,12 +223,27 @@ class HomewayViewModelProjectionTest {
             instrumentation.runOnMainSync { model.selectCareChild(303) }
             assertEquals(303L, model.state.value.selectedChildBotId)
             assertEquals("Old child content must be cleared immediately", 0, model.state.value.stickerBalance)
+            assertNull("Old child's current location must be cleared with their board", model.state.value.latestLocation)
             awaitState { prefs.getLong("careChild_${room.id}", 0) == 303L }
         } finally { gate.release.countDown() }
         awaitState { model.state.value.selectedChildBotId == 303L && model.state.value.stickerBalance == 8 }
         assertFalse("First child's board must never appear under second child's name",
             synchronized(observed) { observed.any { it.first == 303L && it.second == 2 } })
         collect.cancel()
+    }
+
+    @Test fun latestLocationProjectsIndependentlyOfTheBoardRevisionAndHistoryPage() = runBlocking {
+        val board = store.familyCare.state(room.id, 202)!!
+        val at = "2026-09-30T10:00:00Z"
+        val event = FamilyEvent(UUID.randomUUID().toString(), "location", org.json.JSONObject()
+            .put("latitude", 37.0).put("longitude", 127.0).put("accuracy", 12.0)
+            .put("capturedAt", at).put("source", "automatic"), "child", at, "relayed")
+        assertTrue(store.familyCare.saveLatestLocationHead(FamilyCareLocationHead(room.id, 202, board.epoch, 80, event)))
+        createModel()
+        awaitState { !model.state.value.loading && model.state.value.latestLocation?.id == event.id }
+        assertEquals(2, model.state.value.stickerBalance)
+        assertEquals(1L, store.familyCare.stateMetadata(room.id, 202)!!.revision)
+        assertFalse(readOnMain.get())
     }
 
     @Test fun slowPreviousAccountProjectionCannotRestoreARoomAfterReset() = runBlocking {

@@ -276,6 +276,35 @@ class AppRepositoryFamilyCareTest {
         assertTrue(repo.movementHistory(childId = 104).events.isEmpty())
     }
 
+    @Test fun independentLatestLocationIsVisibleBeforeBoardSyncAndIsScopedToSelectedChild() {
+        savedPair(101, "guardian", 103)
+        val sonEpoch = UUID.randomUUID().toString()
+        val daughterEpoch = UUID.randomUUID().toString()
+        val son = locationEvent(latitude = 10.0)
+        val daughter = locationEvent(latitude = 20.0)
+        store.transaction {
+            store.familyChat.setActiveRoom(activeRoom)
+            assertTrue(store.familyCare.saveLatestLocationHead(FamilyCareLocationHead(activeRoom.id, 103, sonEpoch, 80, son)))
+            assertTrue(store.familyCare.saveLatestLocationHead(FamilyCareLocationHead(activeRoom.id, 104, daughterEpoch, 90, daughter)))
+        }
+        val first = repo.readUiSnapshot()
+        assertNull(first.careSnapshot)
+        assertEquals(son.id, first.latestLocation!!.id)
+        assertEquals(103L, first.latestLocation!!.senderId)
+        store.familyCare.saveState(FamilyCareState(activeRoom.id, 103, sonEpoch, 1, false,
+            TelegramLedger.emptyState().put("stickerBalance", 7)))
+        val synced = repo.readUiSnapshot()
+        assertEquals(7, synced.careSnapshot!!.stickerBalance)
+        assertEquals(1L, store.familyCare.stateMetadata(activeRoom.id, 103)!!.revision)
+        assertEquals(son.id, synced.latestLocation!!.id)
+        repo.selectCareChild(104)
+        val selected = repo.readUiSnapshot()
+        assertEquals(daughter.id, selected.latestLocation!!.id)
+        assertEquals(104L, selected.latestLocation!!.senderId)
+        assertNull(selected.careSnapshot)
+        assertTrue(fake.methods.isEmpty())
+    }
+
     private fun locationPayload(latitude: Double = 10.0) = JSONObject().put("latitude", latitude)
         .put("longitude", 20.0).put("accuracy", 12.0).put("capturedAt", measuredAt).put("source", "manual")
 

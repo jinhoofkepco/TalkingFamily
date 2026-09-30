@@ -16,6 +16,7 @@ class FamilyCareEngine(
     private val checkActive: () -> Unit = {},
     private val transport: FamilyTransport? = null,
     private val canSyncDeltas: (Long) -> Boolean = { false },
+    private val canSendLatestLocation: (Long) -> Boolean = { false },
 ) {
     private val room = FamilyChatValidation.room(room)
     private val parents get() = room.members.filter { FamilyCareValidation.isParent(room, it.botId) }.map { it.botId }
@@ -25,6 +26,15 @@ class FamilyCareEngine(
 
     fun currentSnapshot(childId: Long): FamilyCareState? = synchronized(lock) {
         store.state(room.id, childId)?.let { it.copy(state = JSONObject(it.state.toString())) }
+    }
+
+    /** A location preview never substitutes for, or advances, the ordered praise-board state. */
+    fun latestLocation(childId: Long): FamilyEvent? = synchronized(lock) {
+        val current = store.state(room.id, childId)
+        val cached = store.latestLocationHead(room.id, childId)?.takeIf { current == null || it.epoch == current.epoch }?.event
+        val ordered = current?.state?.optJSONObject("latestLocation")?.let(FamilyEvent::parse)
+        listOfNotNull(cached, ordered).maxByOrNull { Instant.parse(it.measuredAt) }
+            ?.let { it.copy(payload = JSONObject(it.payload.toString())) }
     }
 
     /** A transport ACK alone never makes a parent command appear completed. */
@@ -108,6 +118,13 @@ class FamilyCareEngine(
             store.saveDelta(delta)
             store.archiveEvent(room.id, ownBotId, event)
             packets.forEach(store::queuePacket)
+            if (event.kind == "location" && next.state.optJSONObject("latestLocation")?.optString("id") == event.id) {
+                val head = FamilyCareLocationHead(room.id, ownBotId, next.epoch, next.revision, event)
+                store.saveLatestLocationHead(head)
+                parents.filter(canSendLatestLocation).forEach { peer ->
+                    store.queueLatestLocationHead(FamilyCareProtocol.outgoing(room, ownBotId, ownBotId, peer, "care_location_head", head.json()))
+                }
+            }
             next
         }
     }
@@ -147,12 +164,22 @@ class FamilyCareEngine(
     /** The surrounding exchange transaction also commits its Telegram update offset. */
     fun processUpdate(update: JSONObject) {
         val packet = FamilyCareProtocol.receive(update, room, ownBotId) ?: return
+        if (packet.type == "care_location_head") {
+            if (acceptLocationHead(packet) != null) store.queueReceipt(FamilyCareReceipt(room.id, packet.id, packet.childId, packet.actorId, packet.digest))
+            return
+        }
         if (packet.type == "care_ack") {
             val digest = try {
                 FamilyChatValidation.keys(packet.body, setOf("digest"))
                 FamilyCareValidation.hash(packet.body.getString("digest"))
             } catch (_: IllegalArgumentException) { return }
             catch (_: org.json.JSONException) { return }
+            val live = store.pendingLatestLocationHead(room.id, packet.id, packet.actorId)
+            if (live != null && live.childId == packet.childId && live.digest == digest && live.sentAt > 0) {
+                store.acknowledgeLatestLocationHead(room.id, packet.id, packet.actorId, digest)
+                transport?.noteAcknowledgedPacket(packet.actorId, packet.id)
+                return
+            }
             // Storage failures must roll back the shared receive offset, not disappear as malformed input.
             val pending = store.pendingPacket(room.id, packet.id, packet.actorId)
             if (pending != null && pending.childId == packet.childId && pending.digest == digest && pending.sentAt > 0) {
@@ -213,6 +240,31 @@ class FamilyCareEngine(
             store.recordReceived(room.id, packet.id, packet.digest)
         }
         store.queueReceipt(FamilyCareReceipt(room.id, packet.id, packet.childId, packet.actorId, packet.digest))
+    }
+
+    /** Used before a blocked file download: no cursor, finance, replay index or historical ACK changes. */
+    fun processLatestPreview(update: JSONObject): Boolean {
+        val packet = FamilyCareProtocol.receive(update, room, ownBotId) ?: return false
+        if (packet.type != "care_location_head") return false
+        return acceptLocationHead(packet) == true
+    }
+
+    private fun acceptLocationHead(packet: FamilyCareProtocol.Packet): Boolean? {
+        val head = try { FamilyCareLocationHead.parse(room.id, packet.childId, packet.body) }
+            catch (_: IllegalArgumentException) { return null }
+            catch (_: org.json.JSONException) { return null }
+        val known = store.stateMetadata(room.id, packet.childId)
+        if (known != null && known.epoch != head.epoch) return null
+        val prior = store.latestLocationHead(room.id, packet.childId)
+        if (prior != null && prior.epoch != head.epoch && known == null) return null
+        if (prior != null && prior.epoch == head.epoch && prior.revision == head.revision && prior.eventDigest != head.eventDigest) return null
+        val eventDigest = TelegramLedger.eventDigest(head.event)
+        val replayDigest = store.eventDigest(room.id, packet.childId, head.event.id)
+        val archivedDigest = store.movementEventDigest(room.id, packet.childId, head.event.id)
+        if ((replayDigest != null && replayDigest != eventDigest) || (archivedDigest != null && archivedDigest != eventDigest)) return null
+        val changed = store.saveLatestLocationHead(head)
+        store.archiveEvent(room.id, packet.childId, head.event)
+        return changed
     }
 
     private fun rejectMalformedCommand(packet: FamilyCareProtocol.Packet) {
@@ -478,9 +530,10 @@ class FamilyCareEngine(
     }
 
     fun hasReadyWork(): Boolean = synchronized(lock) {
+        if (readyLatestLocations().isNotEmpty()) return@synchronized true
         val peers = store.pendingPeers(room.id)
         peers.any { peer -> store.retryAfter(room.id, peer) <= now() &&
-            (store.firstReceipt(room.id, peer) != null || nextSendable(store.pendingPackets(room.id, peer, MAX_UNACKNOWLEDGED_PER_PEER)) != null)
+            (store.firstReceipt(room.id, peer) != null || nextSendable(store.pendingPackets(room.id, peer, outgoingWindow(peer))) != null)
         }
     }
 
@@ -490,7 +543,7 @@ class FamilyCareEngine(
 
     /** Confirmed HTTP sends may await ACK together; an ambiguous attempt blocks everything after it. */
     private fun nextSendable(packets: List<FamilyCareOutgoing>, sentThisFlush: Set<String> = emptySet()): FamilyCareOutgoing? {
-        for (packet in packets.take(MAX_UNACKNOWLEDGED_PER_PEER)) {
+        for (packet in packets.take(FamilyTransportProtocol.MAX_FILE_PACKETS)) {
             if (packet.packetId in sentThisFlush) continue
             if (packet.sentAt == 0L) return packet
             val retryDue = now() - packet.sentAt >= RETRY_MILLIS
@@ -539,13 +592,13 @@ class FamilyCareEngine(
     private fun flushTransport(member: FamilyChatMember, transport: FamilyTransport) {
         val peer = member.botId
         synchronized(lock) { store.transaction { prepareCompatibilityFallbacks(peer, transport) } }
-        val queuedReceipts = synchronized(lock) { store.receipts(room.id, peer, FamilyTransportProtocol.MAX_PACKETS) }
+        val queuedReceipts = synchronized(lock) { store.receipts(room.id, peer, outgoingWindow(peer)) }
         val receipts = queuedReceipts.take(transport.batchableAcknowledgementCount(peer, queuedReceipts.map { it.packetId }))
         if (receipts.isNotEmpty()) transport.send(member, receipts.map { FamilyCareProtocol.receipt(room, ownBotId, it) },
             allowBatch = transport.canBatchAcknowledgements(peer, receipts.map { it.packetId }), afterSend = { count ->
             synchronized(lock) { store.transaction { receipts.take(count).forEach(store::removeReceipt) } }
         })
-        val candidates = synchronized(lock) { store.pendingPackets(room.id, peer, MAX_UNACKNOWLEDGED_PER_PEER) }
+        val candidates = synchronized(lock) { store.pendingPackets(room.id, peer, outgoingWindow(peer)) }
         val first = nextSendable(candidates) ?: return
         // Preserve FIFO, but include every due original in a retry batch. The transport independently
         // falls back for peers that stop acknowledging batches, without changing original identities.
@@ -560,6 +613,63 @@ class FamilyCareEngine(
                 packets.take(count).forEach { store.markSendConfirmed(room.id, it.packetId, peer) }
             } }
         })
+    }
+
+    private fun outgoingWindow(peer: Long): Int = if (transport?.supportsFiles(peer) == true)
+        FamilyTransportProtocol.MAX_FILE_PACKETS else MAX_UNACKNOWLEDGED_PER_PEER
+
+    private fun readyLatestLocations(): List<FamilyCareOutgoing> = store.pendingLatestLocationHeads(room.id).filter { packet ->
+        val last = store.latestLocationSentAt(room.id, packet.peerId)
+        canSendLatestLocation(packet.peerId) && store.retryAfter(room.id, packet.peerId) <= now() &&
+            (last == 0L || now() < last || now() - last >= LATEST_LOCATION_MIN_INTERVAL_MILLIS) &&
+            (packet.sentAt == 0L || now() < packet.sentAt || now() - packet.sentAt >= RETRY_MILLIS)
+    }
+
+    /** Called before chat/history lanes. A persisted five-second limit leaves them repeated send turns. */
+    fun flushLatestLocations() {
+        val sender = transport ?: return
+        synchronized(lock) { store.transaction { seedLatestLocations() } }
+        val packets = synchronized(lock) { readyLatestLocations() }
+        for (packet in packets) {
+            checkActive()
+            if (sender.shouldFallbackLatestLocation(packet.peerId)) {
+                sender.noteLatestLocationFallback(packet.peerId)
+                continue
+            }
+            val member = room.members.firstOrNull { it.botId == packet.peerId } ?: continue
+            try {
+                sender.send(member, listOf(packet.text), allowBatch = false, beforeSend = {
+                    synchronized(lock) { store.transaction { store.markLatestLocationSent(room.id, packet.packetId, packet.peerId, now().coerceAtLeast(1)) } }
+                }, afterSend = {
+                    synchronized(lock) { store.transaction { store.markLatestLocationConfirmed(room.id, packet.packetId, packet.peerId) } }
+                })
+            } catch (error: TelegramException) {
+                if (error.errorCode in setOf(401, 404, 409, 429)) throw error
+                synchronized(lock) { store.transaction { store.setRetryAfter(room.id, packet.peerId, now() + 15_000) } }
+            }
+        }
+    }
+
+    /** A newly negotiated parent receives the already known position, including just after an upgrade. */
+    private fun seedLatestLocations() {
+        if (!FamilyCareValidation.isChild(room, ownBotId)) return
+        val recipients = parents.filter(canSendLatestLocation)
+        if (recipients.isEmpty()) return
+        val metadata = store.stateMetadata(room.id, ownBotId) ?: return
+        if (!metadata.authoritative) return
+        val cached = store.latestLocationHead(room.id, ownBotId)?.takeIf { it.epoch == metadata.epoch }
+        val head = cached ?: store.state(room.id, ownBotId)?.state?.optJSONObject("latestLocation")?.let { location ->
+            FamilyCareLocationHead(room.id, ownBotId, metadata.epoch, metadata.revision,
+                TelegramLedger.validate(FamilyEvent.parse(location).copy(delivery = "relayed")))
+        }?.also(store::saveLatestLocationHead) ?: return
+        val pending = store.pendingLatestLocationHeads(room.id).filter { it.childId == ownBotId }.associateBy { it.peerId }
+        for (peer in recipients) {
+            val active = pending[peer]?.let { FamilyCareLocationHead.parse(room.id, ownBotId, JSONObject(it.text).getJSONObject("body")) }
+            if (active?.epoch == head.epoch && active.eventDigest == head.eventDigest) continue
+            val acknowledged = store.acknowledgedLatestLocationHead(room.id, ownBotId, peer)
+            if (acknowledged?.epoch == head.epoch && acknowledged.eventDigest == head.eventDigest) continue
+            store.queueLatestLocationHead(FamilyCareProtocol.outgoing(room, ownBotId, ownBotId, peer, "care_location_head", head.json()))
+        }
     }
 
     private fun prepareCompatibilityFallbacks(peer: Long, transport: FamilyTransport) {
@@ -594,5 +704,6 @@ class FamilyCareEngine(
         private const val MAX_PACKETS_PER_FLUSH = 8
         private const val MAX_RECEIPTS_PER_FLUSH = 8
         private const val RETRY_MILLIS = 30_000L
+        private const val LATEST_LOCATION_MIN_INTERVAL_MILLIS = 5_000L
     }
 }

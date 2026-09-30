@@ -82,7 +82,7 @@ class FamilyCareStoreTest {
             db.version = 4
         }
         val db = store()
-        assertEquals(8, db.readableDatabase.version)
+        assertEquals(9, db.readableDatabase.version)
         assertEquals(oldState.toString(), db.cached()!!.toString())
         assertEquals(9812L, db.meta("offset"))
         assertEquals(119L, db.meta("sentAt"))
@@ -124,7 +124,7 @@ class FamilyCareStoreTest {
             version = 5
         }
         val upgraded = reopen()
-        assertEquals(8, upgraded.readableDatabase.version)
+        assertEquals(9, upgraded.readableDatabase.version)
         assertEquals(12345L, upgraded.meta("offset"))
         assertEquals(source.epoch, upgraded.familyCare.state(roomId, 103)!!.epoch)
         assertEquals(999L, upgraded.familyCare.retryAfter(roomId, 102))
@@ -189,7 +189,7 @@ class FamilyCareStoreTest {
             version = 6
         }
         val upgraded = reopen()
-        assertEquals(8, upgraded.readableDatabase.version)
+        assertEquals(9, upgraded.readableDatabase.version)
         // Opening a database must not parse a large old care state on a service's main thread.
         upgraded.readableDatabase.rawQuery("SELECT state,epoch FROM family_care_states", null).use {
             assertTrue(it.moveToFirst()); assertTrue(it.isNull(1)); assertEquals(oldState.json().toString(), it.getString(0))
@@ -545,7 +545,7 @@ class FamilyCareStoreTest {
             db.version = 7
         }
         val upgraded = store()
-        assertEquals(8, upgraded.readableDatabase.version)
+        assertEquals(9, upgraded.readableDatabase.version)
         assertEquals(51, upgraded.familyCare.state(source.roomId, 103)!!.snapshot.stickerBalance)
         assertEquals(FamilyCareStateMetadata(source.epoch, 27, true), upgraded.familyCare.stateMetadata(source.roomId, 103))
         assertEquals(digest("already approved"), upgraded.familyCare.eventDigest(source.roomId, 103, financialId))
@@ -655,6 +655,105 @@ class FamilyCareStoreTest {
         val history = reopen().familyCare.movementHistory(group.id, 103, zone = utc)
         assertEquals(event.id, history.events.single().id)
         assertEquals(37.0, history.events.single().payload.getDouble("latitude"), 0.0)
+    }
+
+    @Test fun latestLocationCacheSurvivesRestartWithoutAdvancingBoardReplayIdsOrCursorAndRollsBackAtomically() {
+        val source = state(id(), revision = 1, authority = false).copy(state = TelegramLedger.emptyState().put("stickerBalance", 77))
+        val head = FamilyCareLocationHead(source.roomId, 103, source.epoch, 100, location())
+        var care = store().familyCare
+        care.saveState(source); store().setMeta("offset", 84921)
+        assertTrue(care.saveLatestLocationHead(head)); care.archiveEvent(source.roomId, 103, head.event)
+        care = reopen().familyCare
+        assertEquals(head.event.id, care.latestLocationHead(source.roomId, 103)!!.event.id)
+        assertEquals(1L, care.stateMetadata(source.roomId, 103)!!.revision)
+        assertEquals(77, care.state(source.roomId, 103)!!.snapshot.stickerBalance)
+        assertNull(care.eventDigest(source.roomId, 103, head.event.id))
+        assertEquals(84921L, store().meta("offset"))
+        assertFalse(care.saveLatestLocationHead(head.copy(revision = 99, event = location())))
+        assertThrows(IllegalArgumentException::class.java) { care.saveLatestLocationHead(head.copy(event = location(latitude = 38.0))) }
+        assertFalse(care.saveLatestLocationHead(head.copy(epoch = id(), revision = 101)))
+        assertEquals(head.event.id, care.latestLocationHead(source.roomId, 103)!!.event.id)
+        val next = head.copy(revision = 101, event = location("2026-09-24T03:01:00Z"))
+        assertThrows(IllegalStateException::class.java) { care.transaction {
+            care.saveLatestLocationHead(next); care.archiveEvent(source.roomId, 103, next.event)
+            store().setMeta("offset", 84922); error("rollback preview")
+        } }
+        assertEquals(head.event.id, care.latestLocationHead(source.roomId, 103)!!.event.id)
+        assertEquals(listOf(head.event.id), care.movementHistory(source.roomId, 103, zone = utc).events.map { it.id })
+        assertEquals(84921L, store().meta("offset"))
+    }
+
+    @Test fun firstVerifiedBoardPinsProvisionalLocationEpochAndOldBufferedHeadsCannotResurrectIt() {
+        val roomId = id(); var care = store().familyCare
+        val provisional = FamilyCareLocationHead(roomId, 103, id(), 5, location())
+        assertTrue(care.saveLatestLocationHead(provisional))
+        assertNotNull(reopen().familyCare.latestLocationHead(roomId, 103))
+        care = store().familyCare
+        val verified = state(roomId, revision = 0, authority = false)
+        care.saveState(verified)
+        assertNull(care.latestLocationHead(roomId, 103))
+        assertFalse(care.saveLatestLocationHead(provisional.copy(revision = 6)))
+        val current = provisional.copy(epoch = verified.epoch, revision = 7, event = location("2026-09-24T03:01:00Z"))
+        assertTrue(care.saveLatestLocationHead(current))
+        assertEquals(current.event.id, reopen().familyCare.latestLocationHead(roomId, 103)!!.event.id)
+        assertEquals(verified.epoch, store().familyCare.stateMetadata(roomId, 103)!!.epoch)
+    }
+
+    @Test fun currentLocationSlotsCoalesceAcrossRestartAndOnlyMatchingSentHeadAckClearsThem() {
+        val group = room(); val epoch = id(); var care = store().familyCare
+        val oldHead = FamilyCareLocationHead(group.id, 103, epoch, 1, location())
+        val newHead = oldHead.copy(revision = 2, event = location("2026-09-24T03:01:00Z"))
+        val oldPacket = FamilyCareProtocol.outgoing(group, 103, 103, 101, "care_location_head", oldHead.json())
+        val currentPacket = FamilyCareProtocol.outgoing(group, 103, 103, 101, "care_location_head", newHead.json())
+        val originalHistory = FamilyCareProtocol.outgoing(group, 103, 103, 101, "child_event", oldHead.json())
+        care.queuePacket(originalHistory); care.queueLatestLocationHead(oldPacket)
+        care.acknowledgeLatestLocationHead(group.id, oldPacket.packetId, 101, oldPacket.digest)
+        assertNotNull(care.pendingLatestLocationHead(group.id, oldPacket.packetId, 101))
+        care.markLatestLocationSent(group.id, oldPacket.packetId, 101, 1000)
+        care.queueLatestLocationHead(currentPacket)
+        care = reopen().familyCare
+        assertEquals(listOf(currentPacket.packetId), care.pendingLatestLocationHeads(group.id).map { it.packetId })
+        assertEquals(1000L, care.latestLocationSentAt(group.id, 101))
+        care.acknowledgeLatestLocationHead(group.id, oldPacket.packetId, 101, oldPacket.digest)
+        care.acknowledgeLatestLocationHead(group.id, currentPacket.packetId, 101, currentPacket.digest)
+        assertNotNull(care.pendingLatestLocationHead(group.id, currentPacket.packetId, 101))
+        care.markLatestLocationSent(group.id, currentPacket.packetId, 101, 2000)
+        care.acknowledgeLatestLocationHead(group.id, currentPacket.packetId, 101, digest("forged"))
+        assertNotNull(care.pendingLatestLocationHead(group.id, currentPacket.packetId, 101))
+        care.acknowledgeLatestLocationHead(group.id, currentPacket.packetId, 101, currentPacket.digest)
+        assertTrue(care.pendingLatestLocationHeads(group.id).isEmpty())
+        assertEquals(listOf(originalHistory.packetId), care.pendingPackets(group.id).map { it.packetId })
+        care = reopen().familyCare
+        assertEquals(2000L, care.latestLocationSentAt(group.id, 101))
+        assertEquals(newHead.eventDigest, care.acknowledgedLatestLocationHead(group.id, 103, 101)!!.eventDigest)
+        // Reconstructing an engine or renegotiating capabilities must not resend this stationary point.
+        care.queueLatestLocationHead(FamilyCareProtocol.outgoing(group, 103, 103, 101, "care_location_head", newHead.json()))
+        care.queueLatestLocationHead(FamilyCareProtocol.outgoing(group, 103, 103, 101, "care_location_head", newHead.copy(revision = 3).json()))
+        assertTrue(reopen().familyCare.pendingLatestLocationHeads(group.id).isEmpty())
+        assertEquals(newHead.eventDigest, store().familyCare.acknowledgedLatestLocationHead(group.id, 103, 101)!!.eventDigest)
+    }
+
+    @Test fun upgradeFromV8KeepsDeltaHistoryOldOutgoingPacketsAndFinancialReplayIds() {
+        val group = room(); val before = state(group.id, revision = 0)
+        val event = location(); val after = before.copy(revision = 1, state = TelegramLedger.apply(before.state, event))
+        val delta = FamilyCareDelta.between(before, after, event)
+        val pending = FamilyCareProtocol.outgoing(group, 103, 103, 101, "child_event", JSONObject()
+            .put("epoch", after.epoch).put("revision", 1).put("event", event.json()))
+        store().familyCare.saveState(after); store().familyCare.saveDelta(delta); store().familyCare.queuePacket(pending)
+        store().setMeta("offset", 45123)
+        opened?.close(); opened = null
+        context.openOrCreateDatabase(databaseName, Context.MODE_PRIVATE, null).use { db ->
+            listOf("family_care_live", "family_care_live_outgoing", "family_care_live_peer").forEach { db.execSQL("DROP TABLE $it") }
+            db.version = 8
+        }
+        val upgraded = store()
+        assertEquals(9, upgraded.readableDatabase.version)
+        assertEquals(after.epoch, upgraded.familyCare.stateMetadata(group.id, 103)!!.epoch)
+        assertEquals(TelegramLedger.eventDigest(event), upgraded.familyCare.eventDigest(group.id, 103, event.id))
+        assertEquals(listOf(1L), upgraded.familyCare.deltas(group.id, 103, after.epoch, 0, 16).map { it.revision })
+        assertEquals(listOf(pending.packetId), upgraded.familyCare.pendingPackets(group.id).map { it.packetId })
+        assertEquals(45123L, upgraded.meta("offset"))
+        assertTrue(upgraded.familyCare.pendingLatestLocationHeads(group.id).isEmpty())
     }
 
     @Test fun leavingRoomRetainsCareWhileExplicitResetClearsAllCareTablesAndImportMarkers() {

@@ -122,7 +122,8 @@ class FamilyChatExchange(
             allowBatch = transport.canBatchAcknowledgements(peer, receipts.map { it.messageId }), afterSend = { count ->
             synchronized(lock) { store.transaction { receipts.take(count).forEach(store::removeChatReceipt) } }
         })
-        val candidates = synchronized(lock) { store.pendingChatDeliveries(room.id, peer, FamilyTransportProtocol.MAX_PACKETS) }
+        val window = if (transport.supportsFiles(peer)) FamilyTransportProtocol.MAX_FILE_PACKETS else FamilyTransportProtocol.MAX_PACKETS
+        val candidates = synchronized(lock) { store.pendingChatDeliveries(room.id, peer, window) }
         if (candidates.isEmpty()) return
         // A ready head opens a contiguous FIFO window, including attempts saved by older app versions.
         val deliveries = candidates.takeWhile { it.sentAt == 0L || now() < it.sentAt || now() - it.sentAt >= 30_000 }
