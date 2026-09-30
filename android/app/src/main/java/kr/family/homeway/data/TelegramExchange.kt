@@ -256,22 +256,39 @@ internal class TelegramExchange(
     }.getOrDefault(false)
 
     private fun flushAll() {
-            transport?.flushControls(repliesOnly = true)
-            familyCare?.flushLatestLocations()
-            familyChat?.flush()
-            if (synchronized(lock) { store.meta("legacyRetryAfter") <= now() }) {
-                try { flushLegacy() }
-                catch (error: TelegramException) {
-                    // A paired phone's failure must not freeze an otherwise healthy family room.
-                    // Keep the original two-phone behavior when no room is active.
-                    if ((familyChat == null && familyCare == null) || error.errorCode in setOf(401, 404, 409, 429)) throw error
-                    synchronized(lock) { store.setMeta("legacyRetryAfter", now() + 15_000) }
-                    onLegacyFailure(error)
-                }
+        transport?.flushControls(repliesOnly = true)
+        familyCare?.flushLatestLocations()
+        // All three lanes use the same peer permit. Start after the lane which actually
+        // used a turn, so inactive lanes cannot bias the next winner after reconstruction.
+        val firstLane = if (transport == null) 0 else synchronized(lock) {
+            store.meta(NEXT_FLUSH_LANE).coerceIn(0, 2).toInt()
+        }
+        var nextLane = firstLane
+        repeat(3) { index ->
+            val lane = (firstLane + index) % 3
+            val permitsBefore = transport?.reservedSendPermits
+            when (lane) {
+                0 -> familyChat?.flush()
+                1 -> flushLegacyLane()
+                2 -> familyCare?.flush()
             }
-            familyCare?.flush()
-            transport?.flushControls(repliesOnly = false)
-            if (synchronized(lock) { store.meta("ledgerConflict") != 0L }) throw TelegramSyncException()
+            if (permitsBefore != null && permitsBefore != transport?.reservedSendPermits) nextLane = (lane + 1) % 3
+        }
+        if (nextLane != firstLane) synchronized(lock) { store.transaction { store.setMeta(NEXT_FLUSH_LANE, nextLane.toLong()) } }
+        transport?.flushControls(repliesOnly = false)
+        if (synchronized(lock) { store.meta("ledgerConflict") != 0L }) throw TelegramSyncException()
+    }
+
+    private fun flushLegacyLane() {
+        if (synchronized(lock) { store.meta("legacyRetryAfter") > now() }) return
+        try { flushLegacy() }
+        catch (error: TelegramException) {
+            // A paired phone's failure must not freeze an otherwise healthy family room.
+            // Keep the original two-phone behavior when no room is active.
+            if ((familyChat == null && familyCare == null) || error.errorCode in setOf(401, 404, 409, 429)) throw error
+            synchronized(lock) { store.setMeta("legacyRetryAfter", now() + 15_000) }
+            onLegacyFailure(error)
+        }
     }
 
     private fun flushLegacy() {
@@ -316,5 +333,6 @@ internal class TelegramExchange(
         internal const val BLOCKED_DOCUMENT_UPDATE = "documentBlockedUpdate"
         internal const val BLOCKED_DOCUMENT_FAILURES = "documentBlockedFailures"
         const val MAX_BLOCKED_DOCUMENT_FAILURES = 3
+        internal const val NEXT_FLUSH_LANE = "exchangeNextFlushLane"
     }
 }

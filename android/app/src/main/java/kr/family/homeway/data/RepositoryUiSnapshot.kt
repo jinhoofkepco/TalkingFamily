@@ -22,4 +22,5 @@ data class RepositoryUiSnapshot(
     val trackingStatus: String,
     val connectionError: String?,
     val latestLocation: FamilyEvent? = null,
+    val historySyncing: Boolean = false,
 )

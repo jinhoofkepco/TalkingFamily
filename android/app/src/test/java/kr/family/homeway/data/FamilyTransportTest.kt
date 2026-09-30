@@ -5,8 +5,39 @@ import org.junit.Assert.*
 import org.junit.Test
 import java.io.IOException
 import java.util.UUID
+import java.util.concurrent.CancellationException
 
 class FamilyTransportTest {
+    @Test fun `history repair capability is separately authenticated and persisted`() {
+        val h = Harness(); val transport = h.transport(101)
+        assertNull(transport.incoming(update(202, FamilyTransportProtocol.historyCapability(42, true))))
+        assertNull(transport.incoming(update(999, FamilyTransportProtocol.historyCapability(42, false))))
+        assertFalse(transport.supportsMovementHistory(202))
+        assertEquals(emptyList<JSONObject>(), transport.incoming(update(202, FamilyTransportProtocol.historyCapability(42, false))))
+        assertTrue(transport.supportsMovementHistory(202))
+        assertTrue(FamilyTransport.supportsMovementHistory(h.stores.getValue(101), h.room.id, 202, h.time))
+        assertFalse(transport.supportsFiles(202))
+        assertNull(transport.incoming(update(202, JSONObject(FamilyTransportProtocol.capability(42, false)).put("history", 1).toString())))
+        assertFalse(transport.supportsBatch(202))
+    }
+
+    @Test fun `history fallback counts HTTP attempts rather than each original in a bulk file`() {
+        val h = Harness(); h.confirmFiles()
+        val member = h.room.members.single { it.botId == 202L }
+        val packets = (1..64).map { FamilyCareProtocol.outgoing(h.room, 101, 101, 202, "history_event", JSONObject()) }
+        assertEquals(64, h.transport(101).send(member, packets.map { it.text }))
+        h.time += 31_000
+        assertFalse(h.transport(101).shouldFallbackHistoryRepair(202))
+        assertEquals(64, h.transport(101).send(member, packets.map { it.text }))
+        val transport = h.transport(101)
+        assertTrue(transport.shouldFallbackHistoryRepair(202))
+        transport.noteHistoryRepairFallback(202)
+        assertFalse(transport.supportsMovementHistory(202))
+        transport.noteAcknowledgedPacket(202, packets.first().packetId)
+        assertTrue(transport.supportsMovementHistory(202))
+        assertFalse(transport.shouldFallbackHistoryRepair(202))
+    }
+
     @Test fun `large backlog uses one bounded document and acknowledges every original`() {
         val h = Harness(); h.confirmFiles()
         val messages = (1..128).map { h.enqueue("압축 파일 기록 $it") }
@@ -291,6 +322,81 @@ class FamilyTransportTest {
         assertEquals(1, transport.send(member, listOf(FamilyChatProtocol.message(message))))
     }
 
+    @Test fun `an abandoned ACK turn expires without repeated data renewing empty receipt debt`() {
+        val h = Harness(); h.confirmFiles()
+        val member = h.room.members.single { it.botId == 202L }
+        val message = FamilyChatProtocol.message(h.enqueue("대기 확인응답이 사라진 뒤에도"))
+        val receipt = FamilyChatProtocol.receipt(FamilyChatReceipt(h.room.id, UUID.randomUUID().toString(), 202, "0".repeat(64)))
+        val transport = h.transport(101)
+        assertEquals(1, transport.send(member, listOf(message)))
+        assertEquals(0, transport.send(member, listOf(receipt)))
+        assertEquals(0, transport.send(member, listOf(message)))
+        h.advance()
+        assertEquals(0, transport.send(member, listOf(receipt)))
+        assertEquals(1, transport.send(member, listOf(message)))
+        val waitingAt = h.time
+        val store = h.stores.getValue(101)
+        val prefix = "transport:${h.room.id}:202:"
+        assertEquals(waitingAt + 5_000, store.meta(prefix + "ackTurnUntil"))
+        // The receipt is removed elsewhere while the process reconstructs its exchange.
+        h.advance()
+        assertEquals(0, h.transport(101).send(member, listOf(message)))
+        assertEquals(waitingAt + 5_000, store.meta(prefix + "ackTurnUntil"))
+        h.time = waitingAt + 5_001
+        assertEquals(1, h.transport(101).send(member, listOf(message)))
+        assertEquals(0L, store.meta(prefix + "ackWaiting"))
+        assertEquals(0L, store.meta(prefix + "ackTurnUntil"))
+        h.advance()
+        assertTrue(h.transport(101).sendLegacy(202, TelegramProtocol.event(FamilyEvent(UUID.randomUUID().toString(),
+            "chat", JSONObject().put("text", "기존 전송도 진행"), "child", "2026-09-30T12:00:00Z", "pending"))))
+    }
+
+    @Test fun `rate limited HTTP attempts cannot finish a data or ACK scheduling turn`() {
+        for (acknowledgement in listOf(false, true)) {
+            val h = Harness(); h.confirmFiles()
+            val store = h.stores.getValue(101)
+            val prefix = "transport:${h.room.id}:202:"
+            store.setMeta(prefix + "ackWaiting", h.time)
+            if (acknowledgement) store.setMeta(prefix + "ackTurnUntil", h.time + 5_000)
+            val text = if (acknowledgement) FamilyChatProtocol.receipt(FamilyChatReceipt(h.room.id,
+                UUID.randomUUID().toString(), 202, "0".repeat(64))) else FamilyChatProtocol.message(h.enqueue("실패는 성공이 아니에요"))
+            val transport = h.transport(101)
+            h.telegram.rateLimitSendFrom = 101
+            var confirmed = false
+            val error = assertThrows(TelegramException::class.java) {
+                transport.send(h.room.members.single { it.botId == 202L }, listOf(text), afterSend = { confirmed = true })
+            }
+            assertEquals(429, error.errorCode)
+            assertFalse(confirmed)
+            assertEquals(h.time, store.meta(prefix + "ackWaiting"))
+            assertEquals(if (acknowledgement) h.time + 5_000 else 0L, store.meta(prefix + "ackTurnUntil"))
+            // A pacing reservation tracks fairness only; it does not mark HTTP success.
+            assertEquals(1, transport.reservedSendPermits)
+        }
+    }
+
+    @Test fun `cancellation before HTTP leaves receipt debt and delivery callbacks untouched`() {
+        val h = Harness(); h.confirmFiles()
+        val store = h.stores.getValue(101)
+        val prefix = "transport:${h.room.id}:202:"
+        store.setMeta(prefix + "ackWaiting", h.time)
+        store.setMeta(prefix + "ackTurnUntil", h.time + 5_000)
+        val transport = FamilyTransport(h.client(101), store, h.room, 101, now = { h.time },
+            checkActive = { throw CancellationException("cancelled") })
+        val receipt = FamilyChatProtocol.receipt(FamilyChatReceipt(h.room.id, UUID.randomUUID().toString(), 202, "0".repeat(64)))
+        var attempted = false
+        var confirmed = false
+        assertThrows(CancellationException::class.java) {
+            transport.send(h.room.members.single { it.botId == 202L }, listOf(receipt),
+                beforeSend = { attempted = true }, afterSend = { confirmed = true })
+        }
+        assertFalse(attempted)
+        assertFalse(confirmed)
+        assertTrue(h.telegram.sendRequests.isEmpty())
+        assertEquals(h.time, store.meta(prefix + "ackWaiting"))
+        assertEquals(h.time + 5_000, store.meta(prefix + "ackTurnUntil"))
+    }
+
     @Test fun `ambiguous batch response and replay notify once and ack each original`() {
         val h = Harness(); h.confirm()
         val messages = (1..4).map { h.enqueue("중복 방지 $it") }
@@ -416,7 +522,8 @@ class FamilyTransportTest {
         fun confirmFiles() {
             for ((own, peer) in listOf(101L to 202L, 202L to 101L)) {
                 for (control in listOf(FamilyTransportProtocol.capability(42, false), FamilyTransportProtocol.careCapability(43, false),
-                    FamilyTransportProtocol.fileCapability(44, false), FamilyTransportProtocol.latestCapability(45, false))) {
+                    FamilyTransportProtocol.fileCapability(44, false), FamilyTransportProtocol.latestCapability(45, false),
+                    FamilyTransportProtocol.historyCapability(46, false))) {
                     val transport = transport(own)
                     transport.incoming(update(peer, control)); transport.flushControls(true); advance()
                 }

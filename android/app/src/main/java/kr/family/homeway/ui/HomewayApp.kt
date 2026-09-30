@@ -44,6 +44,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kr.family.homeway.data.FamilyEvent
@@ -446,10 +447,13 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
                 IconButton({ state.historyDays.getOrNull(dayIndex - 1)?.let(selectDay) }, enabled = dayIndex > 0) { Icon(Icons.Outlined.ChevronRight, "다음 기록 날짜") }
             }
             if (state.historyLoading) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Forest)
+            if (state.historySyncing) Text("과거 기록을 확인하고 있어요", fontSize = 12.sp, color = Muted,
+                modifier = Modifier.padding(start = 8.dp, top = 4.dp).testTag("history-sync-status"))
         }
         item {
             if (selected == null) EmptyCard(Icons.Outlined.LocationOn,
-                if (state.historyLoading) "기록을 불러오고 있어요" else if (state.historyHasMore) "불러온 기록에는 위치가 없어요" else "이 날짜의 위치 기록이 없어요",
+                if (state.historyLoading) "기록을 불러오고 있어요" else if (state.historySyncing) "과거 기록을 확인하고 있어요"
+                else if (state.historyHasMore) "불러온 기록에는 위치가 없어요" else "이 날짜의 위치 기록이 없어요",
                 if (state.historyHasMore) "아래의 ‘이전 기록 더 보기’에서 앞선 위치를 찾아볼 수 있어요." else "자녀가 공유한 위치를 날짜별로 모아 보여 드려요.")
             else Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Surface(shape = RoundedCornerShape(22.dp), modifier = Modifier.fillMaxWidth().height(500.dp).testTag("embedded-location-map")) {
@@ -472,38 +476,52 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
                                 .onSizeChanged { size -> timelineInset = with(density) { size.height.toDp().value.roundToInt() } + 24 }
                                 .testTag("map-timeline-controls")) {
                             Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    IconButton({ selectPoint(selectedIndex - 1) }, enabled = selectedIndex > 0, modifier = Modifier.size(40.dp)) {
-                                        Icon(Icons.Outlined.ChevronLeft, "이전 시각의 위치")
-                                    }
-                                    Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                                        Text(historyClock(eventTime(selected)), fontWeight = FontWeight.Bold, fontSize = 18.sp, modifier = Modifier.testTag("map-selected-time"))
-                                        if (vertical != null) {
-                                            Text(vertical.label, fontSize = 12.sp, color = Forest, modifier = Modifier.testTag("map-selected-vertical"))
-                                            Text("상대 높이 ${if (vertical.relativeMeters >= 0) "+" else ""}${String.format(Locale.KOREA, "%.1f", vertical.relativeMeters)}m",
-                                                fontSize = 11.sp, color = Muted, modifier = Modifier.testTag("map-selected-height"))
-                                        } else selectedMapPoint?.activityLabel()?.let { label ->
-                                            Text(label, fontSize = 11.sp, color = Forest, modifier = Modifier.testTag("map-selected-activity"))
-                                        }
-                                        Text("${selectedIndex + 1} / ${records.size}${if (state.historyHasMore) "+" else ""} ${if (records.any { it.vertical != null }) "기록" else "위치"}", fontSize = 11.sp, color = Muted)
-                                    }
-                                    IconButton({ selectPoint(selectedIndex + 1) }, enabled = selectedIndex < records.lastIndex, modifier = Modifier.size(40.dp)) {
-                                        Icon(Icons.Outlined.ChevronRight, "다음 시각의 위치")
-                                    }
-                                    TextButton({
-                                        followingLatest = true; selectedRecordId = null; pinnedRecordJson = null; focusRequest++
-                                        val latestDay = LocationMapDisplay.latestDay(LocationMapDisplay.latest(readings, state.latestLocation))
-                                            ?: state.historyDays.firstOrNull()
-                                        if (latestDay != null && latestDay != state.historyDay) actions.selectHistoryDay(latestDay)
-                                    }, contentPadding = PaddingValues(horizontal = 4.dp)) { Text("최신") }
+                                Text(historyClock(eventTime(selected)), fontWeight = FontWeight.Bold, fontSize = 20.sp,
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.fillMaxWidth().testTag("map-selected-time"))
+                                Text(runCatching {
+                                    historyDateLabel(Instant.parse(eventTime(selected)).atZone(ZoneId.systemDefault()).toLocalDate().toString())
+                                }.getOrDefault("날짜 정보 없음"), fontSize = 12.sp, color = Muted, maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis, modifier = Modifier.testTag("map-selected-date"))
+                                if (vertical != null) {
+                                    Text(vertical.label, fontSize = 13.sp, color = Forest, maxLines = 2,
+                                        modifier = Modifier.testTag("map-selected-vertical"))
+                                    Text("상대 높이 ${if (vertical.relativeMeters >= 0) "+" else ""}${String.format(Locale.KOREA, "%.1f", vertical.relativeMeters)}m",
+                                        fontSize = 12.sp, color = Muted, modifier = Modifier.testTag("map-selected-height"))
+                                } else selectedMapPoint?.activityLabel()?.let { label ->
+                                    Text(label, fontSize = 13.sp, color = Forest, maxLines = 2,
+                                        modifier = Modifier.testTag("map-selected-activity"))
                                 }
                                 if (vertical != null && selectedMapPoint != null) {
                                     Text("참고 GPS ${historyClock(Instant.ofEpochMilli(selectedMapPoint.measuredAtMillis).toString())} · 상하 이동 위치는 미확인",
-                                        fontSize = 10.sp, color = Muted, modifier = Modifier.testTag("map-vertical-reference"))
+                                        fontSize = 11.sp, color = Muted, maxLines = 2,
+                                        modifier = Modifier.testTag("map-vertical-reference"))
                                 }
                                 if (vertical == null && selectedMapPoint?.positionAdjusted == true) {
-                                    Text("GPS 흔들림 보정", fontSize = 10.sp, color = Muted,
-                                        modifier = Modifier.align(Alignment.CenterHorizontally).testTag("map-position-adjusted"))
+                                    Text("GPS 흔들림 보정", fontSize = 11.sp, color = Muted,
+                                        modifier = Modifier.testTag("map-position-adjusted"))
+                                }
+                                // Variable details grow upward. The navigation row stays at the same
+                                // distance from the map bottom while changing between GPS and stairs.
+                                Row(Modifier.fillMaxWidth().height(48.dp).testTag("map-time-navigation"),
+                                    verticalAlignment = Alignment.CenterVertically) {
+                                    IconButton({ selectPoint(selectedIndex - 1) }, enabled = selectedIndex > 0,
+                                        modifier = Modifier.size(48.dp).testTag("map-previous-time")) {
+                                        Icon(Icons.Outlined.ChevronLeft, "이전 시각의 위치")
+                                    }
+                                    Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                                        TextButton({
+                                            followingLatest = true; selectedRecordId = null; pinnedRecordJson = null; focusRequest++
+                                            val latestDay = LocationMapDisplay.latestDay(LocationMapDisplay.latest(readings, state.latestLocation))
+                                                ?: state.historyDays.firstOrNull()
+                                            if (latestDay != null && latestDay != state.historyDay) actions.selectHistoryDay(latestDay)
+                                        }, modifier = Modifier.height(48.dp).testTag("map-latest-time"),
+                                            contentPadding = PaddingValues(horizontal = 16.dp)) { Text("최신", maxLines = 1) }
+                                    }
+                                    IconButton({ selectPoint(selectedIndex + 1) }, enabled = selectedIndex < records.lastIndex,
+                                        modifier = Modifier.size(48.dp).testTag("map-next-time")) {
+                                        Icon(Icons.Outlined.ChevronRight, "다음 시각의 위치")
+                                    }
                                 }
                                 Slider(value = selectedIndex.coerceAtLeast(0).toFloat(), onValueChange = { selectPoint(it.roundToInt()) },
                                     valueRange = 0f..records.lastIndex.coerceAtLeast(1).toFloat(),
@@ -512,10 +530,12 @@ private fun LocationScreen(state: UiState, actions: UiActions) {
                                         contentDescription = "위치 기록 시간"
                                         stateDescription = historyClock(eventTime(selected))
                                     }.testTag("map-time-slider"))
-                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                    Text(displayTime(eventTime(records.first().event)), fontSize = 11.sp, color = Muted)
-                                    Text(if (records.any { it.vertical != null }) "위치·상하 이동 기록" else "시간 막대로 위치 보기", fontSize = 11.sp, color = Forest)
-                                    Text(displayTime(eventTime(records.last().event)), fontSize = 11.sp, color = Muted)
+                                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                    Text(displayTime(eventTime(records.first().event)), fontSize = 11.sp, color = Muted, maxLines = 1)
+                                    Text("${selectedIndex + 1} / ${records.size}${if (state.historyHasMore) "+" else ""} ${if (records.any { it.vertical != null }) "기록" else "위치"}",
+                                        fontSize = 11.sp, color = Forest, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                        textAlign = TextAlign.Center, modifier = Modifier.weight(1f).padding(horizontal = 4.dp))
+                                    Text(displayTime(eventTime(records.last().event)), fontSize = 11.sp, color = Muted, maxLines = 1)
                                 }
                             }
                         }

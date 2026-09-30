@@ -26,6 +26,8 @@ internal object FamilyTransportProtocol {
         .put("file", 1).put("nonce", nonce).put("reply", reply).toString()
     fun latestCapability(nonce: Long, reply: Boolean): String = envelope("latest_capabilities")
         .put("latest", 1).put("nonce", nonce).put("reply", reply).toString()
+    fun historyCapability(nonce: Long, reply: Boolean): String = envelope("history_capabilities")
+        .put("history", 1).put("nonce", nonce).put("reply", reply).toString()
 
     fun batch(texts: List<String>): String {
         require(texts.size in 2..MAX_PACKETS && texts.all { it.length <= 4096 })
@@ -73,6 +75,9 @@ class FamilyTransport(
 ) {
     var deferredUntilMillis: Long? = null
         private set
+    /** Exchange-local pacing activity, not proof of HTTP success or original delivery. */
+    var reservedSendPermits: Int = 0
+        private set
     private fun key(peer: Long, name: String) = "transport:${room.id}:$peer:$name"
     private fun meta(peer: Long, name: String) = store.meta(key(peer, name))
     private fun put(peer: Long, name: String, value: Long) = store.setMeta(key(peer, name), value)
@@ -83,6 +88,7 @@ class FamilyTransport(
         CARE("care", "care_capabilities", "delta", "careSupportedUntil"),
         FILE("file", "file_capabilities", "file", "fileSupportedUntil"),
         LATEST("latest", "latest_capabilities", "latest", "latestSupportedUntil"),
+        HISTORY("history", "history_capabilities", "history", "historySupportedUntil"),
     }
     fun supportsBatch(peer: Long): Boolean = synchronized(lock) {
         meta(peer, "supportedUntil") > now() && meta(peer, "batchFallbackUntil") <= now()
@@ -96,11 +102,15 @@ class FamilyTransport(
     fun supportsLatestLocation(peer: Long): Boolean = synchronized(lock) {
         supportsLatestLocation(store, room.id, peer, now())
     }
+    fun supportsMovementHistory(peer: Long): Boolean = synchronized(lock) {
+        supportsMovementHistory(store, room.id, peer, now())
+    }
     private fun supported(peer: Long, feature: Feature): Boolean = when (feature) {
         Feature.BATCH -> supportsBatch(peer)
         Feature.CARE -> supportsCareDeltas(peer)
         Feature.FILE -> supportsFiles(peer)
         Feature.LATEST -> supportsLatestLocation(peer)
+        Feature.HISTORY -> supportsMovementHistory(peer)
     }
 
     /** Fixed slots bound transport bookkeeping even when a location stream runs for years. */
@@ -116,7 +126,7 @@ class FamilyTransport(
             ?: (0 until RECORD_SLOTS).minBy { meta(peer, "record:$it:lastUsed") }
         val slot = "record:$index"
         if (meta(peer, "$slot:id") != fingerprint) {
-            listOf("batchAt", "batchAttempts", "batchProof", "fileAt", "fileAttempts", "fileProof", "latestAt", "careAt", "careAttempts", "replays", "individualAckUntil")
+            listOf("batchAt", "batchAttempts", "batchProof", "fileAt", "fileAttempts", "fileProof", "latestAt", "historyAt", "careAt", "careAttempts", "replays", "individualAckUntil")
                 .forEach { put(peer, "$slot:$it", 0) }
             slots.entries.removeAll { it.value == index }
             slots[fingerprint] = index
@@ -167,10 +177,15 @@ class FamilyTransport(
         if (meta(peer, "$slot:latestAt") > 0) {
             put(peer, "latestAttempts", 0); put(peer, "latestUnacknowledgedSince", 0)
         }
+        if (meta(peer, "$slot:historyAt") > 0) {
+            put(peer, "historySupportedUntil", now() + CAPABILITY_TTL_MILLIS)
+            put(peer, "historyAttempts", 0); put(peer, "historyUnacknowledgedSince", 0)
+        }
         put(peer, "$slot:batchAt", 0); put(peer, "$slot:batchAttempts", 0)
         put(peer, "$slot:careAt", 0); put(peer, "$slot:careAttempts", 0)
         put(peer, "$slot:fileAt", 0); put(peer, "$slot:fileAttempts", 0)
         put(peer, "$slot:latestAt", 0)
+        put(peer, "$slot:historyAt", 0)
     }
 
     fun shouldFallbackCarePacket(peer: Long, packetId: String): Boolean = synchronized(lock) {
@@ -196,6 +211,16 @@ class FamilyTransport(
     fun noteLatestLocationFallback(peer: Long) = synchronized(lock) {
         put(peer, "latestSupportedUntil", 0)
         put(peer, "latest:probeWanted", 1); put(peer, "latest:probeAt", 0); put(peer, "latest:retryAt", now() + 30_000)
+    }
+
+    fun shouldFallbackHistoryRepair(peer: Long): Boolean = synchronized(lock) {
+        val since = meta(peer, "historyUnacknowledgedSince")
+        meta(peer, "historyAttemptProof") == meta(peer, "historyProof") && meta(peer, "historyAttempts") >= MAX_BATCH_ATTEMPTS &&
+            since > 0 && (now() < since || now() - since >= 30_000)
+    }
+    fun noteHistoryRepairFallback(peer: Long) = synchronized(lock) {
+        put(peer, "historySupportedUntil", 0)
+        put(peer, "history:probeWanted", 1); put(peer, "history:probeAt", 0); put(peer, "history:retryAt", now() + 30_000)
     }
 
     private fun originalId(text: String): String? = runCatching {
@@ -229,6 +254,33 @@ class FamilyTransport(
         } else false
     }
 
+    /** Competing data lanes cannot keep renewing their wait and suppress every pending ACK. */
+    private fun deferSendTurn(peer: Long, acknowledgement: Boolean): Boolean = synchronized(lock) {
+        val at = now()
+        if (acknowledgement) put(peer, "ackWaiting", at.coerceAtLeast(1))
+        val turnUntil = meta(peer, if (acknowledgement) "dataTurnUntil" else "ackTurnUntil")
+        if (turnUntil > at && turnUntil - at <= SEND_TURN_MILLIS) {
+            deferredUntilMillis = minOf(deferredUntilMillis ?: Long.MAX_VALUE,
+                if (acknowledgement) at + GLOBAL_INTERVAL_MILLIS else
+                    maxOf(at + GLOBAL_INTERVAL_MILLIS, meta(peer, "nextSend"), store.meta("transport:nextSend")))
+            true
+        } else false
+    }
+
+    private fun finishSendTurn(peer: Long, acknowledgement: Boolean) = synchronized(lock) { store.transaction {
+        if (acknowledgement) {
+            put(peer, "ackWaiting", 0); put(peer, "ackTurnUntil", 0)
+        } else {
+            put(peer, "dataTurnUntil", 0)
+            val waitingAt = meta(peer, "ackWaiting")
+            // Without another real receipt attempt this debt expires; data cannot keep renewing
+            // an empty ACK turn after a queue/context change or an interrupted exchange.
+            if (waitingAt > 0 && waitingAt <= now() && now() - waitingAt < SEND_TURN_MILLIS)
+                put(peer, "ackTurnUntil", waitingAt + SEND_TURN_MILLIS)
+            else { put(peer, "ackWaiting", 0); put(peer, "ackTurnUntil", 0) }
+        }
+    } }
+
     /** Retry backlogs batch too; two unacknowledged batch attempts trigger a bounded legacy fallback. */
     fun send(member: FamilyChatMember, texts: List<String>, allowBatch: Boolean = true,
         beforeSend: (Int) -> Unit = {}, afterSend: (Int) -> Unit = {}): Int {
@@ -257,15 +309,13 @@ class FamilyTransport(
             }
             Feature.values().filter { !supported(peer, it) }.forEach { put(peer, "${it.prefix}:probeWanted", 1) }
         } }
+        val acknowledgements = ids.all { it == null }
+        if (acknowledgements) synchronized(lock) { put(peer, "ackWaiting", now().coerceAtLeast(1)) }
         if (deferControlTurn(peer)) {
             if (ids.any { it != null }) synchronized(lock) { put(peer, "dataTurnUntil", now() + 5_000) }
             return 0
         }
-        val acknowledgements = ids.all { it == null }
-        if (acknowledgements && synchronized(lock) { meta(peer, "dataTurnUntil") > now() }) {
-            deferredUntilMillis = minOf(deferredUntilMillis ?: Long.MAX_VALUE, now() + GLOBAL_INTERVAL_MILLIS)
-            return 0
-        }
+        if (deferSendTurn(peer, acknowledgements)) return 0
         var count = 1
         var wire = texts.first()
         val document = if (allowBatch && supportsFiles(peer)) FamilyDocumentProtocol.encode(texts, room.id, ownBotId, peer) else null
@@ -284,6 +334,7 @@ class FamilyTransport(
         checkActive()
         beforeSend(count)
         synchronized(lock) { store.transaction {
+            var historyAttempt = false
             ids.take(count).forEachIndexed { index, id -> if (id != null) {
                 val slot = record(peer, id)
                 val priorAttempts = if (meta(peer, "$slot:batchProof") == meta(peer, "batchProof"))
@@ -303,11 +354,21 @@ class FamilyTransport(
                     put(peer, "latestAttempts", attempts + 1); put(peer, "latestAttemptProof", meta(peer, "latestProof"))
                     if (attempts == 0L) put(peer, "latestUnacknowledgedSince", now().coerceAtLeast(1))
                 }
+                if (type in setOf("history_request", "history_event", "history_checkpoint")) {
+                    put(peer, "$slot:historyAt", now().coerceAtLeast(1))
+                    historyAttempt = true
+                }
                 if (type in setOf("care_sync", "care_delta")) {
                     put(peer, "$slot:careAt", now().coerceAtLeast(1))
                     put(peer, "$slot:careAttempts", meta(peer, "$slot:careAttempts") + 1)
                 }
             } }
+            if (historyAttempt) {
+                val sameProof = meta(peer, "historyAttemptProof") == meta(peer, "historyProof")
+                val attempts = if (sameProof) meta(peer, "historyAttempts") else 0
+                put(peer, "historyAttempts", attempts + 1); put(peer, "historyAttemptProof", meta(peer, "historyProof"))
+                if (attempts == 0L) put(peer, "historyUnacknowledgedSince", now().coerceAtLeast(1))
+            }
             if (document != null && ids.take(count).any { it != null }) {
                 val sameProof = meta(peer, "fileAttemptProof") == meta(peer, "fileProof")
                 val attempts = if (sameProof) meta(peer, "fileAttempts") else 0
@@ -320,15 +381,23 @@ class FamilyTransport(
         } }
         if (document == null) client.sendToFamilyMember(member, wire, checkActive)
         else client.sendDocumentToFamilyMember(member, document.caption, document.bytes, checkActive)
+        finishSendTurn(peer, acknowledgements)
         afterSend(count)
         return count
     }
 
     fun sendLegacy(peer: Long, text: String, beforeSend: () -> Unit = {}, afterSend: () -> Unit = {}): Boolean {
+        val acknowledgement = runCatching { JSONObject(text).optString("type") == "ack" }.getOrDefault(false)
+        if (acknowledgement) synchronized(lock) { put(peer, "ackWaiting", now().coerceAtLeast(1)) }
         if (deferControlTurn(peer)) return false
-        if (!reserve(peer)) return false
+        if (deferSendTurn(peer, acknowledgement)) return false
+        if (!reserve(peer)) {
+            if (!acknowledgement) synchronized(lock) { put(peer, "dataTurnUntil", now() + SEND_TURN_MILLIS) }
+            return false
+        }
         checkActive(); beforeSend()
         client.send(peer.toString(), text)
+        finishSendTurn(peer, acknowledgement)
         afterSend()
         return true
     }
@@ -343,6 +412,7 @@ class FamilyTransport(
         }
         put(peer, "nextSend", at + PEER_INTERVAL_MILLIS)
         store.setMeta("transport:nextSend", at + GLOBAL_INTERVAL_MILLIS)
+        reservedSendPermits++
         true
     }
 
@@ -365,7 +435,7 @@ class FamilyTransport(
                 chat.optString("type") == "private" && FamilyChatValidation.botId(chat.opt("id")) == sender &&
                 !message.has("forward_origin") && !message.has("forward_from") && !message.has("sender_chat"))
             when (json.getString("type")) {
-                "capabilities", "care_capabilities", "file_capabilities", "latest_capabilities" -> {
+                "capabilities", "care_capabilities", "file_capabilities", "latest_capabilities", "history_capabilities" -> {
                     val feature = Feature.values().single { it.type == json.getString("type") }
                     FamilyChatValidation.keys(json, setOf("app", "v", "type", feature.flag, "nonce", "reply"))
                     require(json.opt(feature.flag) == 1 && json.opt("reply") is Boolean)
@@ -401,6 +471,7 @@ class FamilyTransport(
                 put(sender, "fileFallbackUntil", 0); put(sender, "fileProof", meta(sender, "fileProof") + 1)
             }
             if (feature == Feature.LATEST) put(sender, "latestProof", meta(sender, "latestProof") + 1)
+            if (feature == Feature.HISTORY) put(sender, "historyProof", meta(sender, "historyProof") + 1)
         }
         batchSender?.let { sender ->
             // A fully validated batch is fresh evidence, including after an app upgrade or downgrade.
@@ -474,6 +545,7 @@ class FamilyTransport(
                     Feature.CARE -> FamilyTransportProtocol.careCapability(nonce, reply != 0L)
                     Feature.FILE -> FamilyTransportProtocol.fileCapability(nonce, reply != 0L)
                     Feature.LATEST -> FamilyTransportProtocol.latestCapability(nonce, reply != 0L)
+                    Feature.HISTORY -> FamilyTransportProtocol.historyCapability(nonce, reply != 0L)
                 }
                 client.sendToFamilyMember(member, text, checkActive)
                 synchronized(lock) {
@@ -491,6 +563,7 @@ class FamilyTransport(
     companion object {
         const val PEER_INTERVAL_MILLIS = 1_100L
         private const val GLOBAL_INTERVAL_MILLIS = 100L
+        private const val SEND_TURN_MILLIS = 5_000L
         private const val CAPABILITY_TTL_MILLIS = 6 * 60 * 60 * 1000L
         private const val MAX_BATCH_ATTEMPTS = 2
         private const val BATCH_FALLBACK_MILLIS = 3 * 60 * 1000L
@@ -502,5 +575,8 @@ class FamilyTransport(
         fun supportsLatestLocation(store: TelegramExchangeStore, roomId: String, peer: Long,
             nowMillis: Long = System.currentTimeMillis()): Boolean =
             store.meta("transport:$roomId:$peer:latestSupportedUntil") > nowMillis
+        fun supportsMovementHistory(store: TelegramExchangeStore, roomId: String, peer: Long,
+            nowMillis: Long = System.currentTimeMillis()): Boolean =
+            store.meta("transport:$roomId:$peer:historySupportedUntil") > nowMillis
     }
 }

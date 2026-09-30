@@ -12,6 +12,16 @@ import java.io.StringWriter
 class AppDiagnosticsTest {
     @get:Rule val temporary = TemporaryFolder()
 
+    @Test fun failureCategoriesNeverRetainExceptionMessagesOrStackPayloads() {
+        val cause = IllegalArgumentException("latitude=37.123 longitude=127.987 token=secret roomId=family")
+        val error = IllegalStateException("private family chat", cause)
+        assertEquals("category=IllegalStateException <- IllegalArgumentException", AppDiagnostics.failureCategory(error))
+        assertFalse(AppDiagnostics.failureCategory(error).contains("private"))
+        assertEquals(FamilySyncDiagnostics.fingerprint("private-epoch"), FamilySyncDiagnostics.fingerprint("private-epoch"))
+        assertTrue(FamilySyncDiagnostics.fingerprint("private-epoch").matches(Regex("[0-9a-f]{12}")))
+        assertNotEquals(FamilySyncDiagnostics.fingerprint("private-epoch"), FamilySyncDiagnostics.fingerprint("other-epoch"))
+    }
+
     @Test fun repeatedRendersAreDeduplicatedBeforeAnyIoAndBecomeEligibleAfterOneMinute() {
         val admission = DiagnosticAdmission()
         assertNotNull(admission.prepare("receive", "인터넷 연결을 확인해 주세요.", 1, 1_000))

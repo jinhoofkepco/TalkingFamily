@@ -10,7 +10,7 @@ import java.time.LocalDate
 import java.time.ZoneId
 
 class LocalStore internal constructor(context: Context, databaseName: String = "homeway.db") :
-    SQLiteOpenHelper(context, databaseName, null, 9), TelegramExchangeStore {
+    SQLiteOpenHelper(context, databaseName, null, 10), TelegramExchangeStore {
     val familyChat = SqliteFamilyChatStore(this)
     val familyCare = SqliteFamilyCareStore(this)
     override fun onCreate(db: SQLiteDatabase) {
@@ -63,6 +63,7 @@ class LocalStore internal constructor(context: Context, databaseName: String = "
         if (oldVersion < 7) SqliteFamilyCareStore.upgradeToV7(db)
         if (oldVersion < 8) SqliteFamilyCareStore.upgradeToV8(db)
         if (oldVersion < 9) SqliteFamilyCareStore.upgradeToV9(db)
+        if (oldVersion < 10) SqliteFamilyCareStore.upgradeToV10(db)
     }
     private fun createTelegramTables(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE telegram_receipts (id TEXT PRIMARY KEY)")

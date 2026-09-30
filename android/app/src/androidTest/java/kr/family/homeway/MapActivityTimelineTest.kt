@@ -4,7 +4,18 @@ import androidx.activity.ComponentActivity
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.width
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.test.platform.app.InstrumentationRegistry
+import android.graphics.Bitmap
+import java.io.File
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.dp
 import kr.family.homeway.data.FamilyEvent
 import kr.family.homeway.ui.HomewayApp
 import kr.family.homeway.ui.UiActions
@@ -12,6 +23,8 @@ import kr.family.homeway.ui.UiState
 import org.json.JSONObject
 import org.junit.Rule
 import org.junit.Test
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 
 /** Synthetic local records only; no account, sensors, or Telegram transport is started. */
 class MapActivityTimelineTest {
@@ -110,6 +123,60 @@ class MapActivityTimelineTest {
         compose.onNodeWithTag("map-selected-vertical").assertDoesNotExist()
         compose.onNodeWithTag("map-vertical-reference").assertDoesNotExist()
         compose.onNodeWithTag("map-selected-activity").assertTextEquals("정지 추정 · 약 5분")
+    }
+
+    @Test fun timelineNavigationKeepsItsPositionAndTouchSizeAcrossDifferentRecordDetails() {
+        val records = listOf(record("still", 5, "still"), record("walking", 6, "walking"),
+            vertical("up", 7, "ascent_started", 2.5), vertical("down", 8, "descent_finished", -2.8))
+        compose.setContent {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale = 1.5f)) {
+                Box(Modifier.width(320.dp)) {
+                    HomewayApp(UiState(role = "guardian", configured = true, demoMode = true, needsOnboarding = false,
+                        locationHistory = records, historyDays = listOf("2026-09-22"), historyDay = "2026-09-22"), noActions())
+                }
+            }
+        }
+        compose.onNodeWithTag("location-list").performScrollToNode(hasTestTag("map-time-navigation"))
+        val tags = listOf("map-previous-time", "map-next-time", "map-latest-time")
+        val originalBounds = tags.associateWith { compose.onNodeWithTag(it).fetchSemanticsNode().boundsInRoot }
+        val minimumSize = 48f * compose.activity.resources.displayMetrics.density
+        assertTrue("Navigation buttons must not overlap", originalBounds.getValue("map-previous-time").right <=
+            originalBounds.getValue("map-latest-time").left && originalBounds.getValue("map-latest-time").right <=
+            originalBounds.getValue("map-next-time").left)
+        for (tag in listOf("map-previous-time", "map-next-time")) {
+            val bounds = originalBounds.getValue(tag)
+            assertTrue("$tag must have a 48dp touch target", bounds.width >= minimumSize - 1f && bounds.height >= minimumSize - 1f)
+        }
+        compose.onNodeWithTag("map-selected-vertical").assertTextEquals("내려가기 종료 · 추정")
+        compose.onNodeWithTag("map-selected-date").assertTextContains("2026년 9월 22일", substring = true)
+        compose.onNodeWithTag("map-next-time").assertIsNotEnabled()
+        saveTimelinePreview("stairs")
+        for ((selectedTag, previous) in listOf("map-selected-vertical" to "올라가기 시작 · 추정",
+            "map-selected-activity" to "걷는 중 추정", "map-selected-activity" to "정지 추정 · 약 5분")) {
+            compose.onNodeWithTag("map-previous-time").performClick()
+            compose.onNodeWithTag(selectedTag).assertTextEquals(previous)
+            for (tag in tags) {
+                val expected = originalBounds.getValue(tag)
+                val actual = compose.onNodeWithTag(tag).fetchSemanticsNode().boundsInRoot
+                assertEquals("$tag left", expected.left, actual.left, 1f)
+                assertEquals("$tag top", expected.top, actual.top, 1f)
+                assertEquals("$tag right", expected.right, actual.right, 1f)
+                assertEquals("$tag bottom", expected.bottom, actual.bottom, 1f)
+            }
+        }
+        compose.onNodeWithTag("map-previous-time").assertIsNotEnabled()
+        compose.onNodeWithTag("map-next-time").performClick()
+        compose.onNodeWithTag("map-selected-activity").assertTextEquals("걷는 중 추정")
+        saveTimelinePreview("walking")
+    }
+
+    private fun saveTimelinePreview(name: String) {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val image = compose.onRoot().captureToImage().asAndroidBitmap()
+        File(context.getExternalFilesDir(null), "timeline-$name-0.6.10.png").outputStream().use {
+            check(image.compress(Bitmap.CompressFormat.PNG, 100, it))
+        }
     }
 
     @Test fun verticalWithoutGpsStillHasVisibleTimeControlsAndDoesNotPretendToHaveALocation() {

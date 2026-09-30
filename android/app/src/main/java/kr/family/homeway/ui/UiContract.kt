@@ -22,6 +22,7 @@ data class UiState(
     val historyDay: String = LocalDate.now().toString(),
     val historyHasMore: Boolean = false,
     val historyLoading: Boolean = false,
+    val historySyncing: Boolean = false,
     val stickerBalance: Int = 0,
     val redemptions: List<Redemption> = emptyList(),
     val rewards: List<Reward> = emptyList(),

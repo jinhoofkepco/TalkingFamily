@@ -43,6 +43,9 @@ class FamilyCareStoreTest {
         FamilyCareOutgoing(roomId, packetId, childId, peerId, text, digest(text))
     private fun outcome(state: FamilyCareState) = FamilyCareOutcome(state.roomId, state.childId, id(), 101,
         digest("command"), state.epoch, state.revision, true)
+    private fun incoming(sender: Long, text: String) = JSONObject().put("update_id", 1).put("message", JSONObject()
+        .put("from", JSONObject().put("id", sender).put("is_bot", true))
+        .put("chat", JSONObject().put("id", sender).put("type", "private")).put("text", text))
 
     @Test fun upgradeFromV4AddsCareWithoutChangingRoomMessagesPairLedgerHistoryOrTelegramCursor() {
         val group = room()
@@ -82,7 +85,7 @@ class FamilyCareStoreTest {
             db.version = 4
         }
         val db = store()
-        assertEquals(9, db.readableDatabase.version)
+        assertEquals(10, db.readableDatabase.version)
         assertEquals(oldState.toString(), db.cached()!!.toString())
         assertEquals(9812L, db.meta("offset"))
         assertEquals(119L, db.meta("sentAt"))
@@ -124,7 +127,7 @@ class FamilyCareStoreTest {
             version = 5
         }
         val upgraded = reopen()
-        assertEquals(9, upgraded.readableDatabase.version)
+        assertEquals(10, upgraded.readableDatabase.version)
         assertEquals(12345L, upgraded.meta("offset"))
         assertEquals(source.epoch, upgraded.familyCare.state(roomId, 103)!!.epoch)
         assertEquals(999L, upgraded.familyCare.retryAfter(roomId, 102))
@@ -189,7 +192,7 @@ class FamilyCareStoreTest {
             version = 6
         }
         val upgraded = reopen()
-        assertEquals(9, upgraded.readableDatabase.version)
+        assertEquals(10, upgraded.readableDatabase.version)
         // Opening a database must not parse a large old care state on a service's main thread.
         upgraded.readableDatabase.rawQuery("SELECT state,epoch FROM family_care_states", null).use {
             assertTrue(it.moveToFirst()); assertTrue(it.isNull(1)); assertEquals(oldState.json().toString(), it.getString(0))
@@ -545,7 +548,7 @@ class FamilyCareStoreTest {
             db.version = 7
         }
         val upgraded = store()
-        assertEquals(9, upgraded.readableDatabase.version)
+        assertEquals(10, upgraded.readableDatabase.version)
         assertEquals(51, upgraded.familyCare.state(source.roomId, 103)!!.snapshot.stickerBalance)
         assertEquals(FamilyCareStateMetadata(source.epoch, 27, true), upgraded.familyCare.stateMetadata(source.roomId, 103))
         assertEquals(digest("already approved"), upgraded.familyCare.eventDigest(source.roomId, 103, financialId))
@@ -747,13 +750,108 @@ class FamilyCareStoreTest {
             db.version = 8
         }
         val upgraded = store()
-        assertEquals(9, upgraded.readableDatabase.version)
+        assertEquals(10, upgraded.readableDatabase.version)
         assertEquals(after.epoch, upgraded.familyCare.stateMetadata(group.id, 103)!!.epoch)
         assertEquals(TelegramLedger.eventDigest(event), upgraded.familyCare.eventDigest(group.id, 103, event.id))
         assertEquals(listOf(1L), upgraded.familyCare.deltas(group.id, 103, after.epoch, 0, 16).map { it.revision })
         assertEquals(listOf(pending.packetId), upgraded.familyCare.pendingPackets(group.id).map { it.packetId })
         assertEquals(45123L, upgraded.meta("offset"))
         assertTrue(upgraded.familyCare.pendingLatestLocationHeads(group.id).isEmpty())
+    }
+
+    @Test fun upgradeFromV9IndexesEveryArchivedPointAndKeepsStableSequenceAcrossReplacementAndLateFix() {
+        val group = room(); val before = state(group.id, revision = 81)
+        val points = (0 until 35).map { location(eventId = id()) }
+        store().familyCare.saveState(before)
+        points.forEach {
+            store().familyCare.archiveEvent(group.id, 103, it.copy(delivery = "queued"))
+            store().familyCare.archiveEvent(group.id, 104, location())
+        }
+        store().setMeta("offset", 77881)
+        opened?.close(); opened = null
+        context.openOrCreateDatabase(databaseName, Context.MODE_PRIVATE, null).use { db ->
+            listOf("family_care_history_streams", "family_care_history_log", "family_care_history_progress", "family_care_history_parts")
+                .forEach { db.execSQL("DROP TABLE $it") }
+            db.version = 9
+        }
+        var care = store().familyCare
+        assertEquals(10, store().readableDatabase.version)
+        val source = care.historySource(group.id, 103)
+        assertEquals(35L, source.count)
+        val first = care.historyEntries(group.id, 103, 0, source.anchor, 24)
+        assertEquals(24, first.size)
+        care.archiveEvent(group.id, 103, first.first().event.copy(delivery = "relayed"))
+        care = reopen().familyCare
+        assertEquals(source, care.historySource(group.id, 103))
+        assertEquals(first.map { it.sequence }, care.historyEntries(group.id, 103, 0, source.anchor, 24).map { it.sequence })
+        val late = location("2026-09-20T01:00:00Z")
+        care.archiveEvent(group.id, 103, late)
+        val incremental = care.historyEntries(group.id, 103, source.anchor, care.historySource(group.id, 103).anchor, 24)
+        assertEquals(listOf(late.id), incremental.map { it.event.id })
+        assertEquals(35L, care.historySource(group.id, 103, source.anchor).count)
+        assertEquals(36L, care.historySource(group.id, 103).count)
+        assertEquals(81L, care.stateMetadata(group.id, 103)!!.revision)
+        assertEquals(77881L, store().meta("offset"))
+    }
+
+    @Test fun historyManifestCursorAndAcknowledgementAreAtomicAndDoNotTouchFinanceOrLiveHead() {
+        val group = room(); val before = state(group.id, revision = 0, authority = false)
+        var db = store(); db.familyCare.saveState(before)
+        val transfer = id(); val stream = id(); val event = location()
+        db.familyCare.saveHistoryProgress(FamilyCareHistoryProgress(group.id, 103, transfer, null, 0, 0, 0, false, 1000))
+        fun engine() = FamilyCareEngine(TelegramClient("101:${"synthetic_credentials_".repeat(2)}"), store().familyCare, group, 101, canSyncHistory = { true })
+        val entries = listOf(FamilyCareHistoryEntry(1, event))
+        val manifest = JSONArray().put(JSONObject().put("sequence", 1).put("eventId", event.id))
+        val marker = FamilyCareProtocol.envelope(group, 103, 103, "history_checkpoint", JSONObject()
+            .put("transferId", transfer).put("streamId", stream).put("previous", 0).put("cursor", 1).put("anchor", 1)
+            .put("count", 1).put("done", true).put("entries", manifest).put("digest", FamilyCareHistorySync.digest(entries)))
+        db.transaction { engine().processUpdate(incoming(103, marker.toString())) }
+        assertEquals(0L, db.familyCare.historyProgress(group.id, 103)!!.cursor)
+        assertNull(db.familyCare.receivedDigest(group.id, marker.getString("id")))
+        val record = FamilyCareProtocol.envelope(group, 103, 103, "history_event", JSONObject()
+            .put("transferId", transfer).put("streamId", stream).put("sequence", 1).put("event", event.json()))
+        db.transaction { engine().processUpdate(incoming(103, record.toString())) }
+        try { db.transaction {
+            engine().processUpdate(incoming(103, marker.toString())); db.setMeta("offset", 91); error("rollback")
+        }; fail() } catch (_: IllegalStateException) { }
+        db = reopen()
+        assertEquals(0L, db.familyCare.historyProgress(group.id, 103)!!.cursor)
+        assertEquals(0L, db.meta("offset"))
+        assertNull(db.familyCare.receivedDigest(group.id, marker.getString("id")))
+        db.transaction { engine().processUpdate(incoming(103, marker.toString())); db.setMeta("offset", 92) }
+        db = reopen()
+        assertEquals(1L, db.familyCare.historyProgress(group.id, 103)!!.cursor)
+        assertTrue(db.familyCare.historyProgress(group.id, 103)!!.complete)
+        assertTrue(db.familyCare.receipts(group.id).any { it.packetId == marker.getString("id") })
+        assertEquals(before.epoch, db.familyCare.stateMetadata(group.id, 103)!!.epoch)
+        assertEquals(0L, db.familyCare.stateMetadata(group.id, 103)!!.revision)
+        assertNull(db.familyCare.eventDigest(group.id, 103, event.id))
+        assertNull(db.familyCare.latestLocationHead(group.id, 103))
+        assertEquals(92L, db.meta("offset"))
+    }
+
+    @Test fun equalSnapshotAndGappedTelemetryDeltaArchiveBeforeAcknowledgementWithoutAdvancingFinance() {
+        val group = room(); val points = (0 until 12).map { location() }
+        val replica = state(group.id, revision = 0, authority = false).copy(state = TelegramLedger.emptyState()
+            .put("stickerBalance", 7).put("careRewardVersions", JSONObject()).put("events", JSONArray(points.map { it.json() })))
+        val care = store().familyCare; care.saveState(replica)
+        val engine = FamilyCareEngine(TelegramClient("101:${"synthetic_credentials_".repeat(2)}"), care, group, 101)
+        FamilyCareSnapshots.chunks(replica.copy(authoritative = true)).forEach { chunk -> store().transaction {
+            engine.processUpdate(incoming(103, FamilyCareProtocol.envelope(group, 103, 103, "snapshot_chunk",
+                FamilyCareSnapshots.chunkJson(chunk)).toString()))
+        } }
+        assertEquals(12, care.movementHistory(group.id, 103, zone = utc).events.size)
+        val old = replica.copy(authoritative = true, revision = 3)
+        val missing = location("2026-09-24T03:02:00Z")
+        val changed = old.copy(revision = 4, state = TelegramLedger.apply(old.state, missing))
+        val delta = FamilyCareDelta.between(old, changed, missing)
+        val envelope = FamilyCareProtocol.envelope(group, 103, 103, "care_delta", delta.json())
+        store().transaction { engine.processUpdate(incoming(103, envelope.toString())) }
+        assertEquals(13, care.movementHistory(group.id, 103, zone = utc).events.size)
+        assertEquals(0L, care.stateMetadata(group.id, 103)!!.revision)
+        assertEquals(7, care.state(group.id, 103)!!.snapshot.stickerBalance)
+        assertNull(care.eventDigest(group.id, 103, missing.id))
+        assertTrue(care.receipts(group.id).any { it.packetId == envelope.getString("id") })
     }
 
     @Test fun leavingRoomRetainsCareWhileExplicitResetClearsAllCareTablesAndImportMarkers() {

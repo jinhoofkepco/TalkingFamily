@@ -5,6 +5,7 @@ import android.database.sqlite.SQLiteDatabase
 import org.json.JSONObject
 import java.time.Instant
 import java.time.ZoneId
+import java.util.UUID
 
 /** Family care shares the chat/private exchange transaction and never combines different children. */
 class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) : FamilyCareStore {
@@ -141,6 +142,77 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
     override fun movementEventDigest(roomId: String, childId: Long, eventId: String): String? = owner.readableDatabase.rawQuery(
         "SELECT event FROM family_care_movement WHERE room_id=? AND child_id=? AND id=?", arrayOf(roomId, childId.toString(), eventId)
     ).use { if (it.moveToFirst()) TelegramLedger.eventDigest(FamilyEvent.parse(JSONObject(it.getString(0)))) else null }
+
+    override fun historySource(roomId: String, childId: Long, anchor: Long): FamilyCareHistorySource = transaction {
+        val db = owner.writableDatabase
+        db.insertWithOnConflict("family_care_history_streams", null, ContentValues().apply {
+            put("room_id", roomId); put("child_id", childId); put("stream_id", UUID.randomUUID().toString())
+        }, SQLiteDatabase.CONFLICT_IGNORE)
+        val stream = db.rawQuery("SELECT stream_id FROM family_care_history_streams WHERE room_id=? AND child_id=?",
+            arrayOf(roomId, childId.toString())).use { it.moveToFirst(); it.getString(0) }
+        db.rawQuery("SELECT COALESCE(MAX(sequence),0),COUNT(*) FROM family_care_history_log WHERE room_id=? AND child_id=? AND sequence<=?",
+            arrayOf(roomId, childId.toString(), anchor.toString())).use { it.moveToFirst(); FamilyCareHistorySource(stream, it.getLong(0), it.getLong(1)) }
+    }
+
+    override fun historyEntries(roomId: String, childId: Long, after: Long, anchor: Long, limit: Int): List<FamilyCareHistoryEntry> {
+        require(after >= 0 && anchor >= after && limit in 1..FamilyCareHistorySync.PAGE_SIZE)
+        return owner.readableDatabase.rawQuery("SELECT l.sequence,m.event FROM family_care_history_log l LEFT JOIN family_care_movement m " +
+            "ON m.room_id=l.room_id AND m.child_id=l.child_id AND m.id=l.event_id " +
+            "WHERE l.room_id=? AND l.child_id=? AND l.sequence>? AND l.sequence<=? ORDER BY l.sequence LIMIT $limit",
+            arrayOf(roomId, childId.toString(), after.toString(), anchor.toString())).use { rows -> buildList {
+            while (rows.moveToNext()) {
+                require(!rows.isNull(1)) { "이동 기록의 저장 순서를 확인하지 못했어요." }
+                add(FamilyCareHistoryEntry(rows.getLong(0), FamilyEvent.parse(JSONObject(rows.getString(1)))))
+            }
+        } }
+    }
+
+    override fun historyEvents(roomId: String, childId: Long, ids: List<String>): List<FamilyEvent> {
+        require(ids.size <= FamilyCareHistorySync.PAGE_SIZE)
+        if (ids.isEmpty()) return emptyList()
+        return owner.readableDatabase.rawQuery("SELECT event FROM family_care_movement WHERE room_id=? AND child_id=? AND id IN (${ids.joinToString(",") { "?" }})",
+            (listOf(roomId, childId.toString()) + ids).toTypedArray()).use { rows -> buildList {
+            while (rows.moveToNext()) add(FamilyEvent.parse(JSONObject(rows.getString(0))))
+        } }
+    }
+
+    override fun historyProgress(roomId: String, childId: Long): FamilyCareHistoryProgress? = owner.readableDatabase.rawQuery(
+        "SELECT transfer_id,stream_id,cursor,anchor,record_count,complete,checked_at FROM family_care_history_progress WHERE room_id=? AND child_id=?",
+        arrayOf(roomId, childId.toString())).use { if (it.moveToFirst()) FamilyCareHistoryProgress(roomId, childId,
+        it.getString(0), if (it.isNull(1)) null else it.getString(1), it.getLong(2), it.getLong(3), it.getLong(4), it.getInt(5) == 1, it.getLong(6)) else null }
+
+    override fun saveHistoryProgress(progress: FamilyCareHistoryProgress) {
+        owner.writableDatabase.insertWithOnConflict("family_care_history_progress", null, ContentValues().apply {
+            put("room_id", progress.roomId); put("child_id", progress.childId); put("transfer_id", progress.transferId)
+            put("stream_id", progress.streamId); put("cursor", progress.cursor); put("anchor", progress.anchor)
+            put("record_count", progress.count); put("complete", if (progress.complete) 1 else 0); put("checked_at", progress.checkedAt)
+        }, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    override fun pendingHistoryPackets(roomId: String, peerId: Long, limit: Int): List<FamilyCareOutgoing> =
+        packetQuery(roomId, " AND d.peer_id=? AND p.packet_type IN ('history_request','history_event','history_checkpoint')", arrayOf(peerId.toString()), limit)
+
+    override fun linkHistoryPage(checkpoint: FamilyCareOutgoing, entries: List<FamilyCareOutgoing>) {
+        entries.forEach { packet -> owner.writableDatabase.insertWithOnConflict("family_care_history_parts", null, ContentValues().apply {
+            put("room_id", checkpoint.roomId); put("checkpoint_id", checkpoint.packetId); put("peer_id", checkpoint.peerId); put("packet_id", packet.packetId)
+        }, SQLiteDatabase.CONFLICT_IGNORE) }
+    }
+
+    override fun completeHistoryPage(roomId: String, checkpointId: String, peerId: Long) = transaction {
+        val db = owner.writableDatabase
+        val ids = db.rawQuery("SELECT packet_id FROM family_care_history_parts WHERE room_id=? AND checkpoint_id=? AND peer_id=?",
+            arrayOf(roomId, checkpointId, peerId.toString())).use { rows -> buildList { while (rows.moveToNext()) add(rows.getString(0)) } }
+        ids.forEach { id ->
+            db.update("family_care_deliveries", ContentValues().apply { put("completed", 1) },
+                "room_id=? AND packet_id=? AND peer_id=?", arrayOf(roomId, id, peerId.toString()))
+            pruneCompletedPayload(db, roomId, id)
+        }
+        db.delete("family_care_history_parts", "room_id=? AND checkpoint_id=? AND peer_id=?", arrayOf(roomId, checkpointId, peerId.toString()))
+        Unit
+    }
+
+    override fun historySendTurn(roomId: String, peerId: Long) = owner.meta("careHistoryTurn:$roomId:$peerId") != 0L
+    override fun setHistorySendTurn(roomId: String, peerId: Long, history: Boolean) = owner.setMeta("careHistoryTurn:$roomId:$peerId", if (history) 1 else 0)
 
     private data class StateMetadata(val epoch: String, val revision: Long, val authoritative: Boolean, val digest: String)
 
@@ -345,7 +417,7 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
 
     private fun packetQuery(roomId: String, condition: String, arguments: Array<String>, limit: Int, skipReplaced: Boolean = false): List<FamilyCareOutgoing> {
         require(limit in 1..FamilyCareDelta.HISTORY_LIMIT)
-        val replacementFilter = if (skipReplaced) " AND NOT EXISTS(SELECT 1 FROM family_care_replacements r WHERE " +
+        val replacementFilter = if (skipReplaced) " AND (p.packet_type IS NULL OR p.packet_type NOT IN ('history_request','history_event','history_checkpoint')) AND NOT EXISTS(SELECT 1 FROM family_care_replacements r WHERE " +
             "r.room_id=d.room_id AND r.original_id=d.packet_id AND r.peer_id=d.peer_id)" else ""
         val priority = if (skipReplaced) "CASE WHEN EXISTS(SELECT 1 FROM family_care_replacements r WHERE " +
             "r.room_id=d.room_id AND r.replacement_id=d.packet_id AND r.peer_id=d.peer_id) THEN 0 ELSE 1 END," else ""
@@ -508,6 +580,10 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
                     put("room_id", roomId); put("child_id", childId); put("id", event.id)
                     put("measured_at", measuredAt); put("local_day", day(measuredAt, zone)); put("event", event.json().toString())
                 }, SQLiteDatabase.CONFLICT_REPLACE)
+                // This append identity survives CONFLICT_REPLACE, timestamp corrections and delayed fixes.
+                db.insertWithOnConflict("family_care_history_log", null, ContentValues().apply {
+                    put("room_id", roomId); put("child_id", childId); put("event_id", event.id)
+                }, SQLiteDatabase.CONFLICT_IGNORE)
             }
         }
         Unit
@@ -607,6 +683,17 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
             createOptimizationTables(db)
             upgradeToV8(db)
             upgradeToV9(db)
+            upgradeToV10(db)
+        }
+
+        internal fun upgradeToV10(db: SQLiteDatabase) {
+            db.execSQL("CREATE TABLE IF NOT EXISTS family_care_history_streams(room_id TEXT NOT NULL,child_id INTEGER NOT NULL,stream_id TEXT NOT NULL,PRIMARY KEY(room_id,child_id))")
+            db.execSQL("CREATE TABLE IF NOT EXISTS family_care_history_log(sequence INTEGER PRIMARY KEY AUTOINCREMENT,room_id TEXT NOT NULL,child_id INTEGER NOT NULL,event_id TEXT NOT NULL,UNIQUE(room_id,child_id,event_id))")
+            db.execSQL("CREATE INDEX IF NOT EXISTS family_care_history_range ON family_care_history_log(room_id,child_id,sequence)")
+            db.execSQL("CREATE TABLE IF NOT EXISTS family_care_history_progress(room_id TEXT NOT NULL,child_id INTEGER NOT NULL,transfer_id TEXT NOT NULL,stream_id TEXT,cursor INTEGER NOT NULL,anchor INTEGER NOT NULL,record_count INTEGER NOT NULL,complete INTEGER NOT NULL,checked_at INTEGER NOT NULL,PRIMARY KEY(room_id,child_id))")
+            db.execSQL("CREATE TABLE IF NOT EXISTS family_care_history_parts(room_id TEXT NOT NULL,checkpoint_id TEXT NOT NULL,peer_id INTEGER NOT NULL,packet_id TEXT NOT NULL,PRIMARY KEY(room_id,checkpoint_id,peer_id,packet_id))")
+            // Existing full archives are indexed without parsing or changing their events, dates or care state.
+            db.execSQL("INSERT OR IGNORE INTO family_care_history_log(room_id,child_id,event_id) SELECT room_id,child_id,id FROM family_care_movement ORDER BY measured_at,id")
         }
 
         internal fun upgradeToV9(db: SQLiteDatabase) {
@@ -702,7 +789,8 @@ class SqliteFamilyCareStore internal constructor(private val owner: LocalStore) 
             listOf("family_care_states", "family_care_outcomes", "family_care_commands", "family_care_received", "family_care_deliveries", "family_care_packets",
                 "family_care_receipts", "family_care_peer_state", "family_care_chunks", "family_care_errors", "family_care_movement",
                 "family_care_settings", "family_care_event_ids", "family_care_deltas", "family_care_replacements", "family_care_live",
-                "family_care_live_outgoing", "family_care_live_peer").forEach { db.delete(it, null, null) }
+                "family_care_live_outgoing", "family_care_live_peer", "family_care_history_streams", "family_care_history_log",
+                "family_care_history_progress", "family_care_history_parts").forEach { db.delete(it, null, null) }
         }
     }
 }

@@ -668,7 +668,7 @@ class FamilyCareEngineTest {
         assertEquals(2, child.pendingLatestLocationHeads(f.room.id).size)
         assertTrue(child.pendingLatestLocationHeads(f.room.id).all { JSONObject(it.text).getJSONObject("body").getLong("revision") == 10L })
         // Model already negotiated peers so independent capability controls do not consume this fairness turn.
-        for (peer in listOf(101L, 202L)) for (feature in listOf("supportedUntil", "careSupportedUntil", "fileSupportedUntil", "latestSupportedUntil"))
+        for (peer in listOf(101L, 202L)) for (feature in listOf("supportedUntil", "careSupportedUntil", "fileSupportedUntil", "latestSupportedUntil", "historySupportedUntil"))
             child.setMeta("transport:${f.room.id}:$peer:$feature", f.time + 21_600_000)
         val transport = f.transport(303); val engine = f.engine(303, transport)
         f.http.sent.clear(); engine.flushLatestLocations()
@@ -709,7 +709,7 @@ class FamilyCareEngineTest {
         assertTrue(child.pendingLatestLocationHeads(f.room.id).isEmpty())
         assertEquals(2, child.pendingPackets(f.room.id).size)
         f.latest = true
-        for (peer in listOf(101L, 202L)) for (feature in listOf("supportedUntil", "careSupportedUntil", "fileSupportedUntil", "latestSupportedUntil"))
+        for (peer in listOf(101L, 202L)) for (feature in listOf("supportedUntil", "careSupportedUntil", "fileSupportedUntil", "latestSupportedUntil", "historySupportedUntil"))
             child.setMeta("transport:${f.room.id}:$peer:$feature", f.time + 21_600_000)
         val transport = f.transport(303); val engine = f.engine(303, transport)
         f.http.sent.clear(); engine.flushLatestLocations(); engine.flush()
@@ -739,7 +739,7 @@ class FamilyCareEngineTest {
         val child = f.stores.getValue(303)
         assertNull(child.latestLocationHead(f.room.id, 303))
         f.latest = true
-        for (peer in listOf(101L, 202L)) for (feature in listOf("supportedUntil", "careSupportedUntil", "fileSupportedUntil", "latestSupportedUntil"))
+        for (peer in listOf(101L, 202L)) for (feature in listOf("supportedUntil", "careSupportedUntil", "fileSupportedUntil", "latestSupportedUntil", "historySupportedUntil"))
             child.setMeta("transport:${f.room.id}:$peer:$feature", f.time + 21_600_000)
         f.engine(303, f.transport(303)).flushLatestLocations()
         assertEquals("care_location_head", JSONObject(f.http.sent.first().third).getString("type"))
@@ -782,6 +782,138 @@ class FamilyCareEngineTest {
         assertTrue(f.stores.getValue(303).pendingPackets(f.room.id).isEmpty())
     }
 
+    @Test fun `independent history repair restores more than two hundred old points while both boards are already current`() {
+        val f = Family(); f.batching = true; f.files = true; f.drain()
+        val originals = (0 until 260).map { location() }
+        originals.forEach { f.stores.getValue(303).archiveEvent(f.room.id, 303, it) }
+        val before = listOf(101L, 202L).associateWith { FamilyCareDelta.projectionDigest(f.engine(it).currentSnapshot(303)!!) }
+        f.histories = true; f.drain(rounds = 700)
+        for (parentId in listOf(101L, 202L)) {
+            val parent = f.stores.getValue(parentId)
+            assertTrue(parent.archived.map { it.second.id }.containsAll(originals.map { it.id }))
+            assertEquals(before.getValue(parentId), FamilyCareDelta.projectionDigest(f.engine(parentId).currentSnapshot(303)!!))
+            assertEquals(0L, f.engine(parentId).currentSnapshot(303)!!.revision)
+            assertTrue(parent.historyProgress(f.room.id, 303)!!.complete)
+            assertEquals(260L, parent.historyProgress(f.room.id, 303)!!.count)
+            assertNull(parent.eventDigest(f.room.id, 303, originals.first().id))
+            assertNull(parent.latestLocationHead(f.room.id, 303))
+        }
+        assertTrue(f.http.filePacketCounts.any { it > 16 })
+        assertTrue(f.stores.getValue(303).pendingPackets(f.room.id).isEmpty())
+    }
+
+    @Test fun `history checkpoint waits for exact entries and next request proves old page before its ACK`() {
+        val f = Family(); f.drain(); f.histories = true
+        val child = f.stores.getValue(303); val parent = f.stores.getValue(101)
+        repeat(50) { child.archiveEvent(f.room.id, 303, location()) }
+        assertTrue(f.engine(101).requestHistory(303))
+        val request = parent.pendingHistoryPackets(f.room.id, 303, 25).single()
+        parent.markSent(f.room.id, request.packetId, 303, f.time)
+        child.transaction { f.engine(303).processUpdate(update(101, request.text)) }
+        val page = child.pendingHistoryPackets(f.room.id, 101, 25)
+        assertEquals(25, page.size)
+        val marker = page.last(); assertEquals("history_checkpoint", JSONObject(marker.text).getString("type"))
+        parent.transaction { f.engine(101).processUpdate(update(303, marker.text)) }
+        assertEquals(0L, parent.historyProgress(f.room.id, 303)!!.cursor)
+        assertNull(parent.receivedDigest(f.room.id, marker.packetId))
+        page.forEach { child.markSent(f.room.id, it.packetId, 101, f.time) }
+        page.dropLast(1).reversed().forEach { packet -> parent.transaction { f.engine(101).processUpdate(update(303, packet.text)) } }
+        parent.failCommit = true
+        try { parent.transaction { f.engine(101).processUpdate(update(303, marker.text)) }; fail() } catch (_: IOException) { }
+        assertEquals(0L, parent.historyProgress(f.room.id, 303)!!.cursor)
+        assertNotNull(parent.pendingPacket(f.room.id, request.packetId, 303))
+        parent.transaction { f.engine(101).processUpdate(update(303, marker.text)) }
+        assertEquals(24L, parent.historyProgress(f.room.id, 303)!!.cursor)
+        assertNull(parent.pendingPacket(f.room.id, request.packetId, 303))
+        val next = parent.pendingHistoryPackets(f.room.id, 303, 25).single()
+        // The actual checkpoint ACK is deliberately withheld; the durable next cursor is equivalent proof.
+        child.transaction { f.engine(303).processUpdate(update(101, next.text)) }
+        val following = child.pendingHistoryPackets(f.room.id, 101, 25)
+        assertEquals(25, following.size)
+        assertFalse(following.any { it.packetId == marker.packetId })
+        assertEquals(24L, JSONObject(following.last().text).getJSONObject("body").getLong("previous"))
+        parent.transaction { f.engine(101).processUpdate(update(303, marker.text)) }
+        assertEquals(24L, parent.historyProgress(f.room.id, 303)!!.cursor)
+        assertEquals(0L, f.engine(101).currentSnapshot(303)!!.revision)
+    }
+
+    @Test fun `equal revision snapshot repairs its retained timeline without changing the board`() {
+        val f = Family(); f.drain()
+        repeat(8) { f.engine(303).emitChildEvent(location()) }
+        val child = f.engine(303).currentSnapshot(303)!!
+        val parent = f.stores.getValue(101)
+        parent.saveState(child.copy(authoritative = false))
+        assertTrue(parent.archived.isEmpty())
+        FamilyCareSnapshots.chunks(child).forEach { chunk -> parent.transaction { f.engine(101).processUpdate(update(303,
+            FamilyCareProtocol.envelope(f.room, 303, 303, "snapshot_chunk", FamilyCareSnapshots.chunkJson(chunk)).toString())) } }
+        assertEquals(8, parent.archived.size)
+        assertEquals(child.revision, f.engine(101).currentSnapshot(303)!!.revision)
+        assertEquals(FamilyCareDelta.projectionDigest(child), FamilyCareDelta.projectionDigest(f.engine(101).currentSnapshot(303)!!))
+    }
+
+    @Test fun `old finance epoch location is archived before acknowledgement without replacing the board`() {
+        val f = Family(); f.drain()
+        val parent = f.stores.getValue(101); val before = f.engine(101).currentSnapshot(303)!!
+        val event = location().copy(delivery = "relayed")
+        val packet = FamilyCareProtocol.envelope(f.room, 303, 303, "child_event", JSONObject()
+            .put("epoch", UUID.randomUUID().toString()).put("revision", 999).put("event", event.json()))
+        parent.transaction { f.engine(101).processUpdate(update(303, packet.toString())) }
+        assertEquals(listOf(event.id), parent.archived.map { it.second.id })
+        assertEquals(before.epoch, f.engine(101).currentSnapshot(303)!!.epoch)
+        assertEquals(before.revision, f.engine(101).currentSnapshot(303)!!.revision)
+        assertNull(parent.eventDigest(f.room.id, 303, event.id))
+        assertTrue(parent.receipts(f.room.id).any { it.packetId == packet.getString("id") })
+        assertNotNull(parent.error(f.room.id, 303))
+    }
+
+    @Test fun `waiting or unsupported history lane never blocks ready normal telemetry`() {
+        val f = Family(); f.drain(); f.histories = true
+        val child = f.stores.getValue(303); val event = location().copy(delivery = "relayed")
+        val history = FamilyCareProtocol.outgoing(f.room, 303, 303, 101, "history_event", JSONObject()
+            .put("transferId", UUID.randomUUID().toString()).put("streamId", UUID.randomUUID().toString())
+            .put("sequence", 1).put("event", event.json()))
+        child.queuePacket(history); child.markSent(f.room.id, history.packetId, 101, f.time); child.markSendConfirmed(f.room.id, history.packetId, 101)
+        child.setHistorySendTurn(f.room.id, 101, true)
+        for (peer in listOf(101L, 202L)) for (feature in listOf("supportedUntil", "careSupportedUntil", "fileSupportedUntil", "latestSupportedUntil", "historySupportedUntil"))
+            child.setMeta("transport:${f.room.id}:$peer:$feature", f.time + 21_600_000)
+        f.engine(303).emitChildEvent(location())
+        f.http.sent.clear(); f.engine(303, f.transport(303)).flush()
+        assertTrue(f.http.sent.any { it.second == 101L && JSONObject(it.third).optString("type") == "child_event" })
+        assertNotNull(child.pendingPacket(f.room.id, history.packetId, 101))
+        f.oldCarePeers += 101L; f.time += 1101; f.engine(303).emitChildEvent(location())
+        f.http.sent.clear(); f.engine(303, f.transport(303)).flush()
+        assertTrue(f.http.sent.any { it.second == 101L && JSONObject(it.third).optString("type") == "child_event" })
+        assertNotNull(child.pendingPacket(f.room.id, history.packetId, 101))
+    }
+
+    @Test fun `new archive stream restarts an active repair at zero and cannot inject finance or sibling locations`() {
+        val f = Family(); f.drain(); f.histories = true
+        val parent = f.stores.getValue(101); val transfer = UUID.randomUUID().toString()
+        val oldStream = UUID.randomUUID().toString(); val newStream = UUID.randomUUID().toString()
+        val retained = location().copy(delivery = "relayed"); parent.archiveEvent(f.room.id, 303, retained)
+        parent.saveHistoryProgress(FamilyCareHistoryProgress(f.room.id, 303, transfer, oldStream, 24, 50, 50, false, f.time))
+        val event = location().copy(delivery = "relayed")
+        val body = JSONObject().put("transferId", transfer).put("streamId", newStream).put("sequence", 1).put("event", event.json())
+        val source = FamilyCareProtocol.envelope(f.room, 303, 303, "history_event", body)
+        parent.transaction { f.engine(101).processUpdate(update(404, source.toString())) }
+        assertFalse(parent.archived.any { it.second.id == event.id })
+        parent.transaction { f.engine(101).processUpdate(update(303, source.toString())) }
+        val marker = FamilyCareProtocol.envelope(f.room, 303, 303, "history_checkpoint", JSONObject()
+            .put("transferId", transfer).put("streamId", newStream).put("previous", 0).put("cursor", 1).put("anchor", 1)
+            .put("count", 1).put("done", true).put("entries", JSONArray().put(JSONObject().put("sequence", 1).put("eventId", event.id)))
+            .put("digest", FamilyCareHistorySync.digest(listOf(FamilyCareHistoryEntry(1, event)))))
+        parent.transaction { f.engine(101).processUpdate(update(303, marker.toString())) }
+        assertEquals(newStream, parent.historyProgress(f.room.id, 303)!!.streamId)
+        assertEquals(1L, parent.historyProgress(f.room.id, 303)!!.cursor)
+        assertTrue(parent.historyProgress(f.room.id, 303)!!.complete)
+        assertTrue(parent.archived.map { it.second.id }.containsAll(listOf(retained.id, event.id)))
+        val financial = event.copy(kind = "sticker_award", sender = "guardian", payload = award())
+        val invalid = FamilyCareProtocol.envelope(f.room, 303, 303, "history_event", JSONObject(body.toString()).put("event", financial.json()))
+        parent.transaction { f.engine(101).processUpdate(update(303, invalid.toString())) }
+        assertNull(parent.receivedDigest(f.room.id, invalid.getString("id")))
+        assertEquals(5, f.engine(101).currentSnapshot(303)!!.snapshot.stickerBalance)
+    }
+
     private class Family(bootstrap: Boolean = true) {
         val ids = listOf(101L, 202L, 303L, 404L)
         val room = FamilyChatRoom.create("우리집", ids.mapIndexed { index, id -> FamilyChatMember(id, "@care${id}_bot",
@@ -794,6 +926,7 @@ class FamilyCareEngineTest {
         var files = false
         var deltas = false
         var latest = false
+        var histories = false
         val oldPeers = mutableSetOf<Long>()
         val oldCarePeers = mutableSetOf<Long>()
         init {
@@ -806,7 +939,8 @@ class FamilyCareEngineTest {
         }
         private fun client(id: Long) = TelegramClient("$id:${"x".repeat(32)}", http)
         fun engine(id: Long, transport: FamilyTransport? = null) = FamilyCareEngine(client(id), stores.getValue(id), room, id, now = { time }, transport = transport,
-            canSyncDeltas = { deltas && it !in oldCarePeers }, canSendLatestLocation = { latest && it !in oldCarePeers })
+            canSyncDeltas = { deltas && it !in oldCarePeers }, canSendLatestLocation = { latest && it !in oldCarePeers },
+            canSyncHistory = { histories && it !in oldCarePeers })
         fun transport(id: Long) = FamilyTransport(client(id), stores.getValue(id), room, id, now = { time })
         fun sync(id: Long): Boolean {
             http.acceptFiles = files
@@ -904,6 +1038,12 @@ class FamilyCareEngineTest {
         private var liveOutgoing = linkedMapOf<Triple<String, Long, Long>, FamilyCareOutgoing>()
         private var completedLive = linkedSetOf<Triple<String, Long, Long>>()
         private var latestSent = linkedMapOf<Pair<String, Long>, Long>()
+        private var historySerial = 0L
+        private var historyLog = linkedMapOf<Triple<String, Long, String>, Long>()
+        private var historyStreams = linkedMapOf<Pair<String, Long>, String>()
+        private var historyProgress = linkedMapOf<Pair<String, Long>, FamilyCareHistoryProgress>()
+        private var historyPages = linkedMapOf<Triple<String, String, Long>, List<String>>()
+        private var historyTurns = linkedMapOf<Pair<String, Long>, Boolean>()
         var archived = mutableListOf<Pair<Long, FamilyEvent>>()
         private var meta = linkedMapOf<String, Long>()
         private var legacy = TelegramLedger.emptyState()
@@ -918,6 +1058,8 @@ class FamilyCareEngineTest {
             val mappings = LinkedHashMap(replacements)
             val heads = LinkedHashMap(latestHeads); val slots = LinkedHashMap(liveOutgoing); val headTimes = LinkedHashMap(latestSent)
             val completedHeads = LinkedHashSet(completedLive)
+            val serial = historySerial; val log = LinkedHashMap(historyLog); val streams = LinkedHashMap(historyStreams)
+            val progress = LinkedHashMap(historyProgress); val pages = LinkedHashMap(historyPages); val turns = LinkedHashMap(historyTurns)
             try {
                 val value = block()
                 if (failCommit) { failCommit = false; throw IOException("commit failed") }
@@ -929,6 +1071,7 @@ class FamilyCareEngineTest {
                 replacements = mappings
                 latestHeads = heads; liveOutgoing = slots; latestSent = headTimes
                 completedLive = completedHeads
+                historySerial = serial; historyLog = log; historyStreams = streams; historyProgress = progress; historyPages = pages; historyTurns = turns
                 throw error
             }
         }
@@ -986,6 +1129,23 @@ class FamilyCareEngineTest {
         }
         override fun latestLocationSentAt(roomId: String, peerId: Long) = latestSent[roomId to peerId] ?: 0L
         override fun movementEventDigest(roomId: String, childId: Long, eventId: String) = archived.firstOrNull { it.first == childId && it.second.id == eventId }?.second?.let(TelegramLedger::eventDigest)
+        override fun historySource(roomId: String, childId: Long, anchor: Long): FamilyCareHistorySource {
+            val sequences = historyLog.filter { it.key.first == roomId && it.key.second == childId && it.value <= anchor }.values
+            return FamilyCareHistorySource(historyStreams.getOrPut(roomId to childId) { UUID.randomUUID().toString() }, sequences.maxOrNull() ?: 0, sequences.size.toLong())
+        }
+        override fun historyEntries(roomId: String, childId: Long, after: Long, anchor: Long, limit: Int) = historyLog
+            .filter { it.key.first == roomId && it.key.second == childId && it.value > after && it.value <= anchor }.entries.sortedBy { it.value }.take(limit)
+            .map { row -> FamilyCareHistoryEntry(row.value, requireNotNull(archived.firstOrNull { it.first == childId && it.second.id == row.key.third }?.second)) }
+        override fun historyEvents(roomId: String, childId: Long, ids: List<String>) = archived.filter { it.first == childId && it.second.id in ids }.map { it.second }
+        override fun historyProgress(roomId: String, childId: Long) = historyProgress[roomId to childId]
+        override fun saveHistoryProgress(progress: FamilyCareHistoryProgress) { historyProgress[progress.roomId to progress.childId] = progress }
+        override fun linkHistoryPage(checkpoint: FamilyCareOutgoing, entries: List<FamilyCareOutgoing>) { historyPages[Triple(checkpoint.roomId, checkpoint.packetId, checkpoint.peerId)] = entries.map { it.packetId } }
+        override fun completeHistoryPage(roomId: String, checkpointId: String, peerId: Long) {
+            val ids = historyPages.remove(Triple(roomId, checkpointId, peerId)).orEmpty()
+            outgoing.removeAll { it.roomId == roomId && it.peerId == peerId && it.packetId in ids }
+        }
+        override fun historySendTurn(roomId: String, peerId: Long) = historyTurns[roomId to peerId] ?: false
+        override fun setHistorySendTurn(roomId: String, peerId: Long, history: Boolean) { historyTurns[roomId to peerId] = history }
         override fun saveDelta(delta: FamilyCareDelta) { deltaHistory.add(delta); deltaHistory.removeAll { it.roomId == delta.roomId && it.childId == delta.childId && (it.epoch != delta.epoch || it.revision <= delta.revision - FamilyCareDelta.HISTORY_LIMIT) } }
         override fun deltas(roomId: String, childId: Long, epoch: String, afterRevision: Long, limit: Int) =
             deltaHistory.filter { it.roomId == roomId && it.childId == childId && it.epoch == epoch && it.revision > afterRevision }.sortedBy { it.revision }.take(limit)
@@ -997,7 +1157,7 @@ class FamilyCareEngineTest {
         override fun hasReplacement(roomId: String, packetId: String, peerId: Long) = replacements.containsKey(Triple(roomId, packetId, peerId))
         override fun pendingPackets(roomId: String, peerId: Long, limit: Int): List<FamilyCareOutgoing> {
             val targets = replacements.filterKeys { it.first == roomId && it.third == peerId }.values.flatten().toSet()
-            return outgoing.filter { it.roomId == roomId && it.peerId == peerId && !hasReplacement(roomId, it.packetId, peerId) }
+            return outgoing.filter { it.roomId == roomId && it.peerId == peerId && !FamilyCareHistorySync.isHistory(it) && !hasReplacement(roomId, it.packetId, peerId) }
                 .sortedBy { if (it.packetId in targets) 0 else 1 }.take(limit)
         }
         override fun outcome(roomId: String, commandId: String) = outcomes[roomId to commandId]
@@ -1040,7 +1200,15 @@ class FamilyCareEngineTest {
         override fun removeSnapshotChunks(roomId: String, transferId: String) { chunks.removeAll { it.roomId == roomId && it.transferId == transferId } }
         override fun setError(roomId: String, childId: Long, error: String?) { if (error == null) errors.remove(roomId to childId) else errors[roomId to childId] = error }
         override fun error(roomId: String, childId: Long) = errors[roomId to childId]
-        override fun archiveEvent(roomId: String, childId: Long, event: FamilyEvent) { if (event.kind in setOf("location", "vertical") && archived.none { it.first == childId && it.second.id == event.id }) archived.add(childId to event) }
+        override fun archiveEvent(roomId: String, childId: Long, event: FamilyEvent) {
+            if (event.kind !in setOf("location", "vertical")) return
+            val existing = archived.indexOfFirst { it.first == childId && it.second.id == event.id }
+            if (existing >= 0) {
+                require(TelegramLedger.eventDigest(archived[existing].second) == TelegramLedger.eventDigest(event))
+                archived[existing] = childId to event
+            } else archived.add(childId to event)
+            historyLog.getOrPut(Triple(roomId, childId, event.id)) { ++historySerial }
+        }
         override fun meta(name: String) = meta[name] ?: 0
         override fun setMeta(name: String, value: Long) { meta[name] = value }
         override fun cached() = JSONObject(legacy.toString())

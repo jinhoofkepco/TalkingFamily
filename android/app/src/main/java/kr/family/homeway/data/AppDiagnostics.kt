@@ -28,6 +28,14 @@ object AppDiagnostics {
         } catch (_: Exception) { }
     }
 
+    /** Exception messages and stacks may contain private JSON or credentials; retain classes only. */
+    fun recordFailure(context: Context, source: String, error: Throwable) =
+        record(context, source, failureCategory(error))
+
+    internal fun failureCategory(error: Throwable): String = generateSequence(error) { it.cause }
+        .take(3).joinToString(" <- ") { it.javaClass.simpleName.replace(Regex("[^A-Za-z0-9_]"), "").take(64) }
+        .let { "category=$it" }
+
     /** Called by the Activity's privileged diagnostic dump; no screen, sharing flow or upload exists. */
     fun dump(context: Context, writer: PrintWriter) {
         try {

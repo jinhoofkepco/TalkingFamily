@@ -76,6 +76,14 @@ class AppRepository internal constructor(context: Context, private val clientFac
                 FamilyTransport.supportsCareDeltas(store, active.id, peer, System.currentTimeMillis())
             }, canSendLatestLocation = { peer ->
                 FamilyTransport.supportsLatestLocation(store, active.id, peer, System.currentTimeMillis())
+            }, canSyncHistory = { peer ->
+                FamilyTransport.supportsMovementHistory(store, active.id, peer, System.currentTimeMillis())
+            }, onPeerFailure = { peer, failure ->
+                prefs.edit().putString("careDeliveryError_${active.id}_$peer", failure.message).commit()
+                AppDiagnostics.record(app, "telegram.care_delivery",
+                    "operation=${failure.operation.name} code=${failure.errorCode} retryAfterSeconds=${failure.retryAfterSeconds ?: 0}")
+            }, onPeerSuccess = { peer ->
+                prefs.edit().remove("careDeliveryError_${active.id}_$peer").apply()
             })
     fun careSnapshot(childId: Long? = selectedCareChildId): FamilySnapshot? = synchronized(dataLock) {
         val active = room ?: return@synchronized null
@@ -124,6 +132,8 @@ class AppRepository internal constructor(context: Context, private val clientFac
             carePending = selected?.let { engine!!.hasPending(it) } ?: false,
             careStatus = selected?.let { engine!!.status(it) },
             sharingEnabled = sharingEnabled, trackingStatus = trackingStatus, connectionError = connectionError,
+            historySyncing = useCare && activeRole == "guardian" && selected != null &&
+                store.familyCare.historyProgress(active!!.id, selected)?.complete == false,
             latestLocation = if (useCare && selected != null) store.familyCare.latestLocationHead(active!!.id, selected)?.event?.copy(
                 roomId = active.id, senderId = selected,
                 senderName = active.members.firstOrNull { it.botId == selected }?.displayName) else null,
@@ -161,6 +171,7 @@ class AppRepository internal constructor(context: Context, private val clientFac
                 if (role == "guardian" && children.any { it.botId == oldChild }) store.familyCare.importLegacyMovement(active.id, oldChild)
                 val now = System.currentTimeMillis()
                 children.forEach { child ->
+                    engine.requestHistory(child.botId)
                     val key = "careSync_${active.id}_${child.botId}"
                     val previous = prefs.getLong(key, 0)
                     val interval = if (store.familyCare.stateMetadata(active.id, child.botId) == null) 60_000 else 300_000
@@ -341,6 +352,9 @@ class AppRepository internal constructor(context: Context, private val clientFac
             throw e
         } finally {
             pacedOutboxDeadline = transport?.deferredUntilMillis ?: 0L
+            synchronized(dataLock) {
+                FamilySyncDiagnostics.capture(app, store, activeRoom, selfBotId, System.currentTimeMillis())
+            }
             publishChanges()
         }
     } }
@@ -357,6 +371,18 @@ class AppRepository internal constructor(context: Context, private val clientFac
             if (careRoomId != null && childId != null) store.familyCare.movementHistory(careRoomId, childId, day, before)
             else store.movementHistory(day, before)
         }
+    }
+
+    /** An explicit map refresh checks the durable timeline independently of the praise-board revision. */
+    suspend fun requestMovementHistoryRepair(roomId: String, childId: Long) = withContext(Dispatchers.IO) {
+        val queued = synchronized(dataLock) {
+            val active = room ?: return@synchronized false
+            if (active.id != roomId || !careEnabled || careRole != "guardian" ||
+                active.members.none { it.botId == childId && it.relationship in FamilyCareValidation.childRelationships })
+                return@synchronized false
+            store.transaction { careEngine(active).requestHistory(childId) }
+        }
+        if (queued) scheduleOutbox()
     }
     suspend fun privateChatHistory(before: MovementHistoryCursor? = null): PrivateChatHistoryPage = withContext(Dispatchers.IO) {
         synchronized(dataLock) { store.privateChatHistory(before) }
@@ -481,10 +507,16 @@ class AppRepository internal constructor(context: Context, private val clientFac
         } else prefs.edit().remove("legacyDeliveryError").apply()
         room?.let { active ->
             val pendingPeers = store.familyChat.pendingPeers(active.id)
+            val carePeers = (store.familyCare.pendingPeers(active.id) +
+                store.familyCare.pendingLatestLocationHeads(active.id).map { it.peerId }).toSet()
             active.members.forEach { member ->
                 val key = "roomDeliveryError_${active.id}_${member.botId}"
                 if (member.botId in pendingPeers) prefs.getString(key, null)?.let { failures.add("${member.displayName}에게 전달 대기: $it") }
                 else prefs.edit().remove(key).apply()
+                val careKey = "careDeliveryError_${active.id}_${member.botId}"
+                if (member.botId in carePeers) prefs.getString(careKey, null)?.let {
+                    failures.add("가족 기록 전달 대기: $it")
+                } else prefs.edit().remove(careKey).apply()
             }
         }
         failures.firstOrNull()

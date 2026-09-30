@@ -17,9 +17,15 @@ class FamilyCareEngine(
     private val transport: FamilyTransport? = null,
     private val canSyncDeltas: (Long) -> Boolean = { false },
     private val canSendLatestLocation: (Long) -> Boolean = { false },
+    private val canSyncHistory: (Long) -> Boolean = { false },
+    private val onPeerFailure: (Long, TelegramException) -> Unit = { _, _ -> },
+    private val onPeerSuccess: (Long) -> Unit = {},
 ) {
     private val room = FamilyChatValidation.room(room)
     private val parents get() = room.members.filter { FamilyCareValidation.isParent(room, it.botId) }.map { it.botId }
+    private val history = FamilyCareHistorySync(this.room, ownBotId, store, canSyncHistory, now) { peer, id ->
+        transport?.noteAcknowledgedPacket(peer, id); receivedAcknowledgements++; onPeerSuccess(peer)
+    }
     init { require(this.room.members.any { it.botId == ownBotId }) }
     var receivedAcknowledgements: Int = 0
         private set
@@ -130,6 +136,9 @@ class FamilyCareEngine(
     }
 
     fun requestSync(childId: Long) = synchronized(lock) { store.transaction { queueSync(childId) } }
+    fun requestHistory(childId: Long, force: Boolean = false): Boolean = synchronized(lock) {
+        store.transaction { history.request(childId, force) }
+    }
 
     /** Called after valid legacy input, in the very same transaction as the v2 cache and receive offset. */
     fun processLegacy(input: FamilyEvent, peerId: Long): Boolean {
@@ -184,9 +193,12 @@ class FamilyCareEngine(
             val pending = store.pendingPacket(room.id, packet.id, packet.actorId)
             if (pending != null && pending.childId == packet.childId && pending.digest == digest && pending.sentAt > 0) {
                 store.acknowledge(room.id, packet.id, packet.actorId, digest)
+                if (JSONObject(pending.text).optString("type") == "history_checkpoint")
+                    store.completeHistoryPage(room.id, packet.id, packet.actorId)
                 store.setRetryAfter(room.id, packet.actorId, 0)
                 transport?.noteAcknowledgedPacket(packet.actorId, packet.id)
                 receivedAcknowledgements++
+                onPeerSuccess(packet.actorId)
             }
             return
         }
@@ -195,6 +207,7 @@ class FamilyCareEngine(
         if (prior != null) transport?.noteReplayedPacket(packet.actorId, packet.id)
         if (prior == null) {
             val accepted = try {
+                if (packet.type in FamilyCareHistorySync.TYPES) history.receive(packet) else {
                 when (packet.type) {
                     "command" -> {
                         val command = runCatching { FamilyCareCommand.parse(packet.body) }.getOrNull()
@@ -211,7 +224,7 @@ class FamilyCareEngine(
                         queueSnapshot(FamilyCareSnapshots.chunks(state), listOf(packet.actorId))
                     }
                     "care_sync" -> receiveSyncRequest(packet)
-                    "care_delta" -> receiveDelta(FamilyCareDelta.parse(room.id, packet.childId, packet.body))
+                    "care_delta" -> if (!receiveDelta(FamilyCareDelta.parse(room.id, packet.childId, packet.body))) return
                     "snapshot_chunk" -> receiveChunk(FamilyCareSnapshots.parseChunk(room.id, packet.childId, packet.body))
                     "outcome" -> {
                         val outcome = FamilyCareOutcome.parse(packet.body)
@@ -229,6 +242,7 @@ class FamilyCareEngine(
                     "child_event" -> receiveChildEvent(packet)
                 }
                 true
+                }
             } catch (_: IllegalArgumentException) {
                 store.setError(room.id, packet.childId, "받은 가족 기록의 형식을 확인하지 못했어요.")
                 false
@@ -342,17 +356,19 @@ class FamilyCareEngine(
     private fun receiveChunk(chunk: FamilyCareChunk) {
         val current = store.state(room.id, chunk.childId)
         require(current?.authoritative != true)
-        if (current != null && current.epoch != chunk.epoch) { epochError(chunk.childId); return }
-        if (current != null && chunk.revision < current.revision) return
         store.putSnapshotChunk(chunk)
         val parts = store.snapshotChunks(room.id, chunk.transferId)
         if (parts.size != chunk.count) return
         val snapshot = FamilyCareSnapshots.assemble(parts)
+        // Board revision equality or an old board epoch must not suppress authenticated archival repair.
+        archiveProjection(snapshot)
+        if (current != null && current.epoch != chunk.epoch) {
+            epochError(chunk.childId); store.removeSnapshotChunks(room.id, chunk.transferId); return
+        }
         if (current == null || snapshot.revision > current.revision) {
             store.saveState(snapshot)
             store.setError(room.id, chunk.childId, null)
-            archiveProjection(snapshot)
-        } else if (FamilyCareValidation.digest(FamilyCareSnapshots.projection(current.state)) != FamilyCareValidation.digest(snapshot.state)) {
+        } else if (snapshot.revision == current.revision && FamilyCareValidation.digest(FamilyCareSnapshots.projection(current.state)) != FamilyCareValidation.digest(snapshot.state)) {
             store.setError(room.id, chunk.childId, "같은 순서의 칭찬 기록이 달라요. 새 가족방 코드로 함께 연결해 주세요.")
         }
         store.removeSnapshotChunks(room.id, chunk.transferId)
@@ -365,9 +381,10 @@ class FamilyCareEngine(
         val event = TelegramLedger.validate(FamilyEvent.parse(packet.body.getJSONObject("event")))
         require(event.sender == "child" && event.kind in FamilyCareValidation.telemetryKinds)
         val current = store.state(room.id, packet.childId)
+        // Immutable location/vertical history belongs to this authenticated child, independently of finance epochs.
+        store.archiveEvent(room.id, packet.childId, event)
         if (current != null && current.epoch != epoch) { epochError(packet.childId); return }
         val duplicate = current != null && alreadyApplied(current, event)
-        store.archiveEvent(room.id, packet.childId, event)
         if (current == null || revision > current.revision + 1) { queueSync(packet.childId); return }
         require(!current.authoritative)
         if (revision <= current.revision) return
@@ -400,33 +417,35 @@ class FamilyCareEngine(
         else queueSnapshot(FamilyCareSnapshots.chunks(state), listOf(packet.actorId))
     }
 
-    private fun receiveDelta(delta: FamilyCareDelta) {
+    private fun receiveDelta(delta: FamilyCareDelta): Boolean {
         val current = store.state(room.id, delta.childId)
         require(current?.authoritative != true)
-        if (current == null) { queueSync(delta.childId, forceSnapshot = true); return }
-        if (current.epoch != delta.epoch) { epochError(delta.childId); return }
+        val telemetry = delta.event.kind in FamilyCareValidation.telemetryKinds
+        if (telemetry) store.archiveEvent(room.id, delta.childId, delta.event)
+        if (current == null) { queueSync(delta.childId, forceSnapshot = true); return telemetry }
+        if (current.epoch != delta.epoch) { epochError(delta.childId); return telemetry }
         if (delta.revision <= current.revision) {
             // A full snapshot may have overtaken an older delta; its authenticated timeline is still useful.
             alreadyApplied(current, delta.event)
             if (delta.revision == current.revision && FamilyCareDelta.projectionDigest(current) != delta.resultDigest) {
                 store.setError(room.id, delta.childId, "같은 순서의 칭찬 기록이 달라요. 가족 연결을 확인해 주세요.")
                 queueSync(delta.childId, forceSnapshot = true)
-                return
+                return telemetry
             }
             store.recordEventDigest(room.id, delta.childId, delta.event.id, TelegramLedger.eventDigest(delta.event))
             store.archiveEvent(room.id, delta.childId, delta.event)
-            return
+            return true
         }
-        if (delta.baseRevision != current.revision) { queueSync(delta.childId); return }
+        if (delta.baseRevision != current.revision) { queueSync(delta.childId); return telemetry }
         if (delta.baseDigest != FamilyCareDelta.projectionDigest(current)) {
             store.setError(room.id, delta.childId, "칭찬판의 기준 기록이 달라요. 전체 기록을 다시 확인하고 있어요.")
             queueSync(delta.childId, forceSnapshot = true)
-            return
+            return telemetry
         }
         if (alreadyApplied(current, delta.event)) {
             store.setError(room.id, delta.childId, "이미 반영한 변경 기록의 순서가 달라요. 전체 기록을 다시 확인하고 있어요.")
             queueSync(delta.childId, forceSnapshot = true)
-            return
+            return telemetry
         }
         val applied = TelegramLedger.apply(current.state, delta.event)
         bumpRewardVersion(applied, delta.event.kind, delta.event.payload)
@@ -434,7 +453,7 @@ class FamilyCareEngine(
         if (FamilyCareValidation.digest(projected) != delta.resultDigest) {
             store.setError(room.id, delta.childId, "변경 기록의 결과가 달라요. 전체 기록을 다시 확인하고 있어요.")
             queueSync(delta.childId, forceSnapshot = true)
-            return
+            return telemetry
         }
         // Replay identities are persisted separately, even though the parent projection is bounded.
         projected.put("appliedEventIds", applied.optJSONObject("appliedEventIds") ?: JSONObject())
@@ -442,6 +461,7 @@ class FamilyCareEngine(
         store.recordEventDigest(room.id, delta.childId, delta.event.id, TelegramLedger.eventDigest(delta.event))
         store.archiveEvent(room.id, delta.childId, delta.event)
         store.setError(room.id, delta.childId, null)
+        return true
     }
 
     private fun archiveProjection(state: FamilyCareState) {
@@ -533,7 +553,8 @@ class FamilyCareEngine(
         if (readyLatestLocations().isNotEmpty()) return@synchronized true
         val peers = store.pendingPeers(room.id)
         peers.any { peer -> store.retryAfter(room.id, peer) <= now() &&
-            (store.firstReceipt(room.id, peer) != null || nextSendable(store.pendingPackets(room.id, peer, outgoingWindow(peer))) != null)
+            (store.firstReceipt(room.id, peer) != null || nextSendable(store.pendingPackets(room.id, peer, outgoingWindow(peer))) != null ||
+                (canSyncHistory(peer) && nextSendable(store.pendingHistoryPackets(room.id, peer, FamilyCareHistorySync.PAGE_SIZE + 1)) != null))
         }
     }
 
@@ -555,6 +576,7 @@ class FamilyCareEngine(
 
     /** A slow family member cannot block the other parent, another child, or the v2/v3 lanes. */
     fun flush() {
+        synchronized(lock) { store.transaction { history.maintain() } }
         val peers = synchronized(lock) { store.pendingPeers(room.id) }
         for (peer in peers) {
             checkActive()
@@ -578,6 +600,7 @@ class FamilyCareEngine(
                     checkActive()
                     client.sendToFamilyMember(member, packet.text, checkActive)
                     synchronized(lock) { store.transaction { store.markSendConfirmed(room.id, packet.packetId, peer) } }
+                    onPeerSuccess(peer)
                     // Slow HTTP/peer resolution can outlast the retry interval. A successful
                     // packet must still consume only one slot in this flush's bounded budget.
                     sentThisFlush += packet.packetId
@@ -585,6 +608,7 @@ class FamilyCareEngine(
             } catch (error: TelegramException) {
                 if (error.errorCode in setOf(401, 404, 409, 429)) throw error
                 synchronized(lock) { store.transaction { store.setRetryAfter(room.id, peer, now() + 15_000) } }
+                onPeerFailure(peer, error)
             }
         }
     }
@@ -598,7 +622,16 @@ class FamilyCareEngine(
             allowBatch = transport.canBatchAcknowledgements(peer, receipts.map { it.packetId }), afterSend = { count ->
             synchronized(lock) { store.transaction { receipts.take(count).forEach(store::removeReceipt) } }
         })
-        val candidates = synchronized(lock) { store.pendingPackets(room.id, peer, outgoingWindow(peer)) }
+        val normal = synchronized(lock) { store.pendingPackets(room.id, peer, outgoingWindow(peer)) }
+        val archival = synchronized(lock) { if (canSyncHistory(peer))
+            store.pendingHistoryPackets(room.id, peer, FamilyCareHistorySync.PAGE_SIZE + 1) else emptyList() }
+        val normalReady = nextSendable(normal)
+        val historyReady = nextSendable(archival)
+        var historyTurn = historyReady != null && (normalReady == null || synchronized(lock) { store.historySendTurn(room.id, peer) })
+        if (historyTurn && transport.shouldFallbackHistoryRepair(peer)) {
+            transport.noteHistoryRepairFallback(peer); historyTurn = false
+        }
+        val candidates = if (historyTurn) archival else normal
         val first = nextSendable(candidates) ?: return
         // Preserve FIFO, but include every due original in a retry batch. The transport independently
         // falls back for peers that stop acknowledging batches, without changing original identities.
@@ -611,7 +644,9 @@ class FamilyCareEngine(
         }, afterSend = { count ->
             synchronized(lock) { store.transaction {
                 packets.take(count).forEach { store.markSendConfirmed(room.id, it.packetId, peer) }
+                if (count > 0) store.setHistorySendTurn(room.id, peer, !historyTurn)
             } }
+            if (count > 0) onPeerSuccess(peer)
         })
     }
 
@@ -646,6 +681,7 @@ class FamilyCareEngine(
             } catch (error: TelegramException) {
                 if (error.errorCode in setOf(401, 404, 409, 429)) throw error
                 synchronized(lock) { store.transaction { store.setRetryAfter(room.id, packet.peerId, now() + 15_000) } }
+                onPeerFailure(packet.peerId, error)
             }
         }
     }

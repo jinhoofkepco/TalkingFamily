@@ -171,6 +171,7 @@ class TelegramReceiveService : Service() {
         writer.println("failedCycles=$failedCycles consecutiveFailures=$consecutiveFailures")
         writer.println("catchUpActive=$catchUpActive catchUpPolls=$catchUpPolls catchUpCooldownMillis=$catchUpCooldownMillis")
         writer.println("cycleSuccessDoesNotProvePollOrDelivery=true")
+        FamilySyncDiagnostics.dump(writer)
     }
     companion object {
         private const val CHANNEL = "family_telegram_receiving"

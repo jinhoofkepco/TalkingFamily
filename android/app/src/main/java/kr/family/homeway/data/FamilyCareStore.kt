@@ -22,6 +22,17 @@ interface FamilyCareStore {
     fun latestLocationSentAt(roomId: String, peerId: Long): Long = 0
     fun acknowledgedLatestLocationHead(roomId: String, childId: Long, peerId: Long): FamilyCareLocationHead? = null
     fun movementEventDigest(roomId: String, childId: Long, eventId: String): String? = null
+    fun historySource(roomId: String, childId: Long, anchor: Long = Long.MAX_VALUE): FamilyCareHistorySource = error("이동 기록 복구를 사용할 수 없어요.")
+    fun historyEntries(roomId: String, childId: Long, after: Long, anchor: Long, limit: Int): List<FamilyCareHistoryEntry> = emptyList()
+    fun historyEvents(roomId: String, childId: Long, ids: List<String>): List<FamilyEvent> = emptyList()
+    fun historyProgress(roomId: String, childId: Long): FamilyCareHistoryProgress? = null
+    fun saveHistoryProgress(progress: FamilyCareHistoryProgress) = Unit
+    fun pendingHistoryPackets(roomId: String, peerId: Long, limit: Int): List<FamilyCareOutgoing> =
+        pendingPackets(roomId).filter { it.peerId == peerId && FamilyCareHistorySync.isHistory(it) }.take(limit)
+    fun linkHistoryPage(checkpoint: FamilyCareOutgoing, entries: List<FamilyCareOutgoing>) = Unit
+    fun completeHistoryPage(roomId: String, checkpointId: String, peerId: Long) = Unit
+    fun historySendTurn(roomId: String, peerId: Long): Boolean = false
+    fun setHistorySendTurn(roomId: String, peerId: Long, history: Boolean) = Unit
     /** Bounded repair history; permanent event identities must never be pruned with it. */
     fun saveDelta(delta: FamilyCareDelta) = Unit
     fun deltas(roomId: String, childId: Long, epoch: String, afterRevision: Long, limit: Int): List<FamilyCareDelta> = emptyList()
@@ -48,7 +59,7 @@ interface FamilyCareStore {
     fun pendingPacket(roomId: String, packetId: String, peerId: Long): FamilyCareOutgoing? =
         pendingPackets(roomId).firstOrNull { it.packetId == packetId && it.peerId == peerId }
     fun pendingPackets(roomId: String, peerId: Long, limit: Int): List<FamilyCareOutgoing> =
-        pendingPackets(roomId).filter { it.peerId == peerId }.take(limit)
+        pendingPackets(roomId).filter { it.peerId == peerId && !FamilyCareHistorySync.isHistory(it) }.take(limit)
     fun pendingPeers(roomId: String): List<Long> =
         (pendingPackets(roomId).map { it.peerId } + receipts(roomId).map { it.peerId }).distinct()
     fun hasPendingPackets(roomId: String): Boolean = pendingPackets(roomId).isNotEmpty()

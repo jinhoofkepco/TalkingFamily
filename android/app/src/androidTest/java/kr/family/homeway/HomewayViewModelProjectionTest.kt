@@ -246,6 +246,21 @@ class HomewayViewModelProjectionTest {
         assertFalse(readOnMain.get())
     }
 
+    @Test fun historyRepairStatusUsesTheSelectedChildAndSurvivesInitialHistoryReset() = runBlocking {
+        val progress = FamilyCareHistoryProgress(room.id, 202, UUID.randomUUID().toString(), null,
+            0, 0, 0, false, System.currentTimeMillis())
+        store.familyCare.saveHistoryProgress(progress)
+        createModel(); awaitReady()
+        assertTrue("An initial history-context reset must not hide the repair status", model.state.value.historySyncing)
+        instrumentation.runOnMainSync { model.selectCareChild(303) }
+        awaitState { model.state.value.selectedChildBotId == 303L && model.state.value.stickerBalance == 8 }
+        assertFalse("Do not show the first child's repair status for the second child", model.state.value.historySyncing)
+        store.familyCare.saveHistoryProgress(progress.copy(complete = true))
+        instrumentation.runOnMainSync { model.selectCareChild(202) }
+        awaitState { model.state.value.selectedChildBotId == 202L && model.state.value.stickerBalance == 2 }
+        assertFalse(model.state.value.historySyncing)
+    }
+
     @Test fun slowPreviousAccountProjectionCannotRestoreARoomAfterReset() = runBlocking {
         createModel(); awaitReady()
         val gate = blockNextRead()

@@ -33,6 +33,7 @@ import kr.family.homeway.ui.UiActions
 import kr.family.homeway.overlay.FloatingStarService
 import kr.family.homeway.data.TelegramReceiveService
 import kr.family.homeway.data.AppDiagnostics
+import kr.family.homeway.data.FamilySyncDiagnostics
 import kr.family.homeway.data.FamilyNotifications
 import kr.family.homeway.data.TelegramChatPresence
 import kr.family.homeway.data.isTelegramChatVisible
@@ -389,6 +390,7 @@ class MainActivity : ComponentActivity() {
     override fun dump(prefix: String, fd: FileDescriptor?, writer: PrintWriter, args: Array<out String>?) {
         if (args?.contains("--diagnostics") == true) {
             AppDiagnostics.dump(this, writer)
+            FamilySyncDiagnostics.dump(writer)
             return
         }
         if (args?.contains("--overlay") == true) {

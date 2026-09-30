@@ -88,13 +88,16 @@ class HomewayViewModel internal constructor(
             state.map { it.error }.distinctUntilChanged().collect {
                 // Errors may include a family display name or an arbitrary exception payload.
                 // Detailed, authored transport diagnostics are recorded at their safe call sites.
-                if (it != null) AppDiagnostics.record(getApplication(), "ui.error", "화면 동작 오류가 발생했어요.")
+                if (it != null) AppDiagnostics.record(getApplication(), "ui.status_error", "연결 또는 화면 오류 상태가 표시되었어요.")
             }
         }
         viewModelScope.launch {
             try { repo.prepareCare() }
             catch (error: kotlinx.coroutines.CancellationException) { throw error }
-            catch (_: Exception) { showError("가족 기록을 준비하지 못했어요.") }
+            catch (error: Exception) {
+                AppDiagnostics.recordFailure(getApplication(), "ui.care_prepare", error)
+                showError("가족 기록을 준비하지 못했어요.")
+            }
             refreshCached()
         }
     }
@@ -171,7 +174,10 @@ class HomewayViewModel internal constructor(
                     }
                 }
             } catch (error: kotlinx.coroutines.CancellationException) { throw error }
-            catch (_: Exception) { showError("저장된 가족 기록을 불러오지 못했어요. 잠시 후 다시 시도해 주세요.") }
+            catch (error: Exception) {
+                AppDiagnostics.recordFailure(getApplication(), "ui.projection", error)
+                showError("저장된 가족 기록을 불러오지 못했어요. 잠시 후 다시 시도해 주세요.")
+            }
             finally {
                 // A cancelled read can finish after onStart has already launched its successor.
                 if (projectionJob == currentCoroutineContext()[Job]) {
@@ -219,6 +225,7 @@ class HomewayViewModel internal constructor(
             events=if (identityChanged) emptyList() else old.events,
             locationHistory=if (identityChanged) emptyList() else old.locationHistory,
             latestLocation=projection.latestLocation,
+            historySyncing=local.historySyncing,
             historyDays=if (identityChanged) emptyList() else old.historyDays,
             stickerBalance=visible.stickerBalance, redemptions=visible.redemptions,
             paired=local.paired || local.demoMode, room=activeRoom, selfBotId=local.selfBotId,
@@ -291,6 +298,13 @@ class HomewayViewModel internal constructor(
         if(!uiActive || mutableState.value.demoMode || !mutableState.value.configured) return
         refreshJob=viewModelScope.launch {
             try {
+                if (!scheduled) {
+                    val current = mutableState.value
+                    val active = current.room
+                    val child = current.selectedChildBotId
+                    if (current.careEnabled && current.role == "guardian" && active != null && child != null)
+                        repo.requestMovementHistoryRepair(active.id, child)
+                }
                 withContext(Dispatchers.IO) { if (scheduled) repo.synchronizeScheduled(0) else repo.synchronize(0) }
                 if (!scheduled) requestProjection()
             }
@@ -395,7 +409,8 @@ class HomewayViewModel internal constructor(
                         historyHasMore = historyCursor != null, historyLoading = false)
                 }
             } catch (error: kotlinx.coroutines.CancellationException) { throw error }
-            catch (_: Exception) {
+            catch (error: Exception) {
+                AppDiagnostics.recordFailure(getApplication(), "ui.location_history", error)
                 if (generation == historyGeneration) mutableState.update { it.copy(historyLoading = false,
                     error = "이동 기록을 불러오지 못했어요. 잠시 후 다시 시도해 주세요.") }
             }
@@ -419,7 +434,7 @@ class HomewayViewModel internal constructor(
         eventsGeneration++; eventsJob?.cancel()
         baseEvents = emptyList()
         mutableState.update { it.copy(events = emptyList(), rewards = emptyList(), redemptions = emptyList(),
-            latestLocation = null, stickerBalance = 0, careReady = false, carePending = false, careStatus = null) }
+            latestLocation = null, historySyncing = false, stickerBalance = 0, careReady = false, carePending = false, careStatus = null) }
         resetHistorySelection()
     }
     fun sendChat(text:String) {
